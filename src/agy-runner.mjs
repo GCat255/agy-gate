@@ -80,14 +80,21 @@ export class AgyRunner {
       return { ok: true };
     }
 
-    const magpie = loadMagpieAgyEnv({ env: this.env });
-    const childEnv = { ...this.env, ...magpie.envPatch };
+    const useMagpie = this.env.AGY_ROUTER_USE_MAGPIE === '1';
+    const childEnv = { ...this.env };
     const sessionState = this.store.getSession(sessionID);
     const promptText = this.buildPromptText(promptPayload);
 
     const args = [];
-    if (magpie.settingsPath) {
-      args.push('--settings', magpie.settingsPath);
+    if (useMagpie) {
+      const magpie = loadMagpieAgyEnv({ env: this.env });
+      Object.assign(childEnv, magpie.envPatch);
+      if (magpie.settingsPath) {
+        args.push('--settings', magpie.settingsPath);
+      }
+    } else {
+      delete childEnv.GEMINI_API_KEY;
+      delete childEnv.GOOGLE_GEMINI_BASE_URL;
     }
     args.push('--output-format', 'stream-json');
     if (modelID) {

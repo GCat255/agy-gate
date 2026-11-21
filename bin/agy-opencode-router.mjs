@@ -50,8 +50,9 @@ function cmdModels() {
 function cmdDoctor() {
   const realOpenCode = resolveRealOpenCode();
   const agyBin = resolveAgyBinary();
-  const magpieBin = resolveMagpieBinary();
-  const magpieEnv = redactMagpieSummary(loadMagpieAgyEnv({ forceRefresh: true }));
+  const useMagpie = process.env.AGY_ROUTER_USE_MAGPIE === '1';
+  const magpieBin = useMagpie ? resolveMagpieBinary() : null;
+  const magpieEnv = useMagpie ? redactMagpieSummary(loadMagpieAgyEnv({ forceRefresh: true })) : null;
   const ocVer = realOpenCode ? readRealOpenCodeVersion(realOpenCode).stdout?.trim() : null;
 
   process.stdout.write(
@@ -61,8 +62,8 @@ function cmdDoctor() {
         realOpenCode,
         realOpenCodeVersion: ocVer,
         agyBin,
-        magpieBin,
-        magpieEnv,
+        useMagpie,
+        ...(useMagpie ? { magpieBin, magpieEnv } : {}),
       },
       null,
       2,

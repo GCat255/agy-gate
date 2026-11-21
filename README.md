@@ -7,7 +7,7 @@
 - **零源码入侵**：在 OpenChamber 的「OpenCode 可执行文件路径」中指向本网关启动器即可接入，OpenChamber 仍运行在完整托管模式下，不影响版本升级。
 - **按模型归属分流**：
   - 网关注入虚拟 Provider `agy-cli`（模型列表动态取自 `agy models`）。
-  - 当前会话选中的模型属于 `providerID === "agy-cli"` 时，网关直接拦截请求并调用本地 `agy.exe`（自动加载 `magpie.exe agy env` 环境），将其流式事件翻译为 OpenCode 2.x `OpenCodeEvent` 推入 `/api/event` SSE。
+  - 当前会话选中的模型属于 `providerID === "agy-cli"` 时，网关直接拦截请求并原生调用本地 `agy.exe`（默认不注入 `magpie` 代理模型，仅使用 `agy-cli` 原生模型），将其流式事件翻译为 OpenCode 2.x `OpenCodeEvent` 推入 `/api/event` SSE。
   - 其他所有模型原样透明转发给内部托管的真实 `opencode serve`。
 - **混合影子会话**：会话元数据由内部 `opencode serve` 统一维护（保留标题、目录、重命名、归档与小模型辅助功能），`agy-cli` 的对话消息由网关本地持久化并与 `GET /api/session/:id/message` 合并返回，支持同一会话内跨引擎切换。
 

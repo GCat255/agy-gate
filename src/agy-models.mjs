@@ -98,14 +98,21 @@ export function getAgyCatalog(options = {}) {
   }
 
   const env = options.env || process.env;
+  const useMagpie = env.AGY_ROUTER_USE_MAGPIE === '1';
   const agyBin = resolveAgyBinary(env);
   let rawModels = [];
 
   if (agyBin) {
-    const magpie = loadMagpieAgyEnv({ env });
-    const childEnv = { ...env, ...magpie.envPatch };
+    const childEnv = { ...env };
     const args = [];
-    if (magpie.settingsPath) args.push('--settings', magpie.settingsPath);
+    if (useMagpie) {
+      const magpie = loadMagpieAgyEnv({ env });
+      Object.assign(childEnv, magpie.envPatch);
+      if (magpie.settingsPath) args.push('--settings', magpie.settingsPath);
+    } else {
+      delete childEnv.GEMINI_API_KEY;
+      delete childEnv.GOOGLE_GEMINI_BASE_URL;
+    }
     args.push('models');
 
     try {
@@ -117,7 +124,7 @@ export function getAgyCatalog(options = {}) {
         env: childEnv,
       });
       if (res.status === 0 && res.stdout) {
-        rawModels = parseAgyModelsOutput(res.stdout);
+        rawModels = parseAgyModelsOutput(res.stdout).filter((m) => useMagpie || !m.id.startsWith('magpie/'));
       }
     } catch {
       // Fall back to static seed list on probe error
