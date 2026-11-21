@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 
 const FALLBACK_UI_BLOCKS_GUIDANCE = [
@@ -9,9 +10,9 @@ const FALLBACK_UI_BLOCKS_GUIDANCE = [
 ].join('\n');
 
 const HEADLESS_CHOICE_RULE =
-  'IMPORTANT (agy-cli headless mode): NEVER call `ask_question` — it returns empty immediately without waiting for UI input. '
-  + 'For interactive choices or forms, either call `openchamber_render` (`action: "render.page"`, `ui` or `html`, `title`, `awaitAnswer: true`), '
-  + 'or write a fenced ```openui-lang block in your Markdown reply.';
+  'IMPORTANT: NEVER call `ask_question` (returns empty). '
+  + 'For interactive choices/forms, use `openchamber_render` (`render.page`, `ui`/`html`, `awaitAnswer: true`) or ```openui-lang blocks. '
+  + 'For subagents, use native `invoke_subagent`/`send_message`/`manage_subagents` only (never `openchamber` `ownWork`/`returnResult`).';
 
 const cachedWebRootByKey = new Map();
 let cachedGuidance = null;
@@ -35,9 +36,15 @@ export function resolveOpenChamberWebRoot(env = process.env) {
   candidates.push(path.join(execDir, 'node_modules', '@openchamber', 'web'));
   candidates.push(path.join(execDir, '..', 'node_modules', '@openchamber', 'web'));
 
+  if (env.npm_config_prefix?.trim()) {
+    const prefix = path.resolve(env.npm_config_prefix.trim());
+    candidates.push(path.join(prefix, 'node_modules', '@openchamber', 'web'));
+    candidates.push(path.join(prefix, 'lib', 'node_modules', '@openchamber', 'web'));
+  }
   if (env.APPDATA) {
     candidates.push(path.join(env.APPDATA, 'npm', 'node_modules', '@openchamber', 'web'));
   }
+  candidates.push('/opt/homebrew/lib/node_modules/@openchamber/web');
   candidates.push('/usr/local/lib/node_modules/@openchamber/web');
   candidates.push('/usr/lib/node_modules/@openchamber/web');
 
@@ -50,6 +57,26 @@ export function resolveOpenChamberWebRoot(env = process.env) {
       }
     } catch {
       // Ignore inaccessible paths
+    }
+  }
+
+  if (!found) {
+    try {
+      const npmCmd = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+      const probe = spawnSync(npmCmd, ['root', '-g'], {
+        encoding: 'utf8',
+        timeout: 4000,
+        windowsHide: true,
+        env,
+      });
+      if (probe.status === 0 && probe.stdout) {
+        const candidate = path.join(probe.stdout.trim(), '@openchamber', 'web');
+        if (fs.existsSync(path.join(candidate, 'package.json'))) {
+          found = candidate;
+        }
+      }
+    } catch {
+      // Ignore global npm probe failures
     }
   }
 
@@ -158,7 +185,7 @@ export async function buildSessionGuidancePrefix(options = {}) {
     return [
       '<openchamber_runtime_guidance>',
       HEADLESS_CHOICE_RULE,
-      'Read MCP `openchamber_render` schema before rendering UI for complete `openui-lang` component signatures and `render.page` arguments.',
+      'Check MCP `openchamber_render` schema before rendering UI for full `openui-lang` & `render.page` args.',
       '</openchamber_runtime_guidance>',
     ].join('\n');
   }

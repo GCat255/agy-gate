@@ -1,5 +1,6 @@
 import http from 'node:http';
 import { AGY_PROVIDER_ID, getAgyCatalog } from './agy-models.mjs';
+import { isAgyChildSessionID } from './subagent-bridge.mjs';
 
 /**
  * Read full request body as Buffer.
@@ -259,6 +260,7 @@ export function createRouterServer(deps) {
           if (directory) deps.store.setSessionDirectory(json.data.id, directory);
           if (wantsAgy) {
             deps.store.setSessionModel(json.data.id, parsed.model);
+            deps.store.cacheSessionMetadata(json.data);
             json.data = deps.store.overlaySessionInfo(json.data);
           }
         }
@@ -308,7 +310,20 @@ export function createRouterServer(deps) {
         }
         const json = JSON.parse(text);
         if (Array.isArray(json.data)) {
-          json.data = json.data.map((s) => deps.store.overlaySessionInfo(s));
+          const seenIds = new Set();
+          json.data = json.data.map((s) => {
+            if (s?.id) seenIds.add(s.id);
+            deps.store.cacheSessionMetadata(s);
+            return deps.store.overlaySessionInfo(s);
+          });
+          for (const child of deps.store.listChildSessions({ directory })) {
+            deps.agyRunner.syncChildSession?.(child.id);
+          }
+          for (const child of deps.store.listChildSessions({ directory })) {
+            if (!seenIds.has(child.id)) {
+              json.data.push(child);
+            }
+          }
         }
         sendJson(res, up.status, json);
         return;
@@ -320,10 +335,22 @@ export function createRouterServer(deps) {
         const sessionID = decodeURIComponent(sessionMatch[1]);
         const sub = sessionMatch[2] || '';
 
-        if (directory) deps.store.setSessionDirectory(sessionID, directory);
+        if (directory && !isAgyChildSessionID(sessionID)) {
+          deps.store.setSessionDirectory(sessionID, directory);
+        }
 
         // 7a. Get Session Info
         if (method === 'GET' && sub === '') {
+          if (isAgyChildSessionID(sessionID)) {
+            deps.agyRunner.syncChildSession?.(sessionID);
+            const childInfo = deps.store.getChildSessionInfo(sessionID);
+            if (!childInfo) {
+              sendJson(res, 404, { error: 'Child session not found' });
+              return;
+            }
+            sendJson(res, 200, { data: childInfo });
+            return;
+          }
           const up = await fetchUpstream({
             upstreamBase: deps.upstreamBase(),
             authHeader: expectedAuth,
@@ -339,6 +366,7 @@ export function createRouterServer(deps) {
           }
           const json = JSON.parse(text);
           if (json?.data) {
+            deps.store.cacheSessionMetadata(json.data);
             json.data = deps.store.overlaySessionInfo(json.data);
           }
           sendJson(res, up.status, json);
@@ -348,8 +376,44 @@ export function createRouterServer(deps) {
         // 7b. Delete Session
         if (method === 'DELETE' && sub === '') {
           deps.agyRunner.interrupt(sessionID);
+          deps.agyRunner.closeWatchersForParent?.(sessionID);
           deps.store.deleteSession(sessionID);
+          if (isAgyChildSessionID(sessionID)) {
+            sendJson(res, 200, { deleted: true });
+            return;
+          }
           // Fall through to upstream delete
+        }
+
+        // 7b-2. Patch Session (capture user/AI renames locally so auto-title never overwrites them)
+        if (method === 'PATCH' && sub === '' && !isAgyChildSessionID(sessionID)) {
+          const bodyBuf = await readBodyBuffer(req);
+          let parsed = {};
+          try {
+            parsed = bodyBuf.length ? JSON.parse(bodyBuf.toString('utf8')) : {};
+          } catch {}
+          if (typeof parsed?.title === 'string' && parsed.title.trim()) {
+            deps.store.setSessionTitle(sessionID, parsed.title.trim());
+          }
+          const up = await fetchUpstream({
+            upstreamBase: deps.upstreamBase(),
+            authHeader: expectedAuth,
+            req,
+            method,
+            pathAndQuery,
+            body: bodyBuf,
+          });
+          const respHeaders = {};
+          up.headers.forEach((val, key) => {
+            const lower = key.toLowerCase();
+            if (lower === 'transfer-encoding' || lower === 'content-encoding' || lower === 'content-length') return;
+            respHeaders[key] = val;
+          });
+          const outBuf = Buffer.from(await up.arrayBuffer());
+          respHeaders['content-length'] = String(outBuf.length);
+          res.writeHead(up.status, respHeaders);
+          res.end(outBuf);
+          return;
         }
 
         // 7c. Switch Session Model (route decision state)
@@ -544,8 +608,12 @@ export function createRouterServer(deps) {
               promptPayload: { text },
             });
             if (!started.ok) {
-              sendJson(res, 409, { error: 'Session is busy' });
-              return;
+              deps.agyRunner.enqueueTurnInput(sessionID, {
+                modelID: activeModel.id,
+                variant: activeModel.variant,
+                directory: effectiveDir,
+                promptPayload: { text },
+              });
             }
 
             sendJson(res, 200, { data: syntheticMsg });
@@ -577,6 +645,16 @@ export function createRouterServer(deps) {
 
         // 7f. List Messages (merge OpenCode messages + local agy-cli messages)
         if (method === 'GET' && sub === 'message') {
+          if (isAgyChildSessionID(sessionID)) {
+            deps.agyRunner.syncChildSession?.(sessionID);
+            const limitParam = url.searchParams.get('limit');
+            const limit = limitParam ? Number.parseInt(limitParam, 10) : undefined;
+            const order = url.searchParams.get('order') || undefined;
+            const type = url.searchParams.get('type') || undefined;
+            const data = deps.store.mergeMessages([], sessionID, { order, type, limit });
+            sendJson(res, 200, { data });
+            return;
+          }
           const up = await fetchUpstream({
             upstreamBase: deps.upstreamBase(),
             authHeader: expectedAuth,

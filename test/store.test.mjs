@@ -12,6 +12,10 @@ test('RouterStore persists session overrides and merges messages chronologically
     store.setSessionDirectory('ses_1', 'E:/repo');
     store.setSessionModel('ses_1', { providerID: 'agy-cli', id: 'gemini-4-neon-high' });
     store.setAgyConversationId('ses_1', 'conv_999');
+    store.recordTurnUsage('ses_1', {
+      sessionTokens: { input: 1200, output: 50, reasoning: 10, cache: { read: 800, write: 0 } },
+      lastResultUsage: { input: 1200, output: 50, reasoning: 10, cache: { read: 800, write: 0 } },
+    });
 
     store.upsertMessage('ses_1', {
       id: 'msg_2',
@@ -29,6 +33,7 @@ test('RouterStore persists session overrides and merges messages chronologically
     });
     assert.equal(info.model.providerID, 'agy-cli');
     assert.equal(info.model.id, 'gemini-4-neon-high');
+    assert.deepEqual(info.tokens, { input: 1200, output: 50, reasoning: 10, cache: { read: 800, write: 0 } });
     assert.equal(reloaded.getSession('ses_1').agyConversationId, 'conv_999');
 
     const merged = reloaded.mergeMessages(

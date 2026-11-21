@@ -205,6 +205,25 @@ export async function invokeOpenChamberAgentTool({ name, args, env = process.env
     ...(requestedAction !== undefined ? { action: requestedAction } : {}),
   };
 
+  if (
+    canonicalName === 'openchamber' &&
+    ((mergedInput.action === 'session.create' && (mergedInput.ownWork === true || mergedInput.returnResult === true)) ||
+      (mergedInput.action === 'session.send' && mergedInput.returnResult === true))
+  ) {
+    return {
+      isError: false,
+      text: JSON.stringify({
+        schemaVersion: 1,
+        ok: false,
+        action: mergedInput.action,
+        error: {
+          message:
+            'Cross-engine subagent delegation via openchamber (ownWork/returnResult) is disabled in agy-cli sessions to keep rules and tools consistent. Use native invoke_subagent / send_message / manage_subagents instead.',
+        },
+      }),
+    };
+  }
+
   const sessionID = env.OPENCHAMBER_ROUTER_SESSION_ID?.trim() || undefined;
   const contextDirectory = env.OPENCHAMBER_ROUTER_DIRECTORY?.trim() || process.cwd();
   const callID = await resolveCoordinatedCallId(env.OPENCHAMBER_ROUTER_CALL_LOG?.trim(), canonicalName);

@@ -1,6 +1,112 @@
 import { AGY_PROVIDER_ID } from './agy-models.mjs';
 import { unwrapOpenChamberToolCall } from './mcp-bridge.mjs';
 
+export function computeStepWindowTotal(parsed) {
+  if (!parsed || typeof parsed !== 'object') return 0;
+  return parsed.windowTotal || 0;
+}
+
+export function normalizeUsageBuckets(usage) {
+  if (!usage || typeof usage !== 'object') return null;
+  const num = (v) => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : 0);
+  const input = num(usage.input_tokens ?? usage.input);
+  const output = num(usage.output_tokens ?? usage.output);
+  const reasoning = num(usage.thinking_tokens ?? usage.reasoning);
+  const cacheRead = num(usage.cache_read_tokens ?? usage.cache?.read);
+  const cacheWrite = num(usage.cache_write_tokens ?? usage.cache?.write);
+  const hasAny =
+    typeof usage.input_tokens === 'number' ||
+    typeof usage.output_tokens === 'number' ||
+    typeof usage.thinking_tokens === 'number' ||
+    typeof usage.cache_read_tokens === 'number' ||
+    typeof usage.cache_write_tokens === 'number' ||
+    typeof usage.total_tokens === 'number' ||
+    typeof usage.input === 'number' ||
+    typeof usage.output === 'number' ||
+    typeof usage.reasoning === 'number';
+  if (!hasAny) return null;
+
+  // agy Gemini `total_tokens` equals `input_tokens + output_tokens` (with `thinking_tokens`
+  // already included inside `output_tokens`) and excludes `cache_read_tokens`. When `total_tokens`
+  // is absent (e.g. unit mocks), sum all buckets like OpenChamber's `sumTokenBreakdown`.
+  const reportedTotal = num(usage.total_tokens ?? usage.total);
+  const baseTotal = reportedTotal > 0 ? Math.max(reportedTotal, input + output) : input + output + reasoning;
+  const windowTotal = baseTotal + cacheRead + cacheWrite;
+
+  return {
+    input,
+    output,
+    reasoning,
+    cache: { read: cacheRead, write: cacheWrite },
+    windowTotal,
+  };
+}
+
+function unwrapToolParamValue(val) {
+  if (typeof val !== 'string') return val;
+  const trimmed = val.trim();
+  if (
+    (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+    (trimmed.startsWith('[') && trimmed.endsWith(']')) ||
+    (trimmed.startsWith('{') && trimmed.endsWith('}'))
+  ) {
+    try {
+      return JSON.parse(trimmed);
+    } catch {
+      return val;
+    }
+  }
+  return val;
+}
+
+export function emptyTokenBuckets() {
+  return { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } };
+}
+
+function addTokenBuckets(a, b) {
+  return {
+    input: (a?.input || 0) + (b?.input || 0),
+    output: (a?.output || 0) + (b?.output || 0),
+    reasoning: (a?.reasoning || 0) + (b?.reasoning || 0),
+    cache: {
+      read: (a?.cache?.read || 0) + (b?.cache?.read || 0),
+      write: (a?.cache?.write || 0) + (b?.cache?.write || 0),
+    },
+  };
+}
+
+function diffCumulativeUsage(current, prior) {
+  if (!prior) {
+    return {
+      input: current.input,
+      output: current.output,
+      reasoning: current.reasoning,
+      cache: { read: current.cache.read, write: current.cache.write },
+    };
+  }
+  const resetDetected =
+    current.input < prior.input ||
+    current.output < prior.output ||
+    current.cache.read < prior.cache.read;
+  if (resetDetected) {
+    return {
+      input: current.input,
+      output: current.output,
+      reasoning: current.reasoning,
+      cache: { read: current.cache.read, write: current.cache.write },
+    };
+  }
+  return {
+    input: Math.max(0, current.input - prior.input),
+    output: Math.max(0, current.output - prior.output),
+    reasoning: Math.max(0, current.reasoning - prior.reasoning),
+    cache: {
+      read: Math.max(0, current.cache.read - prior.cache.read),
+      write: Math.max(0, current.cache.write - prior.cache.write),
+    },
+  };
+}
+
 /**
  * Translate `agy-cli` `--output-format stream-json` NDJSON events into
  * OpenCode 2.3.2 `OpenCodeEvent` SSE events and final `SessionMessage.Assistant` content.
@@ -16,6 +122,8 @@ export class AgyTurnTranslator {
    *   directory?: string | null,
    *   emit: (event: any) => void,
    *   onConversationId?: (conversationId: string) => void,
+   *   priorSessionTokens?: { input: number, output: number, reasoning: number, cache: { read: number, write: number } } | null,
+   *   priorResultUsage?: { input: number, output: number, reasoning: number, cache: { read: number, write: number } } | null,
    * }} options
    */
   constructor(options) {
@@ -28,6 +136,13 @@ export class AgyTurnTranslator {
     this.emit = options.emit;
     this.onConversationId = options.onConversationId;
     this.onOpenChamberToolStart = options.onOpenChamberToolStart;
+    this.onSubagentDiscovered = options.onSubagentDiscovered;
+    this.onSystemMessageWakeup = options.onSystemMessageWakeup;
+    this.onSubagentWake = options.onSubagentWake;
+    this.onSubagentKilled = options.onSubagentKilled;
+    this.onSyncThinking = options.onSyncThinking;
+    this.priorSessionTokens = options.priorSessionTokens || emptyTokenBuckets();
+    this.priorResultUsage = options.priorResultUsage || null;
 
     this.created = Date.now();
     this.started = false;
@@ -40,9 +155,20 @@ export class AgyTurnTranslator {
     this.activeTextSteps = new Map();
     /** @type {Map<number, { callID: string, name: string, input: any, startedAt: number, closed: boolean }>} */
     this.activeTools = new Map();
+    /** @type {Map<string, { callID: string, input: any, childSessionID: string | null, startedAt: number, notified: boolean, closed: boolean }>} */
+    this.activeSubagents = new Map();
+    /** @type {Set<number>} */
+    this.emittedReasoningSteps = new Set();
     /** @type {any[]} */
     this.content = [];
-    this.tokens = { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } };
+    /** @type {Map<string, { input: number, output: number, reasoning: number, cache: { read: number, write: number }, windowTotal: number }>} */
+    this.stepUsages = new Map();
+    /** @type {string | null} */
+    this.lastStepUsageKey = null;
+    this.syntheticStepUsageSeq = 0;
+    this.rawResultUsage = null;
+    this.tokens = emptyTokenBuckets();
+    this.sessionTokens = addTokenBuckets(this.priorSessionTokens, emptyTokenBuckets());
   }
 
   _location() {
@@ -108,26 +234,44 @@ export class AgyTurnTranslator {
     if (step.conversation_id && this.onConversationId) {
       this.onConversationId(String(step.conversation_id));
     }
-    this._mergeUsage(step.usage);
+    this._recordStepUsage(step.step_index, step.usage);
 
     const stepIndex = Number.isInteger(step.step_index) ? step.step_index : -1;
     const stepType = step.step_type;
 
     if (stepType === 'user_input') return;
 
+    if (stepType === 'system_message') {
+      if (this.onSystemMessageWakeup) this.onSystemMessageWakeup();
+      return;
+    }
+
+    if (stepType === 'subagent') {
+      if (this.onSyncThinking) this.onSyncThinking(stepIndex);
+      this._handleSubagentStep(stepIndex, step);
+      return;
+    }
+
     const reasoningDelta = step.thinking_delta ?? step.thought_delta ?? step.reasoning_delta;
     if (stepType === 'thinking' || stepType === 'reasoning' || typeof reasoningDelta === 'string') {
+      if (stepIndex >= 0) this.emittedReasoningSteps.add(stepIndex);
       this._handleStreamDelta(stepIndex, 'reasoning', String(reasoningDelta ?? ''), step.state === 'DONE');
       return;
     }
 
     if (stepType === 'agent_response') {
+      if (step.state === 'DONE' && this.onSyncThinking) {
+        this.onSyncThinking(stepIndex);
+      }
       const delta = typeof step.text_delta === 'string' ? step.text_delta : '';
       this._handleStreamDelta(stepIndex, 'text', delta, step.state === 'DONE');
       return;
     }
 
     if (stepType === 'tool') {
+      if (!this.activeTools.has(stepIndex) && this.onSyncThinking) {
+        this.onSyncThinking(stepIndex);
+      }
       this._handleToolStep(stepIndex, step);
     }
   }
@@ -236,8 +380,31 @@ export class AgyTurnTranslator {
       });
     }
 
+    if (name === 'send_message' && this.onSubagentWake) {
+      const recipientId = unwrapToolParamValue(parameters.Recipient ?? parameters.recipient);
+      if (typeof recipientId === 'string' && recipientId.trim()) {
+        this.onSubagentWake({ recipientId: recipientId.trim() });
+      }
+    }
+
     if (step.state === 'DONE' && !tool.closed) {
       tool.closed = true;
+      if (name === 'manage_subagents' && this.onSubagentKilled) {
+        const action = String(unwrapToolParamValue(parameters.Action ?? parameters.action) || '').trim();
+        if (action === 'kill_all') {
+          this.onSubagentKilled({ all: true, conversationIds: [] });
+        } else if (action === 'kill') {
+          const rawIds = unwrapToolParamValue(parameters.ConversationIds ?? parameters.conversationIds);
+          const conversationIds = Array.isArray(rawIds)
+            ? rawIds.map((id) => String(unwrapToolParamValue(id) || '').trim()).filter(Boolean)
+            : typeof rawIds === 'string' && rawIds.trim()
+              ? [rawIds.trim()]
+              : [];
+          if (conversationIds.length > 0) {
+            this.onSubagentKilled({ all: false, conversationIds });
+          }
+        }
+      }
       const now = Date.now();
       const output = typeof info.output === 'string'
         ? info.output
@@ -319,13 +486,106 @@ export class AgyTurnTranslator {
     }
   }
 
-  /** @param {any} usage */
-  _mergeUsage(usage) {
-    if (!usage || typeof usage !== 'object') return;
-    if (typeof usage.input_tokens === 'number') this.tokens.input = Math.max(this.tokens.input, usage.input_tokens);
-    if (typeof usage.output_tokens === 'number') this.tokens.output = Math.max(this.tokens.output, usage.output_tokens);
-    if (typeof usage.thinking_tokens === 'number') this.tokens.reasoning = Math.max(this.tokens.reasoning, usage.thinking_tokens);
-    if (typeof usage.cache_read_tokens === 'number') this.tokens.cache.read = Math.max(this.tokens.cache.read, usage.cache_read_tokens);
+  /**
+   * Record per-LLM-step usage snapshot keyed by `step_index` so multiple updates
+   * to the same step overwrite rather than accumulate.
+   * @param {number | undefined} stepIndex
+   * @param {any} usage
+   */
+  _recordStepUsage(stepIndex, usage) {
+    const parsed = normalizeUsageBuckets(usage);
+    if (!parsed) return;
+    const key = Number.isInteger(stepIndex) && stepIndex >= 0
+      ? String(stepIndex)
+      : `anon_${++this.syntheticStepUsageSeq}`;
+    this.stepUsages.set(key, parsed);
+    this.lastStepUsageKey = key;
+    this._recomputeTokens();
+  }
+
+  /**
+   * Record turn-end `result.usage` (which `agy` accumulates across the entire
+   * conversation) without letting it overwrite per-step context snapshots.
+   * @param {any} usage
+   */
+  _recordResultUsage(usage) {
+    const parsed = normalizeUsageBuckets(usage);
+    if (!parsed) return;
+    this.rawResultUsage = parsed;
+    this._recomputeTokens();
+  }
+
+  _recomputeTokens() {
+    if (this.stepUsages.size > 0) {
+      let turnBuckets = emptyTokenBuckets();
+      for (const stepUsage of this.stepUsages.values()) {
+        turnBuckets = addTokenBuckets(turnBuckets, stepUsage);
+      }
+      const lastStep = this.lastStepUsageKey ? this.stepUsages.get(this.lastStepUsageKey) : null;
+      const windowTotal = lastStep?.windowTotal || 0;
+      this.tokens = windowTotal > 0 ? { total: windowTotal, ...turnBuckets } : turnBuckets;
+      this.sessionTokens = addTokenBuckets(this.priorSessionTokens, turnBuckets);
+      return;
+    }
+
+    if (this.rawResultUsage) {
+      const turnBuckets = diffCumulativeUsage(this.rawResultUsage, this.priorResultUsage);
+      const windowTotal =
+        turnBuckets.input +
+        turnBuckets.output +
+        turnBuckets.reasoning +
+        turnBuckets.cache.read +
+        turnBuckets.cache.write;
+      this.tokens = windowTotal > 0 ? { total: windowTotal, ...turnBuckets } : turnBuckets;
+      this.sessionTokens = addTokenBuckets(this.priorSessionTokens, turnBuckets);
+    }
+  }
+
+  /**
+   * Emit a completed reasoning block recovered from `transcript.jsonl` when `agy-cli` omits
+   * thinking deltas from `--output-format stream-json`.
+   * @param {number} stepIndex
+   * @param {string} text
+   */
+  emitReasoning(stepIndex, text) {
+    if (this.finished) return;
+    const trimmed = String(text || '').trim();
+    if (!trimmed) return;
+    if (Number.isInteger(stepIndex) && this.emittedReasoningSteps.has(stepIndex)) return;
+    if (Number.isInteger(stepIndex)) this.emittedReasoningSteps.add(stepIndex);
+
+    if (!this.firstTokenSent) {
+      this.firstTokenSent = true;
+      this._send('session.step.first-token', {
+        sessionID: this.sessionID,
+        assistantMessageID: this.assistantMessageID,
+      });
+    }
+
+    const ordinal = this.reasoningOrdinal++;
+    const now = Date.now();
+    this._send('session.reasoning.started', {
+      sessionID: this.sessionID,
+      assistantMessageID: this.assistantMessageID,
+      ordinal,
+    });
+    this._send('session.reasoning.delta', {
+      sessionID: this.sessionID,
+      assistantMessageID: this.assistantMessageID,
+      ordinal,
+      delta: trimmed,
+    });
+    this._send('session.reasoning.ended', {
+      sessionID: this.sessionID,
+      assistantMessageID: this.assistantMessageID,
+      ordinal,
+      text: trimmed,
+    });
+    this.content.push({
+      type: 'reasoning',
+      text: trimmed,
+      time: { created: this.created, completed: now },
+    });
   }
 
   /** @param {any} result */
@@ -333,7 +593,10 @@ export class AgyTurnTranslator {
     if (result.conversation_id && this.onConversationId) {
       this.onConversationId(String(result.conversation_id));
     }
-    this._mergeUsage(result.usage);
+    if (this.onSyncThinking) {
+      this.onSyncThinking(-1);
+    }
+    this._recordResultUsage(result.usage);
 
     // Flush any remaining open text steps
     for (const [idx, entry] of [...this.activeTextSteps.entries()]) {
@@ -354,9 +617,210 @@ export class AgyTurnTranslator {
     this.complete();
   }
 
+  _handleSubagentStep(stepIndex, step) {
+    const subs = Array.isArray(step.subagent_info?.subagents) && step.subagent_info.subagents.length > 0
+      ? step.subagent_info.subagents
+      : [{ type_name: step.tool_name || 'subagent', role: 'Subagent', initial_prompt: '' }];
+
+    for (let k = 0; k < subs.length; k += 1) {
+      const sub = subs[k] || {};
+      const key = `${stepIndex}:${k}`;
+      let entry = this.activeSubagents.get(key);
+
+      if (!entry) {
+        const callID = `call_${this.assistantMessageID}_sub_${stepIndex}_${k}`;
+        const input = {
+          agent: String(sub.type_name || 'subagent'),
+          description: String(sub.role || sub.type_name || 'Subagent'),
+          prompt: String(sub.initial_prompt || ''),
+        };
+        entry = {
+          callID,
+          input,
+          childSessionID: null,
+          startedAt: Date.now(),
+          notified: false,
+          closed: false,
+        };
+        this.activeSubagents.set(key, entry);
+
+        this._send('session.tool.input.started', {
+          sessionID: this.sessionID,
+          assistantMessageID: this.assistantMessageID,
+          id: callID,
+          name: 'subagent',
+        });
+        this._send('session.tool.called', {
+          sessionID: this.sessionID,
+          assistantMessageID: this.assistantMessageID,
+          id: callID,
+          input,
+          executed: true,
+        });
+      }
+
+      if (step.state === 'DONE' && sub.conversation_id && !entry.notified) {
+        const agyConversationId = String(sub.conversation_id);
+        const childSessionID = agyConversationId.startsWith('agy_sub_')
+          ? agyConversationId
+          : `agy_sub_${agyConversationId}`;
+        entry.notified = true;
+        entry.childSessionID = childSessionID;
+
+        this._send('session.tool.progress', {
+          sessionID: this.sessionID,
+          assistantMessageID: this.assistantMessageID,
+          id: entry.callID,
+          metadata: { sessionID: childSessionID },
+        });
+
+        if (this.onSubagentDiscovered) {
+          this.onSubagentDiscovered({
+            callID: entry.callID,
+            childSessionID,
+            agyConversationId,
+            agent: entry.input.agent,
+            title: entry.input.description,
+            prompt: entry.input.prompt,
+            logUri: sub.log_uri || null,
+            workspaceUris: Array.isArray(sub.workspace_uris) ? sub.workspace_uris : [],
+            startedAt: entry.startedAt,
+          });
+        }
+      }
+    }
+  }
+
+  /**
+   * Complete an open `subagent` tool call inside this turn once the child finishes.
+   * Returns `false` if this turn has already finished (caller should emit background synthetic completion).
+   * @param {string} childSessionID
+   * @param {{ state?: 'completed'|'error'|'cancelled', output?: string }} info
+   */
+  resolveSubagent(childSessionID, info = {}) {
+    if (this.finished) return false;
+    const entry = [...this.activeSubagents.values()].find((item) => item.childSessionID === childSessionID && !item.closed);
+    if (!entry) return false;
+
+    entry.closed = true;
+    const state = info.state || 'completed';
+    const now = Date.now();
+    const output = String(info.output || '');
+    const contentItems = output ? [{ type: 'text', text: output }] : [];
+    const metadata = { status: state, sessionID: childSessionID };
+
+    if (state === 'error') {
+      this._send('session.tool.failed', {
+        sessionID: this.sessionID,
+        assistantMessageID: this.assistantMessageID,
+        id: entry.callID,
+        error: { type: 'unknown', message: output || 'Subagent failed' },
+        content: contentItems,
+        executed: true,
+        metadata,
+      });
+      this.content.push({
+        type: 'tool',
+        id: entry.callID,
+        name: 'subagent',
+        executed: true,
+        time: { created: entry.startedAt, ran: entry.startedAt, completed: now },
+        state: {
+          status: 'error',
+          input: entry.input,
+          error: { type: 'unknown', message: output || 'Subagent failed' },
+          content: contentItems,
+          metadata,
+        },
+      });
+    } else {
+      this._send('session.tool.success', {
+        sessionID: this.sessionID,
+        assistantMessageID: this.assistantMessageID,
+        id: entry.callID,
+        content: contentItems,
+        executed: true,
+        metadata,
+      });
+      this.content.push({
+        type: 'tool',
+        id: entry.callID,
+        name: 'subagent',
+        executed: true,
+        time: { created: entry.startedAt, ran: entry.startedAt, completed: now },
+        state: {
+          status: 'completed',
+          input: entry.input,
+          content: contentItems,
+          metadata,
+        },
+      });
+    }
+    return true;
+  }
+
+  _flushOpenSubagents(interrupted = false) {
+    const now = Date.now();
+    for (const entry of this.activeSubagents.values()) {
+      if (entry.closed) continue;
+      entry.closed = true;
+      if (entry.childSessionID && !interrupted) {
+        const metadata = { status: 'running', sessionID: entry.childSessionID };
+        const contentItems = [{ type: 'text', text: 'Subagent running in background.' }];
+        this._send('session.tool.success', {
+          sessionID: this.sessionID,
+          assistantMessageID: this.assistantMessageID,
+          id: entry.callID,
+          content: contentItems,
+          executed: true,
+          metadata,
+        });
+        this.content.push({
+          type: 'tool',
+          id: entry.callID,
+          name: 'subagent',
+          executed: true,
+          time: { created: entry.startedAt, ran: entry.startedAt, completed: now },
+          state: {
+            status: 'completed',
+            input: entry.input,
+            content: contentItems,
+            metadata,
+          },
+        });
+      } else {
+        const metadata = entry.childSessionID ? { status: 'cancelled', sessionID: entry.childSessionID } : undefined;
+        this._send('session.tool.failed', {
+          sessionID: this.sessionID,
+          assistantMessageID: this.assistantMessageID,
+          id: entry.callID,
+          error: { type: 'unknown', message: interrupted ? 'Subagent interrupted' : 'Subagent did not report a session ID' },
+          content: [],
+          executed: true,
+          ...(metadata ? { metadata } : {}),
+        });
+        this.content.push({
+          type: 'tool',
+          id: entry.callID,
+          name: 'subagent',
+          executed: true,
+          time: { created: entry.startedAt, ran: entry.startedAt, completed: now },
+          state: {
+            status: 'error',
+            input: entry.input,
+            error: { type: 'unknown', message: interrupted ? 'Subagent interrupted' : 'Subagent did not report a session ID' },
+            content: [],
+            ...(metadata ? { metadata } : {}),
+          },
+        });
+      }
+    }
+  }
+
   /** Mark turn completed successfully and emit terminal OpenCode events. */
   complete() {
     if (this.finished) return;
+    this._flushOpenSubagents(false);
     this.finished = true;
     const completed = Date.now();
 
@@ -374,7 +838,7 @@ export class AgyTurnTranslator {
     this._send('session.usage.updated', {
       sessionID: this.sessionID,
       cost: 0,
-      tokens: this.tokens,
+      tokens: this.sessionTokens,
     });
     this._send('session.execution.succeeded', { sessionID: this.sessionID });
     this._send('session.idle', { sessionID: this.sessionID });
@@ -385,6 +849,7 @@ export class AgyTurnTranslator {
   /** @param {string} reason */
   interrupt(reason = 'user') {
     if (this.finished) return;
+    this._flushOpenSubagents(true);
     this.finished = true;
     const completed = Date.now();
 
@@ -408,6 +873,7 @@ export class AgyTurnTranslator {
   /** @param {string} message */
   fail(message) {
     if (this.finished) return;
+    this._flushOpenSubagents(true);
     this.finished = true;
     const completed = Date.now();
     const errObj = { type: 'unknown', message: String(message || 'agy-cli error') };
