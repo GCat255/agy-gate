@@ -10,20 +10,45 @@ import { AgyRunner } from '../src/agy-runner.mjs';
 import { createRouterServer } from '../src/server.mjs';
 import { AGY_PROVIDER_ID, buildAgyProviderInfo, toOpenCodeModelInfo } from '../src/agy-models.mjs';
 
-test('router server injects agy-cli models, splits prompt traffic, and streams merged SSE', async () => {
+test('router server injects variant models, reuses warm agy worker across turns, and splits traffic', async () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-router-e2e-'));
   const mockAgyCmd = path.join(tempDir, process.platform === 'win32' ? 'mock-agy.cmd' : 'mock-agy.sh');
   const mockAgyJs = path.join(tempDir, 'mock-agy.mjs');
+  const bootCountFile = path.join(tempDir, 'boot-count.txt');
 
+  // Persistent warm mock implementing `models` and `--input-format stream-json --output-format stream-json --print=`
   fs.writeFileSync(
     mockAgyJs,
     [
-      "const args = process.argv.slice(2);",
-      "const conv = 'conv_mock_1';",
+      "import fs from 'node:fs';",
+      "import readline from 'node:readline';",
+      "if (process.argv.includes('models')) {",
+      "  console.log('gemini-4-hydrogen-low\\tGemini 4 Hydrogen (Low)');",
+      "  console.log('gemini-4-hydrogen-high\\tGemini 4 Hydrogen (High)');",
+      "  process.exit(0);",
+      "}",
+      `const countFile = ${JSON.stringify(bootCountFile)};`,
+      "const prev = fs.existsSync(countFile) ? Number(fs.readFileSync(countFile, 'utf8')) : 0;",
+      "fs.writeFileSync(countFile, String(prev + 1), 'utf8');",
+      "const conv = 'conv_mock_warm';",
       "console.log(JSON.stringify({ event: 'init', conversation_id: conv, init: { model: 'gemini-4-hydrogen-high' } }));",
-      "console.log(JSON.stringify({ event: 'step_update', step_update: { step_index: 1, state: 'ACTIVE', step_type: 'agent_response', text_delta: 'hi from ' } }));",
-      "console.log(JSON.stringify({ event: 'step_update', step_update: { step_index: 1, state: 'DONE', step_type: 'agent_response', text_delta: 'agy', usage: { input_tokens: 5, output_tokens: 3 } } }));",
-      "console.log(JSON.stringify({ event: 'result', result: { conversation_id: conv, status: 'SUCCESS', response: 'hi from agy' } }));",
+      "const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });",
+      "let turn = 0;",
+      "rl.on('line', (line) => {",
+      "  if (!line.trim()) return;",
+      "  const msg = JSON.parse(line);",
+      "  if (msg.event !== 'user') return;",
+      "  turn += 1;",
+      "  const reply = turn === 1 ? 'hi from ' : 'warm turn 2';",
+      "  if (turn === 1) {",
+      "    console.log(JSON.stringify({ event: 'step_update', step_update: { step_index: 1, state: 'ACTIVE', step_type: 'agent_response', text_delta: reply } }));",
+      "    console.log(JSON.stringify({ event: 'step_update', step_update: { step_index: 1, state: 'DONE', step_type: 'agent_response', text_delta: 'agy', usage: { input_tokens: 5, output_tokens: 3 } } }));",
+      "    console.log(JSON.stringify({ event: 'result', result: { conversation_id: conv, status: 'SUCCESS', response: 'hi from agy' } }));",
+      "  } else {",
+      "    console.log(JSON.stringify({ event: 'step_update', step_update: { step_index: 2, state: 'DONE', step_type: 'agent_response', text_delta: reply, usage: { input_tokens: 8, output_tokens: 3, cache_read_tokens: 5 } } }));",
+      "    console.log(JSON.stringify({ event: 'result', result: { conversation_id: conv, status: 'SUCCESS', response: reply } }));",
+      "  }",
+      "});",
     ].join('\n'),
     'utf8',
   );
@@ -124,7 +149,10 @@ test('router server injects agy-cli models, splits prompt traffic, and streams m
     getAgyCatalogFn: () => ({
       source: 'mock',
       provider: buildAgyProviderInfo(),
-      models: [toOpenCodeModelInfo({ id: 'gemini-4-hydrogen-high', name: 'Gemini 4 Hydrogen (High)' })],
+      models: [toOpenCodeModelInfo({ id: 'gemini-4-hydrogen', name: 'Gemini 4 Hydrogen', variants: ['low', 'high'] })],
+      variantTargets: new Map([
+        ['gemini-4-hydrogen', new Map([['low', 'gemini-4-hydrogen-low'], ['high', 'gemini-4-hydrogen-high'], ['__default__', 'gemini-4-hydrogen-high']])],
+      ]),
     }),
   });
 
@@ -134,15 +162,16 @@ test('router server injects agy-cli models, splits prompt traffic, and streams m
   sseHub.startUpstream();
 
   try {
-    // 1. Check provider & model injection
+    // 1. Check provider & variant model injection
     const providers = await (await fetch(`${gwBase}/api/provider`)).json();
     assert.deepEqual(providers.data.map((p) => p.id), ['opencode', AGY_PROVIDER_ID]);
 
     const models = await (await fetch(`${gwBase}/api/model?types=chat`)).json();
     assert.deepEqual(models.data.map((m) => `${m.providerID}/${m.id}`), [
       'opencode/gpt-5',
-      'agy-cli/gemini-4-hydrogen-high',
+      'agy-cli/gemini-4-hydrogen',
     ]);
+    assert.deepEqual(models.data[1].variants.map((v) => v.id), ['low', 'high']);
 
     // 2. Subscribe to SSE
     const sseAbort = new AbortController();
@@ -166,17 +195,18 @@ test('router server injects agy-cli models, splits prompt traffic, and streams m
       }
     })().catch(() => {});
 
-    // 3. Create session with agy-cli model
+    // 3. Create session with agy-cli variant model
     const created = await (
       await fetch(`${gwBase}/api/session`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-opencode-directory': 'E:/proj' },
-        body: JSON.stringify({ model: { providerID: AGY_PROVIDER_ID, id: 'gemini-4-hydrogen-high' } }),
+        body: JSON.stringify({ model: { providerID: AGY_PROVIDER_ID, id: 'gemini-4-hydrogen', variant: 'high' } }),
       })
     ).json();
     assert.equal(created.data.model.providerID, AGY_PROVIDER_ID);
+    assert.equal(created.data.model.variant, 'high');
 
-    // 4. Send prompt -> routed to mock agy-cli (upstreamPrompts stays empty!)
+    // 4. Turn 1 -> spawns warm worker
     const promptRes = await fetch(`${gwBase}/api/session/ses_test/prompt`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-opencode-directory': 'E:/proj' },
@@ -185,24 +215,36 @@ test('router server injects agy-cli models, splits prompt traffic, and streams m
     assert.equal(promptRes.status, 200);
     assert.equal(upstreamPrompts.length, 0);
 
-    // Wait for session.idle from mock agy
-    const deadline = Date.now() + 5000;
-    while (!received.some((e) => e.type === 'session.idle') && Date.now() < deadline) {
+    let deadline = Date.now() + 5000;
+    while (received.filter((e) => e.type === 'session.idle').length < 1 && Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 30));
     }
     assert.ok(
       received.some((e) => e.type === 'session.text.delta' && e.data.delta === 'hi from '),
       `Expected session.text.delta, got: ${JSON.stringify(received)}`,
     );
-    assert.ok(received.some((e) => e.type === 'session.idle'));
 
-    // 5. Verify merged messages endpoint contains upstream + local agy user & assistant messages
+    // 5. Turn 2 -> reuses the SAME warm worker process (boot count remains 1!)
+    const prompt2Res = await fetch(`${gwBase}/api/session/ses_test/prompt`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-opencode-directory': 'E:/proj' },
+      body: JSON.stringify({ id: 'msg_u1b', text: 'second turn' }),
+    });
+    assert.equal(prompt2Res.status, 200);
+    deadline = Date.now() + 5000;
+    while (received.filter((e) => e.type === 'session.idle').length < 2 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 30));
+    }
+    assert.equal(fs.readFileSync(bootCountFile, 'utf8').trim(), '1', 'Warm worker should serve turn 2 without respawning');
+
+    // 6. Verify merged messages endpoint contains upstream + local agy user & assistant messages
     const msgs = await (await fetch(`${gwBase}/api/session/ses_test/message`)).json();
     assert.ok(msgs.data.some((m) => m.id === 'msg_oc'));
     assert.ok(msgs.data.some((m) => m.id === 'msg_u1' && m.text === 'hello agy'));
     assert.ok(msgs.data.some((m) => m.type === 'assistant' && m.content[0]?.text === 'hi from agy'));
+    assert.ok(msgs.data.some((m) => m.type === 'assistant' && m.content[0]?.text === 'warm turn 2'));
 
-    // 6. Switch back to OpenCode model -> prompt now goes to upstream OpenCode
+    // 7. Switch back to OpenCode model -> prompt now goes to upstream OpenCode
     const swRes = await fetch(`${gwBase}/api/session/ses_test/model`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },

@@ -43,7 +43,10 @@ function cmdModels() {
   const catalog = getAgyCatalog({ forceRefresh: true });
   process.stdout.write(`source: ${catalog.source} (${catalog.models.length} models)\n`);
   for (const m of catalog.models) {
-    process.stdout.write(`  ${m.providerID}/${m.id}\t${m.name}\n`);
+    const variants = Array.isArray(m.variants) && m.variants.length > 0
+      ? ` [${m.variants.map((v) => v.id).join(', ')}]`
+      : '';
+    process.stdout.write(`  ${m.providerID}/${m.id}\t${m.name}${variants}\n`);
   }
 }
 

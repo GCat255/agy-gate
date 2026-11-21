@@ -10,6 +10,7 @@ export class AgyTurnTranslator {
    *   sessionID: string,
    *   assistantMessageID: string,
    *   modelID: string,
+   *   variant?: string,
    *   agent?: string,
    *   directory?: string | null,
    *   emit: (event: any) => void,
@@ -20,6 +21,7 @@ export class AgyTurnTranslator {
     this.sessionID = options.sessionID;
     this.assistantMessageID = options.assistantMessageID;
     this.modelID = options.modelID;
+    this.variant = options.variant;
     this.agent = options.agent || 'agy-cli';
     this.directory = options.directory || null;
     this.emit = options.emit;
@@ -63,7 +65,11 @@ export class AgyTurnTranslator {
       sessionID: this.sessionID,
       assistantMessageID: this.assistantMessageID,
       agent: this.agent,
-      model: { providerID: AGY_PROVIDER_ID, id: this.modelID },
+      model: {
+        providerID: AGY_PROVIDER_ID,
+        id: this.modelID,
+        ...(this.variant ? { variant: this.variant } : {}),
+      },
     });
   }
 
@@ -389,7 +395,11 @@ export class AgyTurnTranslator {
       type: 'assistant',
       time: { created: this.created, completed },
       agent: this.agent,
-      model: { providerID: AGY_PROVIDER_ID, id: this.modelID },
+      model: {
+        providerID: AGY_PROVIDER_ID,
+        id: this.modelID,
+        ...(this.variant ? { variant: this.variant } : {}),
+      },
       finish,
       ...(error ? { error } : {}),
       cost: 0,

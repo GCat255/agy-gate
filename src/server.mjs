@@ -382,6 +382,7 @@ export function createRouterServer(deps) {
             const started = deps.agyRunner.startTurn({
               sessionID,
               modelID: activeModel.id,
+              variant: activeModel.variant,
               directory: effectiveDir,
               promptPayload: userPayload,
             });
