@@ -37,7 +37,12 @@ describe('openchamber-bridge dynamic discovery & guidance', () => {
       const liveTools = await loadOpenChamberToolSpecs({ env: process.env, forceRefresh: true });
       const names = liveTools.map((t) => t.name);
       assert.ok(names.includes('openchamber'));
-      assert.ok(names.includes('openchamber_render'));
+      const renderTool = liveTools.find((t) => t.name === 'openchamber_render');
+      assert.ok(renderTool);
+      assert.ok(renderTool.description.includes('openui-lang'));
+      assert.ok(renderTool.description.includes('ask_question'));
+      assert.ok(renderTool.inputSchema?.properties?.parameters?.properties?.ui);
+      assert.ok(renderTool.inputSchema?.properties?.parameters?.properties?.awaitAnswer);
     }
 
     const fallbackPrefix = await buildSessionGuidancePrefix({
@@ -48,6 +53,7 @@ describe('openchamber-bridge dynamic discovery & guidance', () => {
     assert.ok(fallbackPrefix.includes('<openchamber_runtime_guidance>'));
     assert.ok(fallbackPrefix.includes('openui-lang'));
     assert.ok(fallbackPrefix.includes('ask_question'));
+    assert.ok(fallbackPrefix.length < 600, 'Turn-1 guidance pointer should stay compact for prompt cache efficiency');
   });
 });
 
@@ -181,47 +187,114 @@ describe('mcp-bridge registration, env gating, and OpenChamber HTTP forwarding',
 });
 
 describe('event-translator OpenChamber MCP normalization', () => {
-  it('strips mcp prefix from OpenChamber tool names and populates state.metadata.openchamber', () => {
+  it('strips mcp prefix and unwraps agy call_mcp_tool wrapper with coordinated callID', async () => {
     assert.equal(normalizeOpenChamberToolName('mcp__openchamber__openchamber_render'), 'openchamber_render');
     assert.equal(normalizeOpenChamberToolName('openchamber/openchamber_web'), 'openchamber_web');
 
-    const events = [];
-    const tr = new AgyTurnTranslator({
-      sessionID: 'ses_1',
-      assistantMessageID: 'msg_1',
-      modelID: 'gemini-4-hydrogen',
-      emit: (e) => events.push(e),
-    });
-
-    tr.handleLine({
-      event: 'step_update',
-      step_update: {
-        step_index: 1,
-        state: 'DONE',
-        step_type: 'tool',
-        tool_name: 'mcp__openchamber__openchamber_render',
-        tool_info: {
-          parameters: { action: 'render.page', ui: 'root = Stack([])', awaitAnswer: true },
-          output: JSON.stringify({
-            schemaVersion: 1,
-            ok: true,
-            action: 'render.page',
-            data: { answer: { answered: true, summary: 'Use B' } },
-          }),
+    await withTempDir(async (dir) => {
+      const callLogPath = path.join(dir, 'calls.jsonl');
+      const events = [];
+      const tr = new AgyTurnTranslator({
+        sessionID: 'ses_1',
+        assistantMessageID: 'msg_1',
+        modelID: 'gemini-4-hydrogen',
+        emit: (e) => events.push(e),
+        onOpenChamberToolStart: ({ tool, callID }) => {
+          fs.appendFile(callLogPath, `${JSON.stringify({ tool, callID, ts: Date.now() })}\n`).catch(() => {});
         },
-      },
+      });
+
+      tr.handleLine({
+        event: 'step_update',
+        step_update: {
+          step_index: 1,
+          state: 'ACTIVE',
+          step_type: 'tool',
+          tool_name: 'call_mcp_tool',
+          tool_info: {
+            parameters: {
+              ServerName: 'openchamber',
+              ToolName: 'openchamber_render',
+              Arguments: { action: 'render.page', parameters: { ui: 'root = Stack([])', awaitAnswer: true } },
+            },
+          },
+        },
+      });
+
+      await new Promise((r) => setTimeout(r, 30));
+
+      // Simulate mcp-bridge reading the coordinated callID before POSTing to OpenChamber
+      const captured = [];
+      const stdin = new PassThrough();
+      const stdout = new PassThrough();
+      const done = runMcpBridgeServer({
+        input: stdin,
+        output: stdout,
+        env: {
+          OPENCHAMBER_AGENT_TOOL_URL: 'http://127.0.0.1:3000/api/openchamber/agent-tool',
+          OPENCHAMBER_AGENT_TOOL_TOKEN: 'tok',
+          OPENCHAMBER_ROUTER_CALL_LOG: callLogPath,
+          OPENCHAMBER_ROUTER_SESSION_ID: 'ses_1',
+        },
+        fetchImpl: async (_url, init) => {
+          captured.push(JSON.parse(String(init.body)));
+          return new Response(
+            JSON.stringify({ schemaVersion: 1, ok: true, action: 'render.page', data: { answer: { answered: true, summary: 'Use B' } } }),
+            { status: 200 },
+          );
+        },
+      });
+      stdin.write(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          id: 9,
+          method: 'tools/call',
+          params: { name: 'openchamber_render', arguments: { action: 'render.page', parameters: { ui: 'root = Stack([])', awaitAnswer: true } } },
+        }) + '\n',
+      );
+      await new Promise((r) => setTimeout(r, 50));
+      stdin.end();
+      await done;
+
+      tr.handleLine({
+        event: 'step_update',
+        step_update: {
+          step_index: 1,
+          state: 'DONE',
+          step_type: 'tool',
+          tool_name: 'call_mcp_tool',
+          tool_info: {
+            parameters: {
+              ServerName: 'openchamber',
+              ToolName: 'openchamber_render',
+              Arguments: { action: 'render.page', parameters: { ui: 'root = Stack([])', awaitAnswer: true } },
+            },
+            output: JSON.stringify({
+              schemaVersion: 1,
+              ok: true,
+              action: 'render.page',
+              data: { answer: { answered: true, summary: 'Use B' } },
+            }),
+          },
+        },
+      });
+      const msg = tr.complete();
+
+      const started = events.find((e) => e.type === 'session.tool.input.started');
+      assert.equal(started.data.name, 'openchamber_render');
+      assert.equal(captured[0].callID, started.data.id, 'mcp-bridge callID must match UI tool part callID');
+
+      const success = events.find((e) => e.type === 'session.tool.success');
+      assert.equal(success.data.metadata.openchamber.ok, true);
+      assert.equal(success.data.metadata.openchamber.action, 'render.page');
+      assert.equal(success.data.metadata.openchamber.answer.summary, 'Use B');
+
+      assert.equal(msg.content[0].name, 'openchamber_render');
+      assert.deepEqual(msg.content[0].state.input, {
+        action: 'render.page',
+        parameters: { ui: 'root = Stack([])', awaitAnswer: true },
+      });
+      assert.equal(msg.content[0].state.metadata.openchamber.answer.answered, true);
     });
-    const msg = tr.complete();
-
-    const started = events.find((e) => e.type === 'session.tool.input.started');
-    assert.equal(started.data.name, 'openchamber_render');
-
-    const success = events.find((e) => e.type === 'session.tool.success');
-    assert.equal(success.data.metadata.openchamber.ok, true);
-    assert.equal(success.data.metadata.openchamber.action, 'render.page');
-    assert.equal(success.data.metadata.openchamber.answer.summary, 'Use B');
-
-    assert.equal(msg.content[0].name, 'openchamber_render');
-    assert.equal(msg.content[0].state.metadata.openchamber.answer.answered, true);
   });
 });

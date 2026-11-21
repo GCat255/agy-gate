@@ -25,6 +25,37 @@ export const OPENCHAMBER_TOOL_NAMES = new Set([
 ]);
 
 /**
+ * Unwrap either direct OpenChamber tool name or `agy-cli`'s `call_mcp_tool` wrapper.
+ * @param {string} rawName
+ * @param {any} rawParams
+ * @returns {{ name: string, input: any, isOpenChamberTool: boolean }}
+ */
+export function unwrapOpenChamberToolCall(rawName, rawParams) {
+  const s = String(rawName || '').trim();
+  if (
+    s === 'call_mcp_tool'
+    && rawParams
+    && typeof rawParams === 'object'
+    && rawParams.ServerName === OPENCHAMBER_MCP_NAME
+    && typeof rawParams.ToolName === 'string'
+  ) {
+    const innerName = normalizeOpenChamberToolName(rawParams.ToolName);
+    const innerInput = rawParams.Arguments && typeof rawParams.Arguments === 'object' ? rawParams.Arguments : {};
+    return {
+      name: innerName,
+      input: innerInput,
+      isOpenChamberTool: OPENCHAMBER_TOOL_NAMES.has(innerName),
+    };
+  }
+  const normalized = normalizeOpenChamberToolName(s);
+  return {
+    name: normalized,
+    input: rawParams && typeof rawParams === 'object' ? rawParams : {},
+    isOpenChamberTool: OPENCHAMBER_TOOL_NAMES.has(normalized),
+  };
+}
+
+/**
  * Strip `mcp__openchamber__` / `openchamber/` MCP prefixes emitted by `agy-cli` back to canonical OpenChamber tool names.
  * @param {string} rawName
  */
@@ -123,6 +154,28 @@ export function ensureOpenChamberMcpConfig({ cliEntryPath, env = process.env }) 
   return { ok: true, configPath, changed: true };
 }
 
+async function resolveCoordinatedCallId(callLogPath, canonicalName) {
+  if (callLogPath) {
+    const deadline = Date.now() + 80;
+    while (Date.now() < deadline) {
+      try {
+        const raw = fs.readFileSync(callLogPath, 'utf8');
+        const lines = raw.trim().split(/\r?\n/).filter(Boolean);
+        for (let i = lines.length - 1; i >= 0; i -= 1) {
+          const entry = JSON.parse(lines[i]);
+          if (entry?.tool === canonicalName && entry?.callID && Date.now() - (entry.ts || 0) < 10_000) {
+            return String(entry.callID);
+          }
+        }
+      } catch {
+        // Call log not yet written
+      }
+      await new Promise((r) => setTimeout(r, 5));
+    }
+  }
+  return `call_agy_mcp_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+}
+
 /**
  * Execute one OpenChamber agent tool call over HTTP against `OPENCHAMBER_AGENT_TOOL_URL`.
  * Reuses OpenChamber's exact JSON envelope (`{ input, sessionID, contextDirectory, callID, tool }`).
@@ -154,7 +207,7 @@ export async function invokeOpenChamberAgentTool({ name, args, env = process.env
 
   const sessionID = env.OPENCHAMBER_ROUTER_SESSION_ID?.trim() || undefined;
   const contextDirectory = env.OPENCHAMBER_ROUTER_DIRECTORY?.trim() || process.cwd();
-  const callID = `call_agy_mcp_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+  const callID = await resolveCoordinatedCallId(env.OPENCHAMBER_ROUTER_CALL_LOG?.trim(), canonicalName);
 
   const response = await fetchImpl(endpoint, {
     method: 'POST',

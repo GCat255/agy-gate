@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { resolveAgyBinary } from './config.mjs';
 import { loadMagpieAgyEnv } from './magpie-env.mjs';
@@ -109,6 +110,7 @@ export class AgyRunner {
     const childEnv = { ...this.env };
     if (opts.sessionID) childEnv.OPENCHAMBER_ROUTER_SESSION_ID = opts.sessionID;
     if (opts.cwd) childEnv.OPENCHAMBER_ROUTER_DIRECTORY = opts.cwd;
+    if (opts.callLogPath) childEnv.OPENCHAMBER_ROUTER_CALL_LOG = opts.callLogPath;
     const args = [];
 
     if (useMagpie) {
@@ -172,7 +174,11 @@ export class AgyRunner {
    * @param {{ sessionID: string, realModelID: string, cwd: string, promptText: string }} opts
    */
   _spawnWorker(opts) {
-    const cfg = this._buildAgySpawnConfig({ sessionID: opts.sessionID, cwd: opts.cwd });
+    const cfg = this._buildAgySpawnConfig({
+      sessionID: opts.sessionID,
+      cwd: opts.cwd,
+      callLogPath: opts.callLogPath,
+    });
     if (!cfg) return null;
 
     const sessionState = this.store.getSession(opts.sessionID);
@@ -352,6 +358,8 @@ export class AgyRunner {
     const cwd = directory && fs.existsSync(directory) ? directory : process.cwd();
     const promptText = this.buildPromptText(promptPayload, { syntheticTexts, guidancePrefix });
 
+    const safeSession = String(sessionID).replace(/[^a-zA-Z0-9._-]/g, '_');
+    const callLogPath = path.join(this.store.sessionsDir, `${safeSession}.calls.jsonl`);
     const assistantMessageID = `msg_${Date.now()}_${++this.seq}`;
     const translator = new AgyTurnTranslator({
       sessionID,
@@ -362,6 +370,11 @@ export class AgyRunner {
       directory,
       emit: (ev) => this.sseHub.broadcast(ev),
       onConversationId: (convId) => this.store.setAgyConversationId(sessionID, convId),
+      onOpenChamberToolStart: ({ tool, callID }) => {
+        try {
+          fs.appendFileSync(callLogPath, `${JSON.stringify({ tool, callID, ts: Date.now() })}\n`, 'utf8');
+        } catch {}
+      },
     });
 
     const canReuse =
@@ -375,7 +388,10 @@ export class AgyRunner {
     let worker = canReuse ? existing : null;
     if (!worker) {
       if (existing) this._retireWorker(sessionID, false);
-      worker = this._spawnWorker({ sessionID, realModelID, cwd, promptText });
+      try {
+        fs.unlinkSync(callLogPath);
+      } catch {}
+      worker = this._spawnWorker({ sessionID, realModelID, cwd, promptText, callLogPath });
       if (!worker) {
         translator.begin();
         const msg = translator.fail('agy executable not found on this machine');

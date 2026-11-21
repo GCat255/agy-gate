@@ -5,19 +5,17 @@ import { pathToFileURL } from 'node:url';
 
 const FALLBACK_UI_BLOCKS_GUIDANCE = [
   'UI blocks: a fenced ```openui-lang block in your reply draws native interactive UI inside OpenChamber; keep narrative explanation in Markdown around it.',
-  'Use a block for comparisons, flows, charts, status summaries, or interactive decisions (Card + Choice + Input + Slider + DateInput + Button).',
   'Syntax: one statement per line, `name = Component(args);` with `root = Stack([...])` on line 1. Positional args only; strings `"..."`, arrays `[...]`, objects `{key: value}`.',
-  'Buttons on the same Card/value form one decision and submit choices back cleanly when clicked.',
 ].join('\n');
 
-const FALLBACK_RENDER_GUIDANCE = [
-  'When OpenChamber MCP tools (`openchamber_render`, `openchamber`, `openchamber_web`, `openchamber_memory`, etc.) are available in your tool list, you can invoke them directly.',
-  'Never call `ask_question` in this headless runtime because it returns immediately without waiting for UI input; use an `openui-lang` decision card or `openchamber_render` with `awaitAnswer: true` instead.',
-].join('\n');
+const HEADLESS_CHOICE_RULE =
+  'IMPORTANT (agy-cli headless mode): NEVER call `ask_question` — it returns empty immediately without waiting for UI input. '
+  + 'For interactive choices or forms, either call `openchamber_render` (`action: "render.page"`, `ui` or `html`, `title`, `awaitAnswer: true`), '
+  + 'or write a fenced ```openui-lang block in your Markdown reply.';
 
 const cachedWebRootByKey = new Map();
 let cachedGuidance = null;
-let cachedToolsByKey = new Map();
+const cachedToolsByKey = new Map();
 
 /**
  * Locate the installed `@openchamber/web` directory dynamically so upgrades are picked up automatically.
@@ -33,7 +31,6 @@ export function resolveOpenChamberWebRoot(env = process.env) {
     candidates.push(path.resolve(env.OPENCHAMBER_WEB_ROOT.trim()));
   }
 
-  // Global npm install beside node executable (e.g. AppData\Local\Programs\nodejs\node_modules\@openchamber\web)
   const execDir = path.dirname(process.execPath);
   candidates.push(path.join(execDir, 'node_modules', '@openchamber', 'web'));
   candidates.push(path.join(execDir, '..', 'node_modules', '@openchamber', 'web'));
@@ -152,28 +149,26 @@ export async function loadOpenChamberGuidance(options = {}) {
 }
 
 /**
- * Build the one-time system instruction block prepended to the first turn of a new OpenChamber `agy` conversation.
+ * Build a compact, deterministic first-turn pointer (~320 chars) for new OpenChamber conversations.
+ * Full `openui-lang` syntax lives lazily inside MCP `openchamber_render` schema so normal turns pay near-zero token overhead and prompt prefix cache stays intact.
  * @param {{ env?: NodeJS.ProcessEnv, hasMcpBridge?: boolean }} [options]
  */
 export async function buildSessionGuidancePrefix(options = {}) {
-  const { uiBlocksGuidance, renderPageGuidance } = await loadOpenChamberGuidance(options);
-  const lines = [
-    '<openchamber_runtime_guidance>',
-    'You are running inside OpenChamber Web UI via agy-opencode-router.',
-    'Do NOT call `ask_question` in this environment: headless mode cannot display native `ask_question` prompts and immediately returns empty.',
-    options.hasMcpBridge !== false
-      ? 'OpenChamber runtime tools (`openchamber`, `openchamber_render`, `openchamber_web`, etc.) are bridged as MCP tools when present in your tool list.'
-      : 'Use embedded `openui-lang` fenced blocks for rich UI or interactive choices.',
-    '',
-    uiBlocksGuidance,
-  ];
-  if (renderPageGuidance) {
-    lines.push('', renderPageGuidance);
-  } else {
-    lines.push('', FALLBACK_RENDER_GUIDANCE);
+  if (options.hasMcpBridge !== false) {
+    return [
+      '<openchamber_runtime_guidance>',
+      HEADLESS_CHOICE_RULE,
+      'Read MCP `openchamber_render` schema before rendering UI for complete `openui-lang` component signatures and `render.page` arguments.',
+      '</openchamber_runtime_guidance>',
+    ].join('\n');
   }
-  lines.push('</openchamber_runtime_guidance>');
-  return lines.join('\n');
+  const { uiBlocksGuidance } = await loadOpenChamberGuidance(options);
+  return [
+    '<openchamber_runtime_guidance>',
+    HEADLESS_CHOICE_RULE,
+    uiBlocksGuidance,
+    '</openchamber_runtime_guidance>',
+  ].join('\n');
 }
 
 function normalizeJsonSchemaForMcp(schema) {
@@ -184,8 +179,9 @@ function normalizeJsonSchemaForMcp(schema) {
 }
 
 /**
- * Extract tool schemas directly from installed OpenChamber `agent-tool/runtime.js` using an in-memory stub
- * so OpenChamber upgrades automatically update all bridged MCP tools with zero disk side effects.
+ * Extract tool schemas directly from installed OpenChamber `agent-tool/runtime.js` using an in-memory stub.
+ * Appends live `UI_BLOCKS_GUIDANCE` lazily into `openchamber_render` description so `agy` fetches it on demand
+ * without bloating every session's prompt prefix or hurting KV cache hit rate.
  * @param {{ env?: NodeJS.ProcessEnv, forceRefresh?: boolean }} [options]
  * @returns {Promise<Array<{ name: string, description: string, inputSchema: object }>>}
  */
@@ -197,6 +193,8 @@ export async function loadOpenChamberToolSpecs(options = {}) {
   if (!options.forceRefresh && cachedToolsByKey.has(cacheKey)) {
     return cachedToolsByKey.get(cacheKey);
   }
+
+  const guidance = await loadOpenChamberGuidance({ env, forceRefresh: options.forceRefresh });
 
   if (webRoot) {
     const agentToolRuntimePath = path.join(webRoot, 'build', 'server', 'lib', 'agent-tool', 'runtime.js');
@@ -213,32 +211,42 @@ export async function loadOpenChamberToolSpecs(options = {}) {
           };
           const runtime = mod.createAgentToolRuntime({
             fsPromises: memFs,
-            dataDir: path.join(os.tmpdir(), 'agy-router-probe'),
+            path,
+            instanceDir: path.join(os.tmpdir(), 'agy-router-probe'),
             getActiveHost: () => '127.0.0.1:3000',
           });
           await runtime.materializePlugin(flags);
           const pluginSource = files.get('index.js');
           if (pluginSource) {
-            const tools = await evaluatePluginSourceForSchemas(pluginSource);
+            const tools = await evaluatePluginSourceForSchemas(pluginSource, guidance);
             if (tools.length > 0) {
+              tools.sort((a, b) => a.name.localeCompare(b.name));
               cachedToolsByKey.set(cacheKey, tools);
               return tools;
             }
           }
         }
       } catch {
-        // Fall through to materialized plugin on disk or built-in fallback
+        // Fall through to built-in fallback
       }
     }
   }
 
-  const fallback = buildFallbackToolSpecs(flags);
+  const fallback = buildFallbackToolSpecs(flags, guidance);
+  fallback.sort((a, b) => a.name.localeCompare(b.name));
   cachedToolsByKey.set(cacheKey, fallback);
   return fallback;
 }
 
-async function evaluatePluginSourceForSchemas(pluginSource) {
-  // Rewrite default ESM export into a data-URL module cleanly loaded in memory.
+function enrichToolDescription(name, description, guidance) {
+  if (name !== 'openchamber_render') return description;
+  const parts = [description, HEADLESS_CHOICE_RULE];
+  if (guidance?.renderPageGuidance) parts.push(guidance.renderPageGuidance);
+  if (guidance?.uiBlocksGuidance) parts.push(guidance.uiBlocksGuidance);
+  return parts.filter(Boolean).join('\n\n');
+}
+
+async function evaluatePluginSourceForSchemas(pluginSource, guidance) {
   const dataUrl = `data:text/javascript;base64,${Buffer.from(pluginSource, 'utf8').toString('base64')}`;
   const pluginMod = await import(dataUrl);
   const plugin = pluginMod?.default;
@@ -252,9 +260,10 @@ async function evaluatePluginSourceForSchemas(pluginSource) {
           namespace: () => {},
           add: (spec) => {
             if (!spec?.name) return;
+            const name = String(spec.name);
             captured.push({
-              name: String(spec.name),
-              description: String(spec.description || spec.name),
+              name,
+              description: enrichToolDescription(name, String(spec.description || name), guidance),
               inputSchema: normalizeJsonSchemaForMcp(spec.input),
             });
           },
@@ -265,7 +274,7 @@ async function evaluatePluginSourceForSchemas(pluginSource) {
   return captured;
 }
 
-function buildFallbackToolSpecs(flags) {
+function buildFallbackToolSpecs(flags, guidance) {
   const genericSchema = {
     type: 'object',
     properties: {
@@ -275,9 +284,28 @@ function buildFallbackToolSpecs(flags) {
     required: ['action'],
     additionalProperties: true,
   };
+  const renderSchema = {
+    type: 'object',
+    properties: {
+      action: { type: 'string', enum: ['render.page'], description: 'OpenChamber render action ("render.page")' },
+      parameters: {
+        type: 'object',
+        properties: {
+          title: { type: 'string', description: 'Page title' },
+          ui: { type: 'string', description: 'openui-lang program drawing interactive components' },
+          html: { type: 'string', description: 'Self-contained HTML document' },
+          awaitAnswer: { type: 'boolean', description: 'Block until user submits the page or form' },
+          answerLater: { type: 'boolean', description: 'Return immediately and receive answer as a message later' },
+        },
+        additionalProperties: true,
+      },
+    },
+    required: ['action'],
+    additionalProperties: true,
+  };
   const list = [];
   if (flags.includeControl) list.push({ name: 'openchamber', description: 'Control OpenChamber projects, sessions, and file panel.', inputSchema: genericSchema });
-  if (flags.includeRender) list.push({ name: 'openchamber_render', description: 'Draw an inline HTML or openui-lang UI page in OpenChamber chat.', inputSchema: genericSchema });
+  if (flags.includeRender) list.push({ name: 'openchamber_render', description: enrichToolDescription('openchamber_render', 'Draw an inline HTML or openui-lang UI page in OpenChamber chat.', guidance), inputSchema: renderSchema });
   if (flags.includeWeb) list.push({ name: 'openchamber_web', description: "Interact with OpenChamber's browser panel.", inputSchema: genericSchema });
   if (flags.includeMemory) list.push({ name: 'openchamber_memory', description: 'Read and save cross-session OpenChamber memories.', inputSchema: genericSchema });
   if (flags.includeSchedule) list.push({ name: 'openchamber_schedule', description: 'Manage OpenChamber scheduled tasks.', inputSchema: genericSchema });

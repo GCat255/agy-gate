@@ -1,5 +1,5 @@
 import { AGY_PROVIDER_ID } from './agy-models.mjs';
-import { OPENCHAMBER_TOOL_NAMES, normalizeOpenChamberToolName } from './mcp-bridge.mjs';
+import { unwrapOpenChamberToolCall } from './mcp-bridge.mjs';
 
 /**
  * Translate `agy-cli` `--output-format stream-json` NDJSON events into
@@ -27,6 +27,7 @@ export class AgyTurnTranslator {
     this.directory = options.directory || null;
     this.emit = options.emit;
     this.onConversationId = options.onConversationId;
+    this.onOpenChamberToolStart = options.onOpenChamberToolStart;
 
     this.created = Date.now();
     this.started = false;
@@ -196,15 +197,20 @@ export class AgyTurnTranslator {
   _handleToolStep(stepIndex, step) {
     const info = step.tool_info || {};
     const rawName = String(step.tool_name || info.name || 'tool');
-    const name = normalizeOpenChamberToolName(rawName);
-    const isOpenChamberTool = OPENCHAMBER_TOOL_NAMES.has(name);
-    const parameters = info.parameters && typeof info.parameters === 'object' ? info.parameters : {};
+    const rawParams = info.parameters && typeof info.parameters === 'object' ? info.parameters : {};
+    const unwrapped = unwrapOpenChamberToolCall(rawName, rawParams);
+    const name = unwrapped.name;
+    const isOpenChamberTool = unwrapped.isOpenChamberTool;
+    const parameters = unwrapped.input;
     let tool = this.activeTools.get(stepIndex);
 
     if (!tool) {
       const callID = String(info.call_id || info.id || `call_${this.assistantMessageID}_${stepIndex}`);
       tool = { callID, name, input: parameters, startedAt: Date.now(), closed: false };
       this.activeTools.set(stepIndex, tool);
+      if (isOpenChamberTool && this.onOpenChamberToolStart) {
+        this.onOpenChamberToolStart({ tool: name, callID });
+      }
       this._send('session.tool.input.started', {
         sessionID: this.sessionID,
         assistantMessageID: this.assistantMessageID,
