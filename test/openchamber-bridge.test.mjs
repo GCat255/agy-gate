@@ -8,6 +8,7 @@ import {
   buildSessionGuidancePrefix,
   loadOpenChamberGuidance,
   loadOpenChamberToolSpecs,
+  probeOpenChamberCompat,
   resolveOpenChamberWebRoot,
 } from '../src/bridge/openchamber.mjs';
 import {
@@ -56,6 +57,26 @@ describe('openchamber-bridge dynamic discovery & guidance', () => {
     assert.ok(fallbackPrefix.includes('openui-lang'));
     assert.ok(fallbackPrefix.includes('ask_question'));
     assert.ok(fallbackPrefix.length < 600, 'Turn-1 guidance pointer should stay compact for prompt cache efficiency');
+
+    await withTempDir(async (fakeRoot) => {
+      await fs.writeFile(path.join(fakeRoot, 'package.json'), JSON.stringify({ name: '@openchamber/web', version: '9.9.9' }), 'utf8');
+      const degradedProbe = await probeOpenChamberCompat({
+        env: { OPENCHAMBER_WEB_ROOT: fakeRoot },
+        forceRefresh: true,
+      });
+      assert.equal(degradedProbe.degraded, true);
+      assert.equal(degradedProbe.webVersion, '9.9.9');
+      assert.equal(degradedProbe.guidanceSource, 'fallback');
+      assert.equal(degradedProbe.toolSpecSource, 'fallback');
+    });
+
+    if (installedRoot) {
+      const liveProbe = await probeOpenChamberCompat({ env: process.env, forceRefresh: true });
+      assert.equal(liveProbe.degraded, false);
+      assert.equal(liveProbe.guidanceSource, 'openchamber-live');
+      assert.equal(liveProbe.toolSpecSource, 'openchamber-live');
+      assert.ok(liveProbe.toolNames.includes('openchamber_render'));
+    }
   });
 });
 

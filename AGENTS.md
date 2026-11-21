@@ -84,3 +84,45 @@ scripts/
   npm test
   ```
 - **安全与敏感数据**：禁止将 Token、OAuth 凭证（`quota-auth.json`）、本地会话日志提交到仓库；`doctor` / 日志输出需先脱敏。
+
+---
+
+## 4. OP / OpenCode 更新后的自检与反“打补丁”兼容维护规范
+
+OpenChamber（`@openchamber/web`）或 `@opencode/cli` 更新频繁，但 `agy-gate` 与它们的实际耦合面仅限于以下 **5 个契约边界**；其余接口均由 `src/gateway/server.mjs` 透明反向代理。每次 OP 升级后，按本节先自检再决定是否改动，严禁为追随上游局部变化堆砌临时补丁。
+
+### 4.1 五个契约边界
+
+| 边界 | 依赖方 | 关键契约 | 所在模块 |
+|---|---|---|---|
+| **1. CLI 托管启动** | OpenChamber lifecycle | `--version`、`serve --stdio --hostname --port`、`server listening on http://...` | `bin/agy-gate.mjs` |
+| **2. HTTP / SSE 分流协议** | OpenChamber UI / Server | `/api/provider`、`/api/model`、`/api/session*`、`PATCH /api/session/:id`、`/api/experimental/generate/text`、`/api/event` | `src/gateway/server.mjs`、`src/agy/event-translator.mjs` |
+| **3. Web 运行时动态抽取** | `@openchamber/web` | `ui-blocks-guidance.js`、`runtime.js`、`agent-tool/runtime.js` (`createAgentToolRuntime().materializePlugin`) | `src/bridge/openchamber.mjs` |
+| **4. Agent Tool 转发与命名** | OpenChamber Agent Tool | `OPENCHAMBER_AGENT_TOOL_URL` / `TOKEN`、内置工具名前缀归一化 | `src/bridge/mcp.mjs` |
+| **5. 宿主配置与扩展 API** | `~/.config/openchamber` | `settings.json` (`opencodeBinary`)、`extensions.json`、`openchamber.apiVersion: 1` (`quota`) | `src/cli/setup.mjs`、`extensions/agy-quota/` |
+
+### 4.2 OP 更新后五步自检流程
+
+升级 OP 或 OpenCode 后，必须先跑通以下最小闭环检查；全部正常则**零代码改动**：
+
+1. **自动化契约与单测**：运行 `npm run check && npm test` 与 `agy-gate doctor`。重点核对 `openchamberCompat` 中 `degraded === false`、`guidanceSource === "openchamber-live"`、`toolSpecSource === "openchamber-live"`，及时发现“内部模块路径变更导致的静默降级”。
+2. **宿主启动与绑定复核**：运行 `occ` 重启服务，确认进程正常就绪；若升级清除了扩展或重置配置，跑一次 `agy-gate setup` 复原。
+3. **主对话与小功能实测**：新建 `agy-cli` 会话发送包含工具调用的消息，确认 **思考流（`reasoning`）→ 工具调用 → 正文 → 首轮自动命名** 完整显示。
+4. **子代理与卡片交互实测**：触发一次 `invoke_subagent` 与二次 `send_message` 续传，确认子会话树状态正常；如遇交互卡片，确认 `openchamber_render` 回传正常。
+5. **用量扩展核验**：检查 OpenChamber「设置 → 用量」中 `Agy CLI` 5 小时 / 每周配额窗口正常刷新。
+
+### 4.3 反“打补丁式兼容”四大原则
+
+遇到自检失败或契约退化时，必须遵守以下原则重构适配层，禁止靠堆叠条件分支续命：
+
+1. **动态发现与透传优先，禁止静态复制上游实现**
+   能通过运行时动态读取（如 `openchamber.mjs` 从 `@openchamber/web` 提取指南与工具 Schema）或透明转发解决的问题，不得复制一份静态文案/枚举进本仓库去追上游每次微调。
+2. **单点适配器收敛，禁止补丁散落多处**
+   所有与 OP/OpenCode 协议相关的差异只允许收敛在对应边界模块（HTTP 路由归 `gateway/server.mjs`，事件格式归 `agy/event-translator.mjs`，Web 运行时抽取归 `bridge/openchamber.mjs`），不得把针对 OP 版本特性的 `if/else` 散写进 `runner.mjs`、`store.mjs` 或 `subagent-bridge.mjs`。
+3. **只做最小必需兼容（P0/P1 修，P2 透传不管）**
+   - **P0 阻断**（无法启动、对话断流、工具/子代理失效、标题失联）：必须修复对应边界适配器。
+   - **P1 能力退化**（如 `doctor` 报 `degraded: true` 回退到 `fallback`）：更新单个发现适配器重新对齐 live 导出。
+   - **P2 非核心体验差异**（非阻塞纯前端样式调整、仅与原生 OpenCode 相关的新特性）：不做额外适配，交由上游 `opencode serve` 透明承接。
+4. **替换式演进，禁止叠加历史多版本兼容分支**
+   本仓库只维护与当前主流稳定版 OP/OpenCode 对齐的单一路径。需要兼容新版契约时，**直接替换旧映射逻辑并删除失效适配代码**（必要时使用上游最新字段语义）；若用户暂需旧版 OP，通过 `occ` 菜单的「升级 → 回滚」或切换引擎入口处理，不在源码中保留多版本并存的 `if (ver < ...)` 历史补丁包袱。
+

@@ -15,7 +15,7 @@ const HEADLESS_CHOICE_RULE =
   + 'For subagents, use native `invoke_subagent`/`send_message`/`manage_subagents` only (never `openchamber` `ownWork`/`returnResult`).';
 
 const cachedWebRootByKey = new Map();
-let cachedGuidance = null;
+const cachedGuidanceByKey = new Map();
 const cachedToolsByKey = new Map();
 
 /**
@@ -131,10 +131,13 @@ export function readOpenChamberToolFlags(env = process.env) {
  * @param {{ env?: NodeJS.ProcessEnv, forceRefresh?: boolean }} [options]
  */
 export async function loadOpenChamberGuidance(options = {}) {
-  if (!options.forceRefresh && cachedGuidance) return cachedGuidance;
-
   const env = options.env || process.env;
   const webRoot = resolveOpenChamberWebRoot(env);
+  const cacheKey = webRoot || 'none';
+  if (!options.forceRefresh && cachedGuidanceByKey.has(cacheKey)) {
+    return cachedGuidanceByKey.get(cacheKey);
+  }
+
   let uiBlocksGuidance = FALLBACK_UI_BLOCKS_GUIDANCE;
   let renderPageGuidance = '';
   let source = 'fallback';
@@ -167,12 +170,13 @@ export async function loadOpenChamberGuidance(options = {}) {
     }
   }
 
-  cachedGuidance = {
+  const result = {
     source,
     uiBlocksGuidance,
     renderPageGuidance,
   };
-  return cachedGuidance;
+  cachedGuidanceByKey.set(cacheKey, result);
+  return result;
 }
 
 /**
@@ -205,14 +209,7 @@ function normalizeJsonSchemaForMcp(schema) {
   return schema;
 }
 
-/**
- * Extract tool schemas directly from installed OpenChamber `agent-tool/runtime.js` using an in-memory stub.
- * Appends live `UI_BLOCKS_GUIDANCE` lazily into `openchamber_render` description so `agy` fetches it on demand
- * without bloating every session's prompt prefix or hurting KV cache hit rate.
- * @param {{ env?: NodeJS.ProcessEnv, forceRefresh?: boolean }} [options]
- * @returns {Promise<Array<{ name: string, description: string, inputSchema: object }>>}
- */
-export async function loadOpenChamberToolSpecs(options = {}) {
+async function loadToolSpecsWithMeta(options = {}) {
   const env = options.env || process.env;
   const webRoot = resolveOpenChamberWebRoot(env);
   const flags = readOpenChamberToolFlags(env);
@@ -248,8 +245,9 @@ export async function loadOpenChamberToolSpecs(options = {}) {
             const tools = await evaluatePluginSourceForSchemas(pluginSource, guidance);
             if (tools.length > 0) {
               tools.sort((a, b) => a.name.localeCompare(b.name));
-              cachedToolsByKey.set(cacheKey, tools);
-              return tools;
+              const entry = { source: 'openchamber-live', tools };
+              cachedToolsByKey.set(cacheKey, entry);
+              return entry;
             }
           }
         }
@@ -261,8 +259,57 @@ export async function loadOpenChamberToolSpecs(options = {}) {
 
   const fallback = buildFallbackToolSpecs(flags, guidance);
   fallback.sort((a, b) => a.name.localeCompare(b.name));
-  cachedToolsByKey.set(cacheKey, fallback);
-  return fallback;
+  const entry = { source: 'fallback', tools: fallback };
+  cachedToolsByKey.set(cacheKey, entry);
+  return entry;
+}
+
+/**
+ * Extract tool schemas directly from installed OpenChamber `agent-tool/runtime.js` using an in-memory stub.
+ * Appends live `UI_BLOCKS_GUIDANCE` lazily into `openchamber_render` description so `agy` fetches it on demand
+ * without bloating every session's prompt prefix or hurting KV cache hit rate.
+ * @param {{ env?: NodeJS.ProcessEnv, forceRefresh?: boolean }} [options]
+ * @returns {Promise<Array<{ name: string, description: string, inputSchema: object }>>}
+ */
+export async function loadOpenChamberToolSpecs(options = {}) {
+  const { tools } = await loadToolSpecsWithMeta(options);
+  return tools;
+}
+
+/**
+ * Probe whether live OpenChamber runtime bridges (`openui-lang` guidance & tool schemas) resolved cleanly
+ * or silently degraded to static fallback after an OpenChamber upgrade.
+ * @param {{ env?: NodeJS.ProcessEnv, forceRefresh?: boolean }} [options]
+ */
+export async function probeOpenChamberCompat(options = {}) {
+  const env = options.env || process.env;
+  const webRoot = resolveOpenChamberWebRoot(env);
+  let webVersion = null;
+  if (webRoot) {
+    try {
+      webVersion = JSON.parse(fs.readFileSync(path.join(webRoot, 'package.json'), 'utf8')).version || null;
+    } catch {
+      webVersion = null;
+    }
+  }
+
+  const [guidance, toolMeta] = await Promise.all([
+    loadOpenChamberGuidance({ env, forceRefresh: options.forceRefresh }),
+    loadToolSpecsWithMeta({ env, forceRefresh: options.forceRefresh }),
+  ]);
+
+  const degraded = !webRoot
+    || guidance.source !== 'openchamber-live'
+    || toolMeta.source !== 'openchamber-live';
+
+  return {
+    webRoot,
+    webVersion,
+    guidanceSource: guidance.source,
+    toolSpecSource: toolMeta.source,
+    toolNames: toolMeta.tools.map((t) => t.name),
+    degraded,
+  };
 }
 
 function enrichToolDescription(name, description, guidance) {

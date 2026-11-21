@@ -15,7 +15,7 @@ import { AgyRunner } from '../src/agy/runner.mjs';
 import { createRouterServer } from '../src/gateway/server.mjs';
 import { createOAuthManager } from '../extensions/agy-quota/service/oauth.js';
 import { readAntigravityQuota } from '../extensions/agy-quota/service/quota.js';
-import { loadOpenChamberGuidance, resolveOpenChamberWebRoot } from '../src/bridge/openchamber.mjs';
+import { loadOpenChamberGuidance, probeOpenChamberCompat, resolveOpenChamberWebRoot } from '../src/bridge/openchamber.mjs';
 import { ensureOpenChamberMcpConfig, runMcpBridgeServer } from '../src/bridge/mcp.mjs';
 import { formatSetupReport, runSetup } from '../src/cli/setup.mjs';
 
@@ -66,7 +66,7 @@ function cmdModels() {
   }
 }
 
-function cmdDoctor() {
+async function cmdDoctor() {
   const realOpenCode = resolveRealOpenCode();
   const agyBin = resolveAgyBinary();
   const useMagpie = process.env.AGY_ROUTER_USE_MAGPIE === '1';
@@ -74,6 +74,7 @@ function cmdDoctor() {
   const magpieEnv = useMagpie ? redactMagpieSummary(loadMagpieAgyEnv({ forceRefresh: true })) : null;
   const ocVer = realOpenCode ? readRealOpenCodeVersion(realOpenCode).stdout?.trim() : null;
   const openchamberWebRoot = resolveOpenChamberWebRoot();
+  const openchamberCompat = await probeOpenChamberCompat({ env: process.env, forceRefresh: true });
 
   process.stdout.write(
     JSON.stringify(
@@ -83,6 +84,7 @@ function cmdDoctor() {
         realOpenCodeVersion: ocVer,
         agyBin,
         openchamberWebRoot,
+        openchamberCompat,
         useMagpie,
         ...(useMagpie ? { magpieBin, magpieEnv } : {}),
       },
@@ -301,7 +303,7 @@ if (parsed.command === 'help') {
 } else if (parsed.command === 'models') {
   cmdModels();
 } else if (parsed.command === 'doctor') {
-  cmdDoctor();
+  await cmdDoctor();
 } else if (parsed.command === 'install-mcp') {
   cmdInstallMcp();
 } else if (parsed.command === 'setup') {
