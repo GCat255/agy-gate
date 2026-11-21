@@ -5,6 +5,7 @@ import { loadMagpieAgyEnv } from './magpie-env.mjs';
 import { resolveRealAgyModelId } from './agy-models.mjs';
 import { AgyTurnTranslator } from './event-translator.mjs';
 import { buildSpawnSpec } from './upstream.mjs';
+import { buildSessionGuidancePrefix } from './openchamber-bridge.mjs';
 
 const IS_WIN = process.platform === 'win32';
 const DEFAULT_WORKER_IDLE_MS = 15 * 60_000;
@@ -55,27 +56,50 @@ export class AgyRunner {
   }
 
   /**
-   * Format prompt text including any file attachments sent from OpenChamber.
-   * @param {{ text?: string, files?: any[] }} payload
+   * Format prompt text including any file attachments, inline skills, non-resuming synthetic context,
+   * and one-time OpenChamber UI guidance.
+   * @param {{ text?: string, files?: any[], skills?: any[] }} payload
+   * @param {{ syntheticTexts?: string[], guidancePrefix?: string | null }} [options]
    */
-  buildPromptText(payload) {
-    const base = String(payload?.text || '').trim();
-    const files = Array.isArray(payload?.files) ? payload.files : [];
-    if (files.length === 0) return base;
-
-    const hints = [];
-    for (const file of files) {
-      const label = file.name || file.mime || 'attachment';
-      const uri = file.source?.type === 'uri' ? file.source.uri : null;
-      if (uri) hints.push(`- ${label}: ${uri}`);
-      else hints.push(`- ${label} (${file.mime || 'inline'})`);
+  buildPromptText(payload, options = {}) {
+    const sections = [];
+    if (options.guidancePrefix) {
+      sections.push(options.guidancePrefix);
     }
-    return [base, '', '[Attached files]', ...hints].filter(Boolean).join('\n');
+    if (Array.isArray(options.syntheticTexts) && options.syntheticTexts.length > 0) {
+      sections.push(options.syntheticTexts.join('\n\n'));
+    }
+
+    const skills = Array.isArray(payload?.skills) ? payload.skills : [];
+    if (skills.length > 0) {
+      const skillText = skills
+        .map((s) => (s?.content ? `[Skill: ${s.name || s.id}]\n${s.content}` : `[Use skill: ${s?.name || s?.id || ''}]`))
+        .filter(Boolean)
+        .join('\n\n');
+      if (skillText) sections.push(skillText);
+    }
+
+    const base = String(payload?.text || '').trim();
+    if (base) sections.push(base);
+
+    const files = Array.isArray(payload?.files) ? payload.files : [];
+    if (files.length > 0) {
+      const hints = [];
+      for (const file of files) {
+        const label = file.name || file.mime || 'attachment';
+        const uri = file.source?.type === 'uri' ? file.source.uri : null;
+        if (uri) hints.push(`- ${label}: ${uri}`);
+        else hints.push(`- ${label} (${file.mime || 'inline'})`);
+      }
+      sections.push(['[Attached files]', ...hints].join('\n'));
+    }
+
+    return sections.filter(Boolean).join('\n\n');
   }
 
   /**
    * Build child environment and base CLI flags for `agy-cli`.
-   * @param {{ realModelID?: string, conversationId?: string | null }} opts
+   * @param {{ sessionID?: string, cwd?: string, realModelID?: string, conversationId?: string | null }} opts
    */
   _buildAgySpawnConfig(opts = {}) {
     const agyBin = resolveAgyBinary(this.env);
@@ -83,6 +107,8 @@ export class AgyRunner {
 
     const useMagpie = this.env.AGY_ROUTER_USE_MAGPIE === '1';
     const childEnv = { ...this.env };
+    if (opts.sessionID) childEnv.OPENCHAMBER_ROUTER_SESSION_ID = opts.sessionID;
+    if (opts.cwd) childEnv.OPENCHAMBER_ROUTER_DIRECTORY = opts.cwd;
     const args = [];
 
     if (useMagpie) {
@@ -146,7 +172,7 @@ export class AgyRunner {
    * @param {{ sessionID: string, realModelID: string, cwd: string, promptText: string }} opts
    */
   _spawnWorker(opts) {
-    const cfg = this._buildAgySpawnConfig();
+    const cfg = this._buildAgySpawnConfig({ sessionID: opts.sessionID, cwd: opts.cwd });
     if (!cfg) return null;
 
     const sessionState = this.store.getSession(opts.sessionID);
@@ -187,6 +213,7 @@ export class AgyRunner {
       busy: false,
       exited: false,
       interrupted: false,
+      hadFirstTurn: Boolean(sessionState?.agyConversationId),
       idleTimer: null,
       turn: null,
       stdoutBuf: '',
@@ -302,16 +329,28 @@ export class AgyRunner {
    * Start an `agy-cli` turn asynchronously, reusing the session's warm worker when compatible.
    * @param {{ sessionID: string, modelID: string, variant?: string, realModelID?: string, agent?: string, directory?: string | null, promptPayload: any }} params
    */
-  startTurn(params) {
+  async startTurn(params) {
     const { sessionID, modelID, variant, agent, directory, promptPayload } = params;
     const existing = this.workers.get(sessionID);
     if (existing?.busy) {
       return { ok: false, reason: 'busy' };
     }
 
+    const sessionState = this.store.getSession(sessionID);
+    const needsGuidance = !sessionState?.agyConversationId
+      && !existing?.hadFirstTurn
+      && this.env.AGY_ROUTER_DISABLE_UI_GUIDANCE !== '1';
+    const guidancePrefix = needsGuidance
+      ? await buildSessionGuidancePrefix({
+          env: this.env,
+          hasMcpBridge: Boolean(this.env.OPENCHAMBER_AGENT_TOOL_URL && this.env.OPENCHAMBER_AGENT_TOOL_TOKEN),
+        })
+      : null;
+
+    const syntheticTexts = this.store.consumePendingSynthetic(sessionID);
     const realModelID = params.realModelID || resolveRealAgyModelId(modelID, variant, { env: this.env });
     const cwd = directory && fs.existsSync(directory) ? directory : process.cwd();
-    const promptText = this.buildPromptText(promptPayload);
+    const promptText = this.buildPromptText(promptPayload, { syntheticTexts, guidancePrefix });
 
     const assistantMessageID = `msg_${Date.now()}_${++this.seq}`;
     const translator = new AgyTurnTranslator({
@@ -353,6 +392,7 @@ export class AgyRunner {
 
     worker.busy = true;
     worker.interrupted = false;
+    worker.hadFirstTurn = true;
     worker.turn = { translator, sessionID };
     translator.begin();
 
@@ -376,13 +416,13 @@ export class AgyRunner {
    * @returns {Promise<string>}
    */
   generateText(params) {
-    const cfg = this._buildAgySpawnConfig();
+    const cwd = params.directory && fs.existsSync(params.directory) ? params.directory : process.cwd();
+    const cfg = this._buildAgySpawnConfig({ cwd });
     if (!cfg) {
       return Promise.reject(new Error('agy executable not found on this machine'));
     }
 
     const realModelID = resolveRealAgyModelId(params.modelID, params.variant, { env: this.env });
-    const cwd = params.directory && fs.existsSync(params.directory) ? params.directory : process.cwd();
     const args = [...cfg.args, '--input-format', 'stream-json', '--output-format', 'stream-json'];
     if (realModelID) args.push('--model', realModelID);
     if (this.env.AGY_ROUTER_AGY_AUTO_APPROVE !== '0') {

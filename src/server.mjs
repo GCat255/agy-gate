@@ -442,7 +442,7 @@ export function createRouterServer(deps) {
               data: { sessionID, inboxID: messageID },
             });
 
-            const started = deps.agyRunner.startTurn({
+            const started = await deps.agyRunner.startTurn({
               sessionID,
               modelID: activeModel.id,
               variant: activeModel.variant,
@@ -467,6 +467,92 @@ export function createRouterServer(deps) {
           }
 
           // Native OpenCode prompt
+          const up = await fetchUpstream({
+            upstreamBase: deps.upstreamBase(),
+            authHeader: expectedAuth,
+            req,
+            method,
+            pathAndQuery,
+            body: bodyBuf,
+          });
+          const text = await up.text();
+          res.writeHead(up.status, { 'Content-Type': up.headers.get('content-type') || 'application/json' });
+          res.end(text);
+          return;
+        }
+
+        // 7d-2. Synthetic Input (openui-lang interactive answers & attached skill/selection context)
+        if (method === 'POST' && sub === 'synthetic') {
+          const bodyBuf = await readBodyBuffer(req);
+          const sessionState = deps.store.getSession(sessionID);
+          const activeModel = sessionState?.activeModel;
+
+          if (activeModel?.providerID === AGY_PROVIDER_ID) {
+            let parsed = {};
+            try {
+              parsed = bodyBuf.length ? JSON.parse(bodyBuf.toString('utf8')) : {};
+            } catch {}
+
+            const messageID = parsed.id || `msg_${Date.now()}_syn`;
+            const now = Date.now();
+            const text = String(parsed.text || '');
+            const syntheticMsg = {
+              id: messageID,
+              type: 'synthetic',
+              time: { created: now },
+              text,
+              ...(typeof parsed.description === 'string' && parsed.description ? { description: parsed.description } : {}),
+              ...(parsed.metadata && typeof parsed.metadata === 'object' ? { metadata: parsed.metadata } : {}),
+            };
+            deps.store.upsertMessage(sessionID, syntheticMsg);
+
+            if (parsed.resume === false) {
+              deps.store.queuePendingSynthetic(sessionID, text);
+              sendJson(res, 200, { data: syntheticMsg });
+              return;
+            }
+
+            const effectiveDir = directory || sessionState?.directory || null;
+            deps.sseHub.broadcast({
+              type: 'session.inbox.enqueued',
+              created: now,
+              ...(effectiveDir ? { location: { directory: effectiveDir } } : {}),
+              data: {
+                sessionID,
+                inboxID: messageID,
+                item: {
+                  type: 'synthetic',
+                  payload: {
+                    text,
+                    ...(parsed.metadata ? { metadata: parsed.metadata } : {}),
+                  },
+                },
+              },
+            });
+            deps.sseHub.broadcast({
+              type: 'session.inbox.delivered',
+              created: now,
+              ...(effectiveDir ? { location: { directory: effectiveDir } } : {}),
+              data: { sessionID, inboxID: messageID },
+            });
+
+            const started = await deps.agyRunner.startTurn({
+              sessionID,
+              modelID: activeModel.id,
+              variant: activeModel.variant,
+              directory: effectiveDir,
+              promptPayload: { text },
+            });
+            if (!started.ok) {
+              sendJson(res, 409, { error: 'Session is busy' });
+              return;
+            }
+
+            sendJson(res, 200, { data: syntheticMsg });
+            return;
+          }
+
+          // Native OpenCode synthetic
           const up = await fetchUpstream({
             upstreamBase: deps.upstreamBase(),
             authHeader: expectedAuth,

@@ -45,6 +45,7 @@ export class RouterStore {
       directory: null,
       activeModel: null,
       agyConversationId: null,
+      pendingSynthetic: [],
       messages: [],
       updatedAt: Date.now(),
     };
@@ -116,6 +117,36 @@ export class RouterStore {
   getMessages(sessionID) {
     const s = this.getSession(sessionID);
     return s && Array.isArray(s.messages) ? s.messages : [];
+  }
+
+  /**
+   * Queue non-resuming synthetic context (`resume: false`) to prepend to the next `agy-cli` prompt.
+   * @param {string} sessionID
+   * @param {string} text
+   */
+  queuePendingSynthetic(sessionID, text) {
+    const trimmed = String(text || '').trim();
+    if (!trimmed) return;
+    const s = this._ensureSession(sessionID);
+    if (!Array.isArray(s.pendingSynthetic)) s.pendingSynthetic = [];
+    s.pendingSynthetic.push(trimmed);
+    this._save(sessionID);
+  }
+
+  /**
+   * Consume and clear any queued non-resuming synthetic context for `sessionID`.
+   * @param {string} sessionID
+   * @returns {string[]}
+   */
+  consumePendingSynthetic(sessionID) {
+    const s = this.getSession(sessionID);
+    if (!s || !Array.isArray(s.pendingSynthetic) || s.pendingSynthetic.length === 0) {
+      return [];
+    }
+    const items = [...s.pendingSynthetic];
+    s.pendingSynthetic = [];
+    this._save(sessionID);
+    return items;
   }
 
   /** @param {string} sessionID */

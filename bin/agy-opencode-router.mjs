@@ -3,6 +3,7 @@ import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import process from 'node:process';
 import readline from 'node:readline';
+import { fileURLToPath } from 'node:url';
 import { parseCliArgs } from '../src/cli-args.mjs';
 import { resolveAgyBinary, resolveDataDir, resolveMagpieBinary, resolveRealOpenCode } from '../src/config.mjs';
 import { loadMagpieAgyEnv, redactMagpieSummary } from '../src/magpie-env.mjs';
@@ -14,6 +15,10 @@ import { AgyRunner } from '../src/agy-runner.mjs';
 import { createRouterServer } from '../src/server.mjs';
 import { createOAuthManager } from '../extensions/agy-quota/service/oauth.js';
 import { readAntigravityQuota } from '../extensions/agy-quota/service/quota.js';
+import { loadOpenChamberGuidance, resolveOpenChamberWebRoot } from '../src/openchamber-bridge.mjs';
+import { ensureOpenChamberMcpConfig, runMcpBridgeServer } from '../src/mcp-bridge.mjs';
+
+const CLI_ENTRY_PATH = fileURLToPath(import.meta.url);
 
 function printHelp() {
   process.stdout.write(
@@ -25,6 +30,8 @@ function printHelp() {
       '  agy-opencode-router serve [--stdio] [--hostname <host>] [--port <port>]',
       '  agy-opencode-router models',
       '  agy-opencode-router doctor',
+      '  agy-opencode-router install-mcp',
+      '  agy-opencode-router mcp-bridge',
       '  agy-opencode-router quota-login',
       '  agy-opencode-router quota-status',
       '  agy-opencode-router quota-logout',
@@ -64,6 +71,7 @@ function cmdDoctor() {
   const magpieBin = useMagpie ? resolveMagpieBinary() : null;
   const magpieEnv = useMagpie ? redactMagpieSummary(loadMagpieAgyEnv({ forceRefresh: true })) : null;
   const ocVer = realOpenCode ? readRealOpenCodeVersion(realOpenCode).stdout?.trim() : null;
+  const openchamberWebRoot = resolveOpenChamberWebRoot();
 
   process.stdout.write(
     JSON.stringify(
@@ -72,6 +80,7 @@ function cmdDoctor() {
         realOpenCode,
         realOpenCodeVersion: ocVer,
         agyBin,
+        openchamberWebRoot,
         useMagpie,
         ...(useMagpie ? { magpieBin, magpieEnv } : {}),
       },
@@ -87,6 +96,15 @@ async function cmdServe(opts) {
     process.stderr.write('错误：未找到真实 opencode 可执行文件，无法启动内部 OpenCode 服务。\n');
     process.exit(1);
   }
+
+  if (process.env.OPENCHAMBER_AGENT_TOOL_URL && process.env.AGY_ROUTER_AUTO_MCP !== '0') {
+    try {
+      ensureOpenChamberMcpConfig({ cliEntryPath: CLI_ENTRY_PATH, env: process.env });
+    } catch {
+      // Non-fatal; gateway continues even if mcp_config.json is read-only
+    }
+  }
+  void loadOpenChamberGuidance().catch(() => {});
 
   const callerPassword = process.env.OPENCODE_SERVER_PASSWORD || process.env.OPENCODE_PASSWORD || '';
   const upstreamPassword = callerPassword || crypto.randomBytes(16).toString('hex');
@@ -251,6 +269,12 @@ async function cmdQuotaLogout() {
   process.stdout.write(`已清除本地 Agy 用量授权凭证（${oauth.authFilePath}）。\n`);
 }
 
+function cmdInstallMcp() {
+  const res = ensureOpenChamberMcpConfig({ cliEntryPath: CLI_ENTRY_PATH, env: process.env });
+  process.stdout.write(JSON.stringify(res, null, 2) + '\n');
+  if (!res.ok) process.exit(1);
+}
+
 const parsed = parseCliArgs(process.argv.slice(2));
 if (parsed.command === 'help') {
   printHelp();
@@ -261,6 +285,10 @@ if (parsed.command === 'help') {
   cmdModels();
 } else if (parsed.command === 'doctor') {
   cmdDoctor();
+} else if (parsed.command === 'install-mcp') {
+  cmdInstallMcp();
+} else if (parsed.command === 'mcp-bridge') {
+  await runMcpBridgeServer();
 } else if (parsed.command === 'quota-login') {
   await cmdQuotaLogin();
 } else if (parsed.command === 'quota-status') {

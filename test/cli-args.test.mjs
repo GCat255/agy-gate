@@ -10,6 +10,8 @@ test('parseCliArgs handles --version, --help, models, doctor', () => {
   assert.deepEqual(parseCliArgs(['quota-login']), { command: 'quota-login' });
   assert.deepEqual(parseCliArgs(['quota-status']), { command: 'quota-status' });
   assert.deepEqual(parseCliArgs(['quota-logout']), { command: 'quota-logout' });
+  assert.deepEqual(parseCliArgs(['mcp-bridge']), { command: 'mcp-bridge' });
+  assert.deepEqual(parseCliArgs(['install-mcp']), { command: 'install-mcp' });
 });
 
 test('parseCliArgs parses serve flags including --stdio, --hostname, --port', () => {

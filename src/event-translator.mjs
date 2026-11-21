@@ -1,4 +1,5 @@
 import { AGY_PROVIDER_ID } from './agy-models.mjs';
+import { OPENCHAMBER_TOOL_NAMES, normalizeOpenChamberToolName } from './mcp-bridge.mjs';
 
 /**
  * Translate `agy-cli` `--output-format stream-json` NDJSON events into
@@ -194,12 +195,14 @@ export class AgyTurnTranslator {
 
   _handleToolStep(stepIndex, step) {
     const info = step.tool_info || {};
-    const name = String(step.tool_name || info.name || 'tool');
+    const rawName = String(step.tool_name || info.name || 'tool');
+    const name = normalizeOpenChamberToolName(rawName);
+    const isOpenChamberTool = OPENCHAMBER_TOOL_NAMES.has(name);
     const parameters = info.parameters && typeof info.parameters === 'object' ? info.parameters : {};
     let tool = this.activeTools.get(stepIndex);
 
     if (!tool) {
-      const callID = `call_${this.assistantMessageID}_${stepIndex}`;
+      const callID = String(info.call_id || info.id || `call_${this.assistantMessageID}_${stepIndex}`);
       tool = { callID, name, input: parameters, startedAt: Date.now(), closed: false };
       this.activeTools.set(stepIndex, tool);
       this._send('session.tool.input.started', {
@@ -214,6 +217,16 @@ export class AgyTurnTranslator {
         id: callID,
         input: parameters,
         executed: true,
+        ...(isOpenChamberTool
+          ? {
+              metadata: {
+                openchamber: {
+                  schemaVersion: 1,
+                  ...(typeof parameters.action === 'string' ? { action: parameters.action } : {}),
+                },
+              },
+            }
+          : {}),
       });
     }
 
@@ -228,6 +241,28 @@ export class AgyTurnTranslator {
       const errorMsg = typeof info.error === 'string' ? info.error : info.error?.message;
       const contentItems = output ? [{ type: 'text', text: output }] : [];
 
+      let openchamberMeta;
+      if (isOpenChamberTool) {
+        let parsedOut = null;
+        try {
+          parsedOut = output ? JSON.parse(output) : null;
+        } catch {}
+        const ok = parsedOut?.schemaVersion === 1 ? Boolean(parsedOut.ok) : !errorMsg;
+        const answer = parsedOut?.data?.answer && typeof parsedOut.data.answer === 'object' ? parsedOut.data.answer : undefined;
+        openchamberMeta = {
+          openchamber: {
+            schemaVersion: 1,
+            ...(typeof parsedOut?.action === 'string'
+              ? { action: parsedOut.action }
+              : typeof tool.input?.action === 'string'
+                ? { action: tool.input.action }
+                : {}),
+            ok,
+            ...(answer ? { answer } : {}),
+          },
+        };
+      }
+
       if (errorMsg) {
         this._send('session.tool.failed', {
           sessionID: this.sessionID,
@@ -236,6 +271,7 @@ export class AgyTurnTranslator {
           error: { type: 'unknown', message: errorMsg },
           content: contentItems,
           executed: true,
+          ...(openchamberMeta ? { metadata: openchamberMeta } : {}),
         });
         this.content.push({
           type: 'tool',
@@ -248,6 +284,7 @@ export class AgyTurnTranslator {
             input: tool.input,
             error: { type: 'unknown', message: errorMsg },
             content: contentItems,
+            ...(openchamberMeta ? { metadata: openchamberMeta } : {}),
           },
         });
       } else {
@@ -257,6 +294,7 @@ export class AgyTurnTranslator {
           id: tool.callID,
           content: contentItems,
           executed: true,
+          ...(openchamberMeta ? { metadata: openchamberMeta } : {}),
         });
         this.content.push({
           type: 'tool',
@@ -268,6 +306,7 @@ export class AgyTurnTranslator {
             status: 'completed',
             input: tool.input,
             content: contentItems,
+            ...(openchamberMeta ? { metadata: openchamberMeta } : {}),
           },
         });
       }

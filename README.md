@@ -5,6 +5,9 @@
 ## 核心设计
 
 - **零源码入侵**：在 OpenChamber 的「OpenCode 可执行文件路径」中指向本网关启动器即可接入，OpenChamber 仍运行在完整托管模式下，不影响版本升级。
+- **生成式 UI 与 OpenChamber 工具全打通（抗升级）**：
+  - 首轮自动从本机已安装的 `@openchamber/web` 动态提取最新 `openui-lang` 组件规范并注入新建会话，完整拦截 `POST /api/session/:id/synthetic` 支持卡片交互回传与 `POST /api/experimental/generate/text` 小模型生成。
+  - 内置零依赖 MCP stdio 桥接器（`agy-opencode-router mcp-bridge`）：启动时自动在 `~/.gemini/config/mcp_config.json` 幂等注册 `openchamber` 服务，并仅在 OpenChamber 注入 `OPENCHAMBER_AGENT_TOOL_URL` 时动态同步开启 `openchamber_render`、`openchamber`、`openchamber_web` 等工具（对普通终端下的 `agy` 零影响）。
 - **按模型归属分流**：
   - 网关注入虚拟 Provider `agy-cli`（模型列表动态取自 `agy models`）。
   - 当前会话选中的模型属于 `providerID === "agy-cli"` 时，网关直接拦截请求并原生调用本地 `agy.exe`（默认不注入 `magpie` 代理模型，仅使用 `agy-cli` 原生模型），将其流式事件翻译为 OpenCode 2.x `OpenCodeEvent` 推入 `/api/event` SSE。

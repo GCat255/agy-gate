@@ -29,6 +29,12 @@ export function parseCliArgs(argv) {
   if (first === 'quota-logout') {
     return { command: 'quota-logout' };
   }
+  if (first === 'mcp-bridge') {
+    return { command: 'mcp-bridge' };
+  }
+  if (first === 'install-mcp') {
+    return { command: 'install-mcp' };
+  }
 
   if (first === 'serve') {
     let stdio = false;

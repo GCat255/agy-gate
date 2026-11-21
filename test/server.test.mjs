@@ -15,6 +15,7 @@ test('router server injects variant models, reuses warm agy worker across turns,
   const mockAgyCmd = path.join(tempDir, process.platform === 'win32' ? 'mock-agy.cmd' : 'mock-agy.sh');
   const mockAgyJs = path.join(tempDir, 'mock-agy.mjs');
   const bootCountFile = path.join(tempDir, 'boot-count.txt');
+  const promptsLogFile = path.join(tempDir, 'prompts-log.json');
 
   // Persistent warm mock implementing `models` and `--input-format stream-json --output-format stream-json --print=`
   fs.writeFileSync(
@@ -28,6 +29,7 @@ test('router server injects variant models, reuses warm agy worker across turns,
       "  process.exit(0);",
       "}",
       `const countFile = ${JSON.stringify(bootCountFile)};`,
+      `const logFile = ${JSON.stringify(promptsLogFile)};`,
       "const prev = fs.existsSync(countFile) ? Number(fs.readFileSync(countFile, 'utf8')) : 0;",
       "fs.writeFileSync(countFile, String(prev + 1), 'utf8');",
       "const conv = 'conv_mock_warm';",
@@ -38,14 +40,17 @@ test('router server injects variant models, reuses warm agy worker across turns,
       "  if (!line.trim()) return;",
       "  const msg = JSON.parse(line);",
       "  if (msg.event !== 'user') return;",
+      "  const logs = fs.existsSync(logFile) ? JSON.parse(fs.readFileSync(logFile, 'utf8')) : [];",
+      "  logs.push(msg.message?.content || '');",
+      "  fs.writeFileSync(logFile, JSON.stringify(logs), 'utf8');",
       "  turn += 1;",
-      "  const reply = turn === 1 ? 'hi from ' : 'warm turn 2';",
+      "  const reply = turn === 1 ? 'hi from ' : turn === 2 ? 'warm turn 2' : 'synthetic reply';",
       "  if (turn === 1) {",
       "    console.log(JSON.stringify({ event: 'step_update', step_update: { step_index: 1, state: 'ACTIVE', step_type: 'agent_response', text_delta: reply } }));",
       "    console.log(JSON.stringify({ event: 'step_update', step_update: { step_index: 1, state: 'DONE', step_type: 'agent_response', text_delta: 'agy', usage: { input_tokens: 5, output_tokens: 3 } } }));",
       "    console.log(JSON.stringify({ event: 'result', result: { conversation_id: conv, status: 'SUCCESS', response: 'hi from agy' } }));",
       "  } else {",
-      "    console.log(JSON.stringify({ event: 'step_update', step_update: { step_index: 2, state: 'DONE', step_type: 'agent_response', text_delta: reply, usage: { input_tokens: 8, output_tokens: 3, cache_read_tokens: 5 } } }));",
+      "    console.log(JSON.stringify({ event: 'step_update', step_update: { step_index: turn, state: 'DONE', step_type: 'agent_response', text_delta: reply, usage: { input_tokens: 8, output_tokens: 3, cache_read_tokens: 5 } } }));",
       "    console.log(JSON.stringify({ event: 'result', result: { conversation_id: conv, status: 'SUCCESS', response: reply } }));",
       "  }",
       "});",
@@ -244,12 +249,41 @@ test('router server injects variant models, reuses warm agy worker across turns,
     }
     assert.equal(fs.readFileSync(bootCountFile, 'utf8').trim(), '1', 'Warm worker should serve turn 2 without respawning');
 
-    // 6. Verify merged messages endpoint contains upstream + local agy user & assistant messages
+    // 5b. Guidance is injected once on turn 1 and not repeated on turn 2; synthetic non-resume queues + resume triggers turn
+    const synNoResume = await fetch(`${gwBase}/api/session/ses_test/synthetic`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-opencode-directory': 'E:/proj' },
+      body: JSON.stringify({ id: 'msg_syn_ctx', text: 'use: deploy', resume: false }),
+    });
+    assert.equal(synNoResume.status, 200);
+    const synResume = await fetch(`${gwBase}/api/session/ses_test/synthetic`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-opencode-directory': 'E:/proj' },
+      body: JSON.stringify({
+        id: 'msg_syn_card',
+        text: 'Picked Option A',
+        metadata: { openchamberUiBlockAnswer: { messageId: 'msg_a', block: 'blk_1', answer: { option: 'A' } } },
+        resume: true,
+      }),
+    });
+    assert.equal(synResume.status, 200);
+    deadline = Date.now() + 5000;
+    while (received.filter((e) => e.type === 'session.idle').length < 3 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 30));
+    }
+    const loggedPrompts = JSON.parse(fs.readFileSync(promptsLogFile, 'utf8'));
+    assert.ok(loggedPrompts[0].includes('<openchamber_runtime_guidance>'));
+    assert.ok(!loggedPrompts[1].includes('<openchamber_runtime_guidance>'));
+    assert.ok(loggedPrompts[2].includes('use: deploy') && loggedPrompts[2].includes('Picked Option A'));
+
+    // 6. Verify merged messages endpoint contains upstream + local agy user, synthetic & assistant messages
     const msgs = await (await fetch(`${gwBase}/api/session/ses_test/message`)).json();
     assert.ok(msgs.data.some((m) => m.id === 'msg_oc'));
     assert.ok(msgs.data.some((m) => m.id === 'msg_u1' && m.text === 'hello agy'));
+    assert.ok(msgs.data.some((m) => m.id === 'msg_syn_card' && m.type === 'synthetic' && m.metadata?.openchamberUiBlockAnswer));
     assert.ok(msgs.data.some((m) => m.type === 'assistant' && m.content[0]?.text === 'hi from agy'));
     assert.ok(msgs.data.some((m) => m.type === 'assistant' && m.content[0]?.text === 'warm turn 2'));
+    assert.ok(msgs.data.some((m) => m.type === 'assistant' && m.content[0]?.text === 'synthetic reply'));
 
     // 7. Switch back to OpenCode model -> prompt now goes to upstream OpenCode
     const swRes = await fetch(`${gwBase}/api/session/ses_test/model`, {
