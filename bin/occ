@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+NODE_BIN=""
+if command -v node >/dev/null 2>&1; then
+  NODE_BIN="$(command -v node)"
+elif [ -n "${LOCALAPPDATA:-}" ] && [ -x "${LOCALAPPDATA}/Programs/nodejs/node.exe" ]; then
+  NODE_BIN="${LOCALAPPDATA}/Programs/nodejs/node.exe"
+else
+  NODE_BIN="node"
+fi
+exec "$NODE_BIN" "$SCRIPT_DIR/occ.mjs" "$@"

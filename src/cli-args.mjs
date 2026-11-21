@@ -35,6 +35,24 @@ export function parseCliArgs(argv) {
   if (first === 'install-mcp') {
     return { command: 'install-mcp' };
   }
+  if (first === 'setup') {
+    let installDeps = false;
+    let dryRun = false;
+    let json = false;
+    let uninstall = false;
+    let skipMcp = false;
+    let keepEngine = false;
+    for (let i = 1; i < argv.length; i += 1) {
+      const arg = argv[i];
+      if (arg === '--install-deps') installDeps = true;
+      else if (arg === '--dry-run') dryRun = true;
+      else if (arg === '--json') json = true;
+      else if (arg === '--uninstall') uninstall = true;
+      else if (arg === '--no-mcp') skipMcp = true;
+      else if (arg === '--keep-engine') keepEngine = true;
+    }
+    return { command: 'setup', installDeps, dryRun, json, uninstall, skipMcp, keepEngine };
+  }
 
   if (first === 'serve') {
     let stdio = false;

@@ -4,7 +4,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
-const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
+const MODULE_DIR = path.dirname(fs.realpathSync(fileURLToPath(import.meta.url)));
 export const ROUTER_ROOT = path.resolve(MODULE_DIR, '..');
 export const ROUTER_BIN_DIR = path.join(ROUTER_ROOT, 'bin');
 

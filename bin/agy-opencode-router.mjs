@@ -17,6 +17,7 @@ import { createOAuthManager } from '../extensions/agy-quota/service/oauth.js';
 import { readAntigravityQuota } from '../extensions/agy-quota/service/quota.js';
 import { loadOpenChamberGuidance, resolveOpenChamberWebRoot } from '../src/openchamber-bridge.mjs';
 import { ensureOpenChamberMcpConfig, runMcpBridgeServer } from '../src/mcp-bridge.mjs';
+import { formatSetupReport, runSetup } from '../src/setup.mjs';
 
 const CLI_ENTRY_PATH = fileURLToPath(import.meta.url);
 
@@ -28,6 +29,7 @@ function printHelp() {
       '用法：',
       '  agy-opencode-router --version',
       '  agy-opencode-router serve [--stdio] [--hostname <host>] [--port <port>]',
+      '  agy-opencode-router setup [--install-deps] [--dry-run] [--json] [--uninstall]',
       '  agy-opencode-router models',
       '  agy-opencode-router doctor',
       '  agy-opencode-router install-mcp',
@@ -128,7 +130,22 @@ async function cmdServe(opts) {
     upstreamUrl: () => upstream.baseUrl,
     authHeader: upstreamAuthHeader,
   });
-  const agyRunner = new AgyRunner({ store, sseHub });
+  const renameSessionTitle = async ({ sessionID, title, directory, signal }) => {
+    const headers = { 'Content-Type': 'application/json' };
+    const auth = upstreamAuthHeader();
+    if (auth) headers.authorization = auth;
+    if (directory) headers['x-opencode-directory'] = encodeURIComponent(directory);
+    const res = await fetch(`${upstream.baseUrl}/api/session/${encodeURIComponent(sessionID)}`, {
+      method: 'PATCH',
+      headers,
+      body: JSON.stringify({ title }),
+      signal,
+    });
+    if (!res.ok) {
+      throw new Error(`PATCH /api/session/${sessionID} failed with ${res.status}`);
+    }
+  };
+  const agyRunner = new AgyRunner({ store, sseHub, renameSessionTitle });
 
   const server = createRouterServer({
     upstreamBase: () => upstream.baseUrl,
@@ -287,6 +304,17 @@ if (parsed.command === 'help') {
   cmdDoctor();
 } else if (parsed.command === 'install-mcp') {
   cmdInstallMcp();
+} else if (parsed.command === 'setup') {
+  const result = await runSetup({
+    cliEntryPath: CLI_ENTRY_PATH,
+    installDeps: parsed.installDeps,
+    dryRun: parsed.dryRun,
+    uninstall: parsed.uninstall,
+    skipMcp: parsed.skipMcp,
+    keepEngine: parsed.keepEngine,
+  });
+  process.stdout.write(parsed.json ? `${JSON.stringify(result, null, 2)}\n` : formatSetupReport(result));
+  if (!result.ok) process.exit(1);
 } else if (parsed.command === 'mcp-bridge') {
   await runMcpBridgeServer();
 } else if (parsed.command === 'quota-login') {

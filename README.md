@@ -1,52 +1,89 @@
 # agy-opencode-router
 
-非侵入式前置分流网关，使 **OpenChamber** 在不修改任何底层源码的前提下，同时支持原生 **OpenCode 2.x** 与本地 **agy-cli**（Gemini 订阅模型等），并可在原生主聊天界面随时按模型自由切换。
+非侵入式前置双引擎路由网关与终端管理工具（集成 **`occ`** 启动器），使 **OpenChamber** 在不修改任何底层源码的前提下，同时支持原生 **OpenCode 2.x** 与本地 **agy-cli**（Gemini 订阅模型、原生工具、子代理体系与思考流），并可在新设备上一键完成全套部署。
+
+## 新设备一条龙安装与使用
+
+前置要求：**Node.js >= 24.0.0**、**Git**；如需使用 `agy-cli` 引擎，需提前安装并登录本机 `agy`。
+
+### Windows（PowerShell）
+
+```powershell
+git clone https://github.com/GCat255/agy-opencode-router.git
+cd agy-opencode-router
+.\scripts\install.ps1
+```
+
+### macOS / Linux / Git Bash
+
+```bash
+git clone https://github.com/GCat255/agy-opencode-router.git
+cd agy-opencode-router
+./scripts/install.sh
+```
+
+安装脚本会自动完成以下全部动作：
+1. 全局链接 `occ` 与 `agy-opencode-router` 命令（`npm link`，失败时回退 `npm install -g .`）。
+2. 检查并在缺失时全局安装 `@openchamber/web` 与 `@opencode/cli`。
+3. 运行 `agy-opencode-router setup`，自动完成三项本地配置：
+   - 在 `~/.config/openchamber/settings.json` 将 `opencodeBinary` 绑定到分流网关；
+   - 在 `~/.config/openchamber/extensions.json` 注册并授权 `extensions/agy-quota` 用量扩展；
+   - 在 `~/.gemini/config/mcp_config.json` 幂等注册 `mcpServers.openchamber`（仅在 OpenChamber 会话内激活工具）。
+4. 运行 `agy-opencode-router doctor` 输出环境自检摘要。
+
+安装完成后即可直接在任意终端运行 **`occ`** 启动 OpenChamber、切换引擎、升级组件或授权 Agy 用量（也可手动执行 `agy-opencode-router quota-login` 完成只读 Google OAuth 授权）。
 
 ## 核心设计
 
-- **零源码入侵**：在 OpenChamber 的「OpenCode 可执行文件路径」中指向本网关启动器即可接入，OpenChamber 仍运行在完整托管模式下，不影响版本升级。
-- **生成式 UI 与 OpenChamber 工具全打通（抗升级）**：
-  - 首轮自动从本机已安装的 `@openchamber/web` 动态提取最新 `openui-lang` 组件规范并注入新建会话，完整拦截 `POST /api/session/:id/synthetic` 支持卡片交互回传与 `POST /api/experimental/generate/text` 小模型生成。
-  - 内置零依赖 MCP stdio 桥接器（`agy-opencode-router mcp-bridge`）：启动时自动在 `~/.gemini/config/mcp_config.json` 幂等注册 `openchamber` 服务，并仅在 OpenChamber 注入 `OPENCHAMBER_AGENT_TOOL_URL` 时动态同步开启 `openchamber_render`、`openchamber`、`openchamber_web` 等工具（对普通终端下的 `agy` 零影响）。
+- **零源码入侵**：在 OpenChamber 的 `opencodeBinary` 中指向本网关即可接入，OpenChamber 仍运行在完整托管模式下，不影响版本升级。
 - **按模型归属分流**：
-  - 网关注入虚拟 Provider `agy-cli`（模型列表动态取自 `agy models`）。
-  - 当前会话选中的模型属于 `providerID === "agy-cli"` 时，网关直接拦截请求并原生调用本地 `agy.exe`（默认不注入 `magpie` 代理模型，仅使用 `agy-cli` 原生模型），将其流式事件翻译为 OpenCode 2.x `OpenCodeEvent` 推入 `/api/event` SSE。
+  - 网关注入虚拟 Provider `agy-cli`（模型列表动态取自 `agy models` 并自动折叠档位为可选变体）。
+  - 当前会话选中的模型属于 `providerID === "agy-cli"` 时，网关直接拦截请求并原生调用本地 `agy.exe`（默认不注入 `magpie` 代理模型），将其流式事件翻译为 OpenCode 2.x `OpenCodeEvent` 推入 `/api/event` SSE。
   - 其他所有模型原样透明转发给内部托管的真实 `opencode serve`。
-- **混合影子会话**：会话元数据由内部 `opencode serve` 统一维护（保留标题、目录、重命名、归档与小模型辅助功能），`agy-cli` 的对话消息由网关本地持久化并与 `GET /api/session/:id/message` 合并返回，支持同一会话内跨引擎切换。
+- **完整协议与子代理打通**：
+  - **思考过程恢复**：针对 `agy-cli` 标准输出流不输出思考增量的特点，按轮次从 `transcript.jsonl` 增量恢复 `PLANNER_RESPONSE.thinking` 并同步回传前端。
+  - **原生子代理桥接**：禁止跨体系混调，将 `agy` 的 `invoke_subagent` / `send_message` / `manage_subagents` 映射为 OpenChamber 子会话树，支持异步回传、二次消息续传及父会话终止清理。
+  - **自动会话命名**：首轮对话完成后异步生成简洁标题并通过 `PATCH /api/session/:id` 同步上游并广播 `session.renamed`。
+  - **生成式 UI 与工具桥接**：首轮动态提取 `@openchamber/web` 的 `openui-lang` 规范，通过内置 `mcp-bridge`（仅在存在 `OPENCHAMBER_AGENT_TOOL_URL` 时激活）支持 `openchamber_render` 等工具及 `/api/session/:id/synthetic` 交互回传。
+- **混合影子会话**：会话元数据由内部 `opencode serve` 统一维护，`agy-cli` 对话消息由网关本地持久化并与 `GET /api/session/:id/message` 按时间顺序合并返回，支持同一会话内跨引擎切换。
 
 ## 目录结构
 
 ```text
 agy-opencode-router/
 ├── bin/
-│   ├── agy-opencode-router.mjs   # CLI 主入口（--version / serve / models / doctor / help）
-│   ├── agy-opencode-router.cmd   # Windows 垫片（可填入 OpenChamber opencodeBinary）
-│   └── agy-opencode-router       # POSIX / Git Bash 垫片
+│   ├── agy-opencode-router.mjs   # 网关 CLI（serve / setup / models / doctor / quota-* / install-mcp / mcp-bridge）
+│   ├── agy-opencode-router.cmd   # Windows 垫片
+│   ├── agy-opencode-router       # POSIX / Git Bash 垫片
+│   ├── occ.mjs                   # OpenChamber 终端启动器（详见 docs/occ.md）
+│   ├── occ.cmd                   # Windows 垫片
+│   └── occ                       # POSIX / Git Bash 垫片
+├── scripts/
+│   ├── install.ps1               # Windows 一键安装与环境初始化脚本
+│   └── install.sh                # macOS / Linux 一键安装与环境初始化脚本
 ├── extensions/
-│   └── agy-quota/                # OpenChamber 独立用量扩展（B2：自带只读 Google OAuth）
-├── src/                          # 网关核心模块（纯 Node 24 ESM，零第三方运行时依赖）
-├── docs/                         # 协议映射与架构说明
+│   └── agy-quota/                # OpenChamber 后台用量扩展（只读 Google OAuth）
+├── src/                          # 网关与 setup 核心模块（纯 Node 24 ESM，零第三方运行时依赖）
+├── docs/                         # 协议映射与 occ 使用说明
 └── test/                         # 单元测试与模拟端到端集成测试
 ```
 
-## Agy CLI 用量扩展（OpenChamber）
-
-`extensions/agy-quota` 是一个无多余界面、零第三方依赖的 OpenChamber 后台用量扩展（仅保留原生「设置 → 用量」及顶部状态栏展示，不在左侧栏添加额外面板图标）：
-
-1. 在 OpenChamber 打开 **设置 → 扩展 → 添加扩展**，填入本地目录路径：`<repo-dir>\extensions\agy-quota`，并批准本地服务与用量查询权限。
-2. 在终端执行一次只读 Google OAuth 授权（也可在 `occ` 菜单中选择 **Agy 用量授权**）：
-   ```bash
-   agy-opencode-router quota-login
-   ```
-   授权凭证以 `0600` 权限保存在 `~/.config/agy-opencode-router/quota-auth.json`（与 OpenCode 完全隔离）；可用 `agy-opencode-router quota-status` 检查或 `agy-opencode-router quota-logout` 解绑。
-3. 随后在 **设置 → 用量 → Agy CLI 用量**（及顶部状态栏下拉）即可只展示精简的 5 小时 / 每周配额池（`Gemini` 与 `Claude / GPT`）。
-
-## 快速命令
+## 常用命令
 
 ```bash
-# 查看帮助与环境诊断
-node ./bin/agy-opencode-router.mjs --help
-node ./bin/agy-opencode-router.mjs doctor
+# 打开交互式控制面板（启停、升级/回滚、切换引擎、授权用量、一键配置）
+occ
+
+# 在新环境执行一条龙配置（也可附加 --install-deps / --dry-run / --json / --uninstall）
+agy-opencode-router setup
+occ setup
+
+# 环境自检、模型目录与用量管理
+agy-opencode-router doctor
+agy-opencode-router models
+agy-opencode-router quota-login
+agy-opencode-router quota-status
+agy-opencode-router quota-logout
 
 # 运行语法检查与全部测试
 npm run check
