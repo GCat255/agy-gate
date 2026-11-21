@@ -10,8 +10,8 @@ import {
   resolveRealAgyModelId,
   toOpenCodeModelInfo,
   AGY_PROVIDER_ID,
-} from '../src/agy-models.mjs';
-import { parseMagpieEnvOutput, redactMagpieSummary } from '../src/magpie-env.mjs';
+} from '../src/agy/models.mjs';
+import { parseMagpieEnvOutput, redactMagpieSummary } from '../src/agy/magpie-env.mjs';
 
 test('parseAgyModelsOutput parses tab-separated models and skips noise', () => {
   const sample = [

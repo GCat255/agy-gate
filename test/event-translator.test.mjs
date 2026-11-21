@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { AgyTurnTranslator } from '../src/event-translator.mjs';
+import { AgyTurnTranslator } from '../src/agy/event-translator.mjs';
 
 test('AgyTurnTranslator maps init, tool, text delta, and result into OpenCode events', () => {
   const events = [];

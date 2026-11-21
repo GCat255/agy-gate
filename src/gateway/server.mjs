@@ -1,6 +1,6 @@
 import http from 'node:http';
-import { AGY_PROVIDER_ID, getAgyCatalog } from './agy-models.mjs';
-import { isAgyChildSessionID } from './subagent-bridge.mjs';
+import { AGY_PROVIDER_ID, getAgyCatalog } from '../agy/models.mjs';
+import { isAgyChildSessionID } from '../agy/subagent-bridge.mjs';
 
 /**
  * Read full request body as Buffer.

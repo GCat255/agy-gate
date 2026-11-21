@@ -1,5 +1,5 @@
-import { AGY_PROVIDER_ID } from './agy-models.mjs';
-import { unwrapOpenChamberToolCall } from './mcp-bridge.mjs';
+import { AGY_PROVIDER_ID } from './models.mjs';
+import { unwrapOpenChamberToolCall } from '../bridge/mcp.mjs';
 
 export function computeStepWindowTotal(parsed) {
   if (!parsed || typeof parsed !== 'object') return 0;

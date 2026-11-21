@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { resolveMagpieBinary } from './config.mjs';
+import { resolveMagpieBinary } from '../core/config.mjs';
 
 const CACHE_TTL_MS = 60_000;
 let cached = null;

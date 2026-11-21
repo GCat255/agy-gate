@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { isUntitledSessionTitle } from './session-title.mjs';
+import { isUntitledSessionTitle } from '../agy/session-title.mjs';
 
 /**
  * Persistent store for `agy-cli` session bindings, model overrides, and messages.

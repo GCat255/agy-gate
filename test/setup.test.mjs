@@ -8,7 +8,7 @@ import {
   registerOpenChamberEngine,
   registerOpenChamberQuotaExtension,
   runSetup,
-} from '../src/setup.mjs';
+} from '../src/cli/setup.mjs';
 
 test('registerOpenChamberEngine binds and restores opencodeBinary while preserving other settings', () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-setup-eng-'));

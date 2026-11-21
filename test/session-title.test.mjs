@@ -4,15 +4,15 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
-import { RouterStore } from '../src/store.mjs';
-import { AgyRunner } from '../src/agy-runner.mjs';
-import { createRouterServer } from '../src/server.mjs';
+import { RouterStore } from '../src/gateway/store.mjs';
+import { AgyRunner } from '../src/agy/runner.mjs';
+import { createRouterServer } from '../src/gateway/server.mjs';
 import {
   buildAutoTitlePrompt,
   extractTitleCandidate,
   isUntitledSessionTitle,
   resolveTitleModelConfig,
-} from '../src/session-title.mjs';
+} from '../src/agy/session-title.mjs';
 
 test('session-title helpers clean raw outputs, detect placeholders, and select flash-low', () => {
   assert.equal(isUntitledSessionTitle(''), true);

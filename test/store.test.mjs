@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { RouterStore } from '../src/store.mjs';
+import { RouterStore } from '../src/gateway/store.mjs';
 
 test('RouterStore persists session overrides and merges messages chronologically', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-router-store-'));

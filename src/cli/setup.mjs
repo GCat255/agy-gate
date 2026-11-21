@@ -9,15 +9,18 @@ import {
   resolveAgyBinary,
   resolveDataDir,
   resolveRealOpenCode,
-} from './config.mjs';
-import { ensureOpenChamberMcpConfig } from './mcp-bridge.mjs';
-import { resolveOpenChamberDataDir, resolveOpenChamberWebRoot } from './openchamber-bridge.mjs';
-import { createOAuthManager } from '../extensions/agy-quota/service/oauth.js';
+} from '../core/config.mjs';
+import { resolveNpmInvocation } from '../core/process.mjs';
+import { ensureOpenChamberMcpConfig } from '../bridge/mcp.mjs';
+import { resolveOpenChamberDataDir, resolveOpenChamberWebRoot } from '../bridge/openchamber.mjs';
+import { createOAuthManager } from '../../extensions/agy-quota/service/oauth.js';
 
 const IS_WIN = process.platform === 'win32';
 const MODULE_DIR = path.dirname(fs.realpathSync(fileURLToPath(import.meta.url)));
-const DEFAULT_CLI_ENTRY = path.resolve(MODULE_DIR, '..', 'bin', 'agy-gate.mjs');
+const DEFAULT_CLI_ENTRY = path.resolve(MODULE_DIR, '..', '..', 'bin', 'agy-gate.mjs');
 const QUOTA_EXTENSION_ID = 'agy-quota';
+
+export { resolveNpmInvocation };
 
 function readJsonFile(filePath, fallback = {}) {
   try {
@@ -55,24 +58,6 @@ export function resolveRouterBinary(options = {}) {
     if (fs.existsSync(candidate)) return candidate;
   }
   return options.cliEntryPath || DEFAULT_CLI_ENTRY;
-}
-
-/**
- * Resolve npm invocation (`node <npm-cli.js>` when beside current Node binary, otherwise `npm` / `npm.cmd`).
- * @param {NodeJS.ProcessEnv} [env]
- */
-export function resolveNpmInvocation(env = process.env) {
-  const nodeDir = path.dirname(process.execPath);
-  const candidates = [
-    path.join(nodeDir, 'node_modules', 'npm', 'bin', 'npm-cli.js'),
-    path.join(nodeDir, '..', 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js'),
-  ];
-  for (const c of candidates) {
-    if (fs.existsSync(c)) {
-      return { file: process.execPath, prefixArgs: [c] };
-    }
-  }
-  return { file: IS_WIN ? 'npm.cmd' : 'npm', prefixArgs: [], env };
 }
 
 /**

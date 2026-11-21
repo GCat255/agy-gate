@@ -9,13 +9,13 @@ import {
   loadOpenChamberGuidance,
   loadOpenChamberToolSpecs,
   resolveOpenChamberWebRoot,
-} from '../src/openchamber-bridge.mjs';
+} from '../src/bridge/openchamber.mjs';
 import {
   ensureOpenChamberMcpConfig,
   normalizeOpenChamberToolName,
   runMcpBridgeServer,
-} from '../src/mcp-bridge.mjs';
-import { AgyTurnTranslator } from '../src/event-translator.mjs';
+} from '../src/bridge/mcp.mjs';
+import { AgyTurnTranslator } from '../src/agy/event-translator.mjs';
 
 async function withTempDir(fn) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'agy-oc-bridge-'));

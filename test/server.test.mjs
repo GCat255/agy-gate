@@ -4,11 +4,11 @@ import http from 'node:http';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { RouterStore } from '../src/store.mjs';
-import { SseHub } from '../src/sse-hub.mjs';
-import { AgyRunner } from '../src/agy-runner.mjs';
-import { createRouterServer } from '../src/server.mjs';
-import { AGY_PROVIDER_ID, buildAgyProviderInfo, toOpenCodeModelInfo } from '../src/agy-models.mjs';
+import { RouterStore } from '../src/gateway/store.mjs';
+import { SseHub } from '../src/gateway/sse-hub.mjs';
+import { AgyRunner } from '../src/agy/runner.mjs';
+import { createRouterServer } from '../src/gateway/server.mjs';
+import { AGY_PROVIDER_ID, buildAgyProviderInfo, toOpenCodeModelInfo } from '../src/agy/models.mjs';
 
 test('router server injects variant models, reuses warm agy worker across turns, and splits traffic', async () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-router-e2e-'));

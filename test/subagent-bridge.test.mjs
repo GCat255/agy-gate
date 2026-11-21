@@ -4,11 +4,11 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
-import { RouterStore } from '../src/store.mjs';
-import { AgyTurnTranslator } from '../src/event-translator.mjs';
-import { AgyRunner } from '../src/agy-runner.mjs';
-import { createRouterServer } from '../src/server.mjs';
-import { invokeOpenChamberAgentTool } from '../src/mcp-bridge.mjs';
+import { RouterStore } from '../src/gateway/store.mjs';
+import { AgyTurnTranslator } from '../src/agy/event-translator.mjs';
+import { AgyRunner } from '../src/agy/runner.mjs';
+import { createRouterServer } from '../src/gateway/server.mjs';
+import { invokeOpenChamberAgentTool } from '../src/bridge/mcp.mjs';
 import {
   AgySubagentWatcher,
   AgyTranscriptTranslator,
@@ -17,7 +17,7 @@ import {
   resolveChildTranscriptPath,
   syncChildSessionFromTranscript,
   toChildSessionID,
-} from '../src/subagent-bridge.mjs';
+} from '../src/agy/subagent-bridge.mjs';
 
 test('AgyTranscriptTranslator and AgySubagentWatcher convert transcript.jsonl into OpenCode child session events & store records', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-sub-watch-'));

@@ -1,7 +1,7 @@
 import { spawnSync } from 'node:child_process';
-import { resolveAgyBinary } from './config.mjs';
+import { resolveAgyBinary } from '../core/config.mjs';
+import { buildSpawnSpec } from '../core/process.mjs';
 import { loadMagpieAgyEnv } from './magpie-env.mjs';
-import { buildSpawnSpec } from './upstream.mjs';
 
 export const AGY_PROVIDER_ID = 'agy-cli';
 export const AGY_PROVIDER_NAME = 'Agy CLI';

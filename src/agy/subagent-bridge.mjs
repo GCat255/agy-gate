@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { AGY_PROVIDER_ID } from './agy-models.mjs';
+import { AGY_PROVIDER_ID } from './models.mjs';
 import { computeStepWindowTotal, emptyTokenBuckets, normalizeUsageBuckets } from './event-translator.mjs';
 
 export const AGY_SUBAGENT_SESSION_PREFIX = 'agy_sub_';

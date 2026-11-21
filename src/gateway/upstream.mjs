@@ -1,8 +1,9 @@
 import net from 'node:net';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
+import { buildSpawnSpec } from '../core/process.mjs';
 
-const IS_WIN = process.platform === 'win32';
+export { buildSpawnSpec };
 
 /**
  * Reserve an unused ephemeral TCP port on 127.0.0.1.
@@ -22,21 +23,6 @@ export function allocateLoopbackPort() {
       });
     });
   });
-}
-
-/**
- * Build spawn command & args, wrapping Windows `.cmd`/`.bat` scripts via `cmd.exe`.
- * @param {string} binary
- * @param {string[]} args
- */
-export function buildSpawnSpec(binary, args) {
-  if (IS_WIN && /\.(cmd|bat)$/i.test(binary)) {
-    return {
-      command: process.env.ComSpec || 'cmd.exe',
-      args: ['/d', '/s', '/c', 'call', binary, ...args],
-    };
-  }
-  return { command: binary, args };
 }
 
 /**

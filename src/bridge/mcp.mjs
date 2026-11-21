@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { loadOpenChamberToolSpecs } from './openchamber-bridge.mjs';
+import { loadOpenChamberToolSpecs } from './openchamber.mjs';
 
 export const OPENCHAMBER_MCP_NAME = 'openchamber';
 

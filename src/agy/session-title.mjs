@@ -1,4 +1,4 @@
-import { getAgyCatalog, resolveRealAgyModelId } from './agy-models.mjs';
+import { getAgyCatalog, resolveRealAgyModelId } from './models.mjs';
 
 export const TITLE_SYSTEM_PROMPT = [
   'You name coding sessions so the user can find them later in a list.',

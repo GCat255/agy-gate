@@ -51,21 +51,26 @@ cd agy-gate
 
 ```text
 agy-gate/
+├── AGENTS.md                   # 项目规范与入口向下的树形依赖约束
 ├── bin/
-│   ├── agy-gate.mjs      # 网关 CLI（serve / setup / models / doctor / quota-* / install-mcp / mcp-bridge）
-│   ├── agy-gate.cmd      # Windows 垫片
-│   ├── agy-gate          # POSIX / Git Bash 垫片
-│   ├── occ.mjs           # OpenChamber 终端启动器（详见 docs/occ.md）
-│   ├── occ.cmd           # Windows 垫片
-│   └── occ               # POSIX / Git Bash 垫片
+│   ├── agy-gate.mjs            # 网关 CLI 入口（serve / setup / models / doctor / quota-* / mcp-bridge）
+│   ├── agy-gate.cmd / agy-gate # Windows / POSIX 垫片
+│   ├── occ.mjs                 # 终端启动器入口（Thin entrypoint -> src/occ/app.mjs）
+│   └── occ.cmd / occ           # Windows / POSIX 垫片
+├── src/                        # 入口向下分层依赖：cli, occ -> gateway -> agy, bridge -> core
+│   ├── cli/                    #   命令行解析（args.mjs）与一条龙配置（setup.mjs）
+│   ├── occ/                    #   occ 终端控制面板（app.mjs / services.mjs / render.mjs）
+│   ├── gateway/                #   HTTP/SSE 分流网关（server.mjs / upstream.mjs / sse-hub.mjs / store.mjs）
+│   ├── agy/                    #   agy-cli 执行与翻译（runner / event-translator / subagent-bridge / session-title / models / magpie-env）
+│   ├── bridge/                 #   OpenChamber 生态桥接（openchamber.mjs / mcp.mjs）
+│   └── core/                   #   底层共享原语（config.mjs / process.mjs）
 ├── scripts/
-│   ├── install.ps1       # Windows 一键安装与环境初始化脚本
-│   └── install.sh        # macOS / Linux 一键安装与环境初始化脚本
+│   ├── install.ps1             # Windows 一键安装与环境初始化脚本
+│   └── install.sh              # macOS / Linux 一键安装与环境初始化脚本
 ├── extensions/
-│   └── agy-quota/        # OpenChamber 后台用量扩展（只读 Google OAuth）
-├── src/                  # 网关与 setup 核心模块（纯 Node 24 ESM，零第三方运行时依赖）
-├── docs/                 # 协议映射与 occ 使用说明
-└── test/                 # 单元测试与模拟端到端集成测试
+│   └── agy-quota/              # OpenChamber 后台用量扩展（只读 Google OAuth）
+├── docs/                       # 协议映射与 occ 使用说明
+└── test/                       # 单元测试与模拟端到端集成测试
 ```
 
 ## 常用命令

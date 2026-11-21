@@ -1,13 +1,12 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
-import { resolveAgyBinary } from './config.mjs';
+import { resolveAgyBinary } from '../core/config.mjs';
+import { buildSpawnSpec } from '../core/process.mjs';
+import { buildSessionGuidancePrefix } from '../bridge/openchamber.mjs';
 import { loadMagpieAgyEnv } from './magpie-env.mjs';
-import { resolveRealAgyModelId } from './agy-models.mjs';
+import { AGY_PROVIDER_ID, resolveRealAgyModelId } from './models.mjs';
 import { AgyTurnTranslator } from './event-translator.mjs';
-import { buildSpawnSpec } from './upstream.mjs';
-import { buildSessionGuidancePrefix } from './openchamber-bridge.mjs';
-import { AGY_PROVIDER_ID } from './agy-models.mjs';
 import {
   AgySubagentWatcher,
   buildSubagentCompletionSynthetic,

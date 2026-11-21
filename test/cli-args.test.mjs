@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { parseCliArgs } from '../src/cli-args.mjs';
+import { parseCliArgs } from '../src/cli/args.mjs';
 
 test('parseCliArgs handles --version, --help, models, doctor', () => {
   assert.deepEqual(parseCliArgs([]), { command: 'help' });
