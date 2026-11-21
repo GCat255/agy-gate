@@ -1,0 +1,26 @@
+{
+  "name": "agy-opencode-router",
+  "version": "0.1.0",
+  "description": "Non-invasive routing gateway bridging OpenChamber/OpenCode 2.x and agy-cli by model provider",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "bin": {
+    "agy-opencode-router": "./bin/agy-opencode-router.mjs"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "check": "node --check bin/agy-opencode-router.mjs src/*.mjs test/*.mjs",
+    "smoke": "node ./bin/agy-opencode-router.mjs --help"
+  },
+  "keywords": [
+    "openchamber",
+    "opencode",
+    "agy-cli",
+    "router",
+    "gateway"
+  ],
+  "license": "MIT"
+}
