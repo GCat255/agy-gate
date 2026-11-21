@@ -1,8 +1,8 @@
 @echo off
-rem agy-opencode-router Windows shim
+rem agy-gate Windows shim
 rem ASCII only: cmd.exe parses .cmd files in the OEM codepage.
 setlocal
-set "IMPL=%~dp0agy-opencode-router.mjs"
+set "IMPL=%~dp0agy-gate.mjs"
 set "NODE="
 where node >nul 2>nul
 if %ERRORLEVEL% EQU 0 set "NODE=node"

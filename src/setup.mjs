@@ -16,7 +16,7 @@ import { createOAuthManager } from '../extensions/agy-quota/service/oauth.js';
 
 const IS_WIN = process.platform === 'win32';
 const MODULE_DIR = path.dirname(fs.realpathSync(fileURLToPath(import.meta.url)));
-const DEFAULT_CLI_ENTRY = path.resolve(MODULE_DIR, '..', 'bin', 'agy-opencode-router.mjs');
+const DEFAULT_CLI_ENTRY = path.resolve(MODULE_DIR, '..', 'bin', 'agy-gate.mjs');
 const QUOTA_EXTENSION_ID = 'agy-quota';
 
 function readJsonFile(filePath, fallback = {}) {
@@ -44,12 +44,12 @@ export function resolveRouterBinary(options = {}) {
   const binDir = options.binDir || ROUTER_BIN_DIR;
   const preferred = IS_WIN
     ? [
-        path.join(binDir, 'agy-opencode-router.cmd'),
-        path.join(binDir, 'agy-opencode-router.mjs'),
+        path.join(binDir, 'agy-gate.cmd'),
+        path.join(binDir, 'agy-gate.mjs'),
       ]
     : [
-        path.join(binDir, 'agy-opencode-router'),
-        path.join(binDir, 'agy-opencode-router.mjs'),
+        path.join(binDir, 'agy-gate'),
+        path.join(binDir, 'agy-gate.mjs'),
       ];
   for (const candidate of preferred) {
     if (fs.existsSync(candidate)) return candidate;
@@ -229,7 +229,7 @@ function parseNodeMajor(version = process.versions.node) {
 }
 
 /**
- * Execute one-stop environment setup for `occ` + `agy-opencode-router`.
+ * Execute one-stop environment setup for `occ` + `agy-gate`.
  * @param {{
  *   env?: NodeJS.ProcessEnv,
  *   cliEntryPath?: string,
@@ -265,7 +265,7 @@ export async function runSetup(options = {}) {
       if (!r.ok) warnings.push(`安装 @opencode/cli 失败：${r.stderr.trim() || r.stdout.trim()}`);
     }
     const linkRes = runNpmInstall(['link'], env);
-    installed.push({ pkg: 'agy-opencode-router (link)', ...linkRes });
+    installed.push({ pkg: 'agy-gate (link)', ...linkRes });
     steps.installDeps = installed;
   }
 
@@ -343,7 +343,7 @@ export async function runSetup(options = {}) {
  */
 export function formatSetupReport(result) {
   const lines = [
-    result.uninstall ? 'agy-opencode-router — 已卸载配置' : 'agy-opencode-router — 环境初始化结果',
+    result.uninstall ? 'agy-gate — 已卸载配置' : 'agy-gate — 环境初始化结果',
     '',
     `  Node.js:          ${result.checks.nodeVersion} ${result.checks.nodeOk ? '✓' : '⚠ (建议 >= 24)'}`,
     `  OpenChamber:      ${result.checks.openChamberWebRoot || '未检测到 ✗'}`,
@@ -365,7 +365,7 @@ export function formatSetupReport(result) {
     lines.push(`  OpenChamber MCP:  ${result.steps.mcp.action || (result.steps.mcp.ok ? 'ready' : 'error')}`);
   }
   lines.push(
-    `  Agy 用量授权:     ${result.checks.quotaAuth.connected ? `已授权 (${result.checks.quotaAuth.email || 'Google'})` : '未授权（可运行 occ → Agy 用量授权 或 agy-opencode-router quota-login）'}`,
+    `  Agy 用量授权:     ${result.checks.quotaAuth.connected ? `已授权 (${result.checks.quotaAuth.email || 'Google'})` : '未授权（可运行 occ → Agy 用量授权 或 agy-gate quota-login）'}`,
   );
 
   if (result.warnings.length > 0) {

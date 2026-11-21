@@ -15,9 +15,13 @@ const IS_WIN = process.platform === 'win32';
  * @param {NodeJS.ProcessEnv} [env]
  */
 export function resolveDataDir(env = process.env) {
-  const override = env.AGY_ROUTER_DATA_DIR?.trim();
+  const override = env.AGY_GATE_DATA_DIR?.trim() || env.AGY_ROUTER_DATA_DIR?.trim();
   if (override) return path.resolve(override);
-  return path.join(os.homedir(), '.config', 'agy-opencode-router');
+  const primary = path.join(os.homedir(), '.config', 'agy-gate');
+  if (fs.existsSync(primary)) return primary;
+  const legacy = path.join(os.homedir(), '.config', 'agy-opencode-router');
+  if (fs.existsSync(legacy)) return legacy;
+  return primary;
 }
 
 /**
@@ -27,15 +31,19 @@ export function resolveDataDir(env = process.env) {
 export function isRouterSelfPath(candidate) {
   if (!candidate) return false;
   const resolved = path.resolve(candidate).toLowerCase();
-  const selfNames = [
-    path.join(ROUTER_BIN_DIR, 'agy-opencode-router.mjs'),
-    path.join(ROUTER_BIN_DIR, 'agy-opencode-router.cmd'),
-    path.join(ROUTER_BIN_DIR, 'agy-opencode-router'),
-  ].map((p) => path.resolve(p).toLowerCase());
-  if (selfNames.includes(resolved)) return true;
-  return resolved.endsWith(`${path.sep}agy-opencode-router.cmd`)
-    || resolved.endsWith(`${path.sep}agy-opencode-router.mjs`)
-    || resolved.endsWith(`${path.sep}agy-opencode-router`);
+  const names = [
+    'agy-gate.mjs',
+    'agy-gate.cmd',
+    'agy-gate',
+    'agy-opencode-router.mjs',
+    'agy-opencode-router.cmd',
+    'agy-opencode-router',
+  ];
+  for (const name of names) {
+    if (resolved === path.join(ROUTER_BIN_DIR, name).toLowerCase()) return true;
+    if (resolved.endsWith(`${path.sep}${name}`)) return true;
+  }
+  return false;
 }
 
 function existsFile(filePath) {

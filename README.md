@@ -1,4 +1,4 @@
-# agy-opencode-router
+# agy-gate
 
 非侵入式前置双引擎路由网关与终端管理工具（集成 **`occ`** 启动器），使 **OpenChamber** 在不修改任何底层源码的前提下，同时支持原生 **OpenCode 2.x** 与本地 **agy-cli**（Gemini 订阅模型、原生工具、子代理体系与思考流），并可在新设备上一键完成全套部署。
 
@@ -9,29 +9,29 @@
 ### Windows（PowerShell）
 
 ```powershell
-git clone https://github.com/GCat255/agy-opencode-router.git
-cd agy-opencode-router
+git clone https://github.com/GCat255/agy-gate.git
+cd agy-gate
 .\scripts\install.ps1
 ```
 
 ### macOS / Linux / Git Bash
 
 ```bash
-git clone https://github.com/GCat255/agy-opencode-router.git
-cd agy-opencode-router
+git clone https://github.com/GCat255/agy-gate.git
+cd agy-gate
 ./scripts/install.sh
 ```
 
 安装脚本会自动完成以下全部动作：
-1. 全局链接 `occ` 与 `agy-opencode-router` 命令（`npm link`，失败时回退 `npm install -g .`）。
+1. 全局链接 `occ` 与 `agy-gate` 命令（`npm link`，失败时回退 `npm install -g .`）。
 2. 检查并在缺失时全局安装 `@openchamber/web` 与 `@opencode/cli`。
-3. 运行 `agy-opencode-router setup`，自动完成三项本地配置：
-   - 在 `~/.config/openchamber/settings.json` 将 `opencodeBinary` 绑定到分流网关；
+3. 运行 `agy-gate setup`，自动完成三项本地配置：
+   - 在 `~/.config/openchamber/settings.json` 将 `opencodeBinary` 绑定到 `agy-gate`；
    - 在 `~/.config/openchamber/extensions.json` 注册并授权 `extensions/agy-quota` 用量扩展；
    - 在 `~/.gemini/config/mcp_config.json` 幂等注册 `mcpServers.openchamber`（仅在 OpenChamber 会话内激活工具）。
-4. 运行 `agy-opencode-router doctor` 输出环境自检摘要。
+4. 运行 `agy-gate doctor` 输出环境自检摘要。
 
-安装完成后即可直接在任意终端运行 **`occ`** 启动 OpenChamber、切换引擎、升级组件或授权 Agy 用量（也可手动执行 `agy-opencode-router quota-login` 完成只读 Google OAuth 授权）。
+安装完成后即可直接在任意终端运行 **`occ`** 启动 OpenChamber、切换引擎、升级组件或授权 Agy 用量（也可手动执行 `agy-gate quota-login` 完成只读 Google OAuth 授权）。
 
 ## 核心设计
 
@@ -50,22 +50,22 @@ cd agy-opencode-router
 ## 目录结构
 
 ```text
-agy-opencode-router/
+agy-gate/
 ├── bin/
-│   ├── agy-opencode-router.mjs   # 网关 CLI（serve / setup / models / doctor / quota-* / install-mcp / mcp-bridge）
-│   ├── agy-opencode-router.cmd   # Windows 垫片
-│   ├── agy-opencode-router       # POSIX / Git Bash 垫片
-│   ├── occ.mjs                   # OpenChamber 终端启动器（详见 docs/occ.md）
-│   ├── occ.cmd                   # Windows 垫片
-│   └── occ                       # POSIX / Git Bash 垫片
+│   ├── agy-gate.mjs      # 网关 CLI（serve / setup / models / doctor / quota-* / install-mcp / mcp-bridge）
+│   ├── agy-gate.cmd      # Windows 垫片
+│   ├── agy-gate          # POSIX / Git Bash 垫片
+│   ├── occ.mjs           # OpenChamber 终端启动器（详见 docs/occ.md）
+│   ├── occ.cmd           # Windows 垫片
+│   └── occ               # POSIX / Git Bash 垫片
 ├── scripts/
-│   ├── install.ps1               # Windows 一键安装与环境初始化脚本
-│   └── install.sh                # macOS / Linux 一键安装与环境初始化脚本
+│   ├── install.ps1       # Windows 一键安装与环境初始化脚本
+│   └── install.sh        # macOS / Linux 一键安装与环境初始化脚本
 ├── extensions/
-│   └── agy-quota/                # OpenChamber 后台用量扩展（只读 Google OAuth）
-├── src/                          # 网关与 setup 核心模块（纯 Node 24 ESM，零第三方运行时依赖）
-├── docs/                         # 协议映射与 occ 使用说明
-└── test/                         # 单元测试与模拟端到端集成测试
+│   └── agy-quota/        # OpenChamber 后台用量扩展（只读 Google OAuth）
+├── src/                  # 网关与 setup 核心模块（纯 Node 24 ESM，零第三方运行时依赖）
+├── docs/                 # 协议映射与 occ 使用说明
+└── test/                 # 单元测试与模拟端到端集成测试
 ```
 
 ## 常用命令
@@ -75,15 +75,15 @@ agy-opencode-router/
 occ
 
 # 在新环境执行一条龙配置（也可附加 --install-deps / --dry-run / --json / --uninstall）
-agy-opencode-router setup
+agy-gate setup
 occ setup
 
 # 环境自检、模型目录与用量管理
-agy-opencode-router doctor
-agy-opencode-router models
-agy-opencode-router quota-login
-agy-opencode-router quota-status
-agy-opencode-router quota-logout
+agy-gate doctor
+agy-gate models
+agy-gate quota-login
+agy-gate quota-status
+agy-gate quota-logout
 
 # 运行语法检查与全部测试
 npm run check

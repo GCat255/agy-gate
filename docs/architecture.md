@@ -4,9 +4,9 @@
 
 ```text
 OpenChamber Server
-   │  spawn: agy-opencode-router serve [--stdio] --hostname 127.0.0.1 --port <P_gw>
+   │  spawn: agy-gate serve [--stdio] --hostname 127.0.0.1 --port <P_gw>
    ▼
-agy-opencode-router (监听 P_gw，透传 Basic Auth)
+agy-gate (监听 P_gw，透传 Basic Auth)
    ├──▶ 内部子进程：opencode serve [--stdio] --hostname 127.0.0.1 --port <P_oc>
    └──▶ 按需调用：agy.exe -p --output-format stream-json --model <modelID> [--conversation <convID>]
 ```

@@ -240,7 +240,7 @@ export async function readAntigravityQuota(oauthManager, options = {}) {
     return {
       ok: false,
       configured: false,
-      error: '尚未授权 Google 账号，请运行 agy-opencode-router quota-login（或在 occ 中登录）。',
+      error: '尚未授权 Google 账号，请运行 agy-gate quota-login（或在 occ 中登录）。',
       usage: null,
     };
   }

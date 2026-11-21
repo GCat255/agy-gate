@@ -299,7 +299,7 @@ export function runMcpBridgeServer(options = {}) {
           result: {
             protocolVersion,
             capabilities: { tools: {} },
-            serverInfo: { name: 'agy-opencode-router-openchamber-bridge', version: '0.1.0' },
+            serverInfo: { name: 'agy-gate-openchamber-bridge', version: '0.1.0' },
           },
         });
         return;

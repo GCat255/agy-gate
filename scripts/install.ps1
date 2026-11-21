@@ -2,7 +2,7 @@
 
 $RepoRoot = Resolve-Path (Join-Path $PSScriptRoot '..')
 
-Write-Host "==> agy-opencode-router + occ 一键安装与配置" -ForegroundColor Cyan
+Write-Host "==> agy-gate + occ 一键安装与配置" -ForegroundColor Cyan
 
 $nodeCmd = Get-Command node -ErrorAction SilentlyContinue
 if (-not $nodeCmd) {
@@ -24,7 +24,7 @@ if (-not $npmCmd) {
 
 Push-Location $RepoRoot
 try {
-  Write-Host "[1/3] 链接全局命令 occ 与 agy-opencode-router..."
+  Write-Host "[1/3] 链接全局命令 occ 与 agy-gate..."
   & npm link
   if ($LASTEXITCODE -ne 0) {
     Write-Host "npm link 未成功，改用 npm install -g . ..." -ForegroundColor Yellow
@@ -33,11 +33,11 @@ try {
   }
 
   Write-Host "[2/3] 检测并补齐 @openchamber/web / @opencode/cli，绑定网关、agy-quota 扩展与 MCP..."
-  & node .\bin\agy-opencode-router.mjs setup --install-deps
+  & node .\bin\agy-gate.mjs setup --install-deps
   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
   Write-Host "[3/3] 环境诊断 (doctor)..."
-  & node .\bin\agy-opencode-router.mjs doctor
+  & node .\bin\agy-gate.mjs doctor
 } finally {
   Pop-Location
 }

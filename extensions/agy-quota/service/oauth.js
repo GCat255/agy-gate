@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import fsSync from 'node:fs';
 import fs from 'node:fs/promises';
 import http from 'node:http';
 import os from 'node:os';
@@ -26,7 +27,11 @@ export function resolveDefaultAuthFilePath(env = process.env) {
   if (env.AGY_QUOTA_AUTH_FILE?.trim()) {
     return path.resolve(env.AGY_QUOTA_AUTH_FILE.trim());
   }
-  return path.join(os.homedir(), '.config', 'agy-opencode-router', 'quota-auth.json');
+  const primary = path.join(os.homedir(), '.config', 'agy-gate', 'quota-auth.json');
+  if (fsSync.existsSync(primary)) return primary;
+  const legacy = path.join(os.homedir(), '.config', 'agy-opencode-router', 'quota-auth.json');
+  if (fsSync.existsSync(legacy)) return legacy;
+  return primary;
 }
 
 function resolveFallbackAuthFilePath(env = process.env) {
@@ -383,7 +388,7 @@ export function createOAuthManager(options = {}) {
       const code = payload?.error || '';
       const desc = payload?.error_description || code || `HTTP ${res.status}`;
       if (code === 'invalid_grant') {
-        lastError = 'Google OAuth 授权已过期或被撤销，请重新运行 agy-opencode-router quota-login 授权。';
+        lastError = 'Google OAuth 授权已过期或被撤销，请重新运行 agy-gate quota-login 授权。';
         throw new Error(lastError);
       }
       throw new Error(`刷新 Google 访问令牌失败：${desc}`);

@@ -1,5 +1,5 @@
 {
-  "name": "agy-opencode-router",
+  "name": "agy-gate",
   "version": "0.1.0",
   "description": "Non-invasive routing gateway bridging OpenChamber/OpenCode 2.x and agy-cli by model provider",
   "type": "module",
@@ -8,14 +8,14 @@
     "node": ">=24.0.0"
   },
   "bin": {
-    "agy-opencode-router": "./bin/agy-opencode-router.mjs",
+    "agy-gate": "./bin/agy-gate.mjs",
     "occ": "./bin/occ.mjs"
   },
   "scripts": {
     "test": "node --test test/*.test.mjs",
-    "check": "node --check bin/agy-opencode-router.mjs bin/occ.mjs src/*.mjs test/*.mjs extensions/agy-quota/service/*.js",
-    "setup": "node ./bin/agy-opencode-router.mjs setup",
-    "smoke": "node ./bin/agy-opencode-router.mjs --help"
+    "check": "node --check bin/agy-gate.mjs bin/occ.mjs src/*.mjs test/*.mjs extensions/agy-quota/service/*.js",
+    "setup": "node ./bin/agy-gate.mjs setup",
+    "smoke": "node ./bin/agy-gate.mjs --help"
   },
   "keywords": [
     "openchamber",

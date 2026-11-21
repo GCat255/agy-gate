@@ -16,15 +16,15 @@ test('registerOpenChamberEngine binds and restores opencodeBinary while preservi
     const settingsPath = path.join(tmp, 'settings.json');
     fs.writeFileSync(settingsPath, JSON.stringify({ themeId: 'dark', desktopLocalPort: 3000 }), 'utf8');
 
-    const res = registerOpenChamberEngine({ dataDir: tmp, routerBinary: 'C:\\bin\\agy-opencode-router.cmd' });
+    const res = registerOpenChamberEngine({ dataDir: tmp, routerBinary: 'C:\\bin\\agy-gate.cmd' });
     assert.equal(res.ok, true);
     assert.equal(res.action, 'updated');
 
     const afterBind = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
-    assert.equal(afterBind.opencodeBinary, 'C:\\bin\\agy-opencode-router.cmd');
+    assert.equal(afterBind.opencodeBinary, 'C:\\bin\\agy-gate.cmd');
     assert.equal(afterBind.themeId, 'dark');
 
-    const idempotent = registerOpenChamberEngine({ dataDir: tmp, routerBinary: 'C:\\bin\\agy-opencode-router.cmd' });
+    const idempotent = registerOpenChamberEngine({ dataDir: tmp, routerBinary: 'C:\\bin\\agy-gate.cmd' });
     assert.equal(idempotent.action, 'unchanged');
 
     const restored = registerOpenChamberEngine({ dataDir: tmp, restore: true });
@@ -91,10 +91,11 @@ test('runSetup wires engine, extension, and mcp_config cleanly in isolated temp 
       AGY_MCP_CONFIG_PATH: mcpPath,
     };
 
+    const repoRoot = path.resolve(import.meta.dirname, '..');
     const result = await runSetup({
       env,
-      cliEntryPath: path.resolve('E:/agy_projects/agy-opencode-router/bin/agy-opencode-router.mjs'),
-      routerRoot: path.resolve('E:/agy_projects/agy-opencode-router'),
+      cliEntryPath: path.join(repoRoot, 'bin', 'agy-gate.mjs'),
+      routerRoot: repoRoot,
     });
 
     assert.equal(result.ok, true);

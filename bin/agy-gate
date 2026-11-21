@@ -8,4 +8,4 @@ elif [ -n "${LOCALAPPDATA:-}" ] && [ -x "${LOCALAPPDATA}/Programs/nodejs/node.ex
 else
   NODE_BIN="node"
 fi
-exec "$NODE_BIN" "$SCRIPT_DIR/agy-opencode-router.mjs" "$@"
+exec "$NODE_BIN" "$SCRIPT_DIR/agy-gate.mjs" "$@"

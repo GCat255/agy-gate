@@ -73,7 +73,7 @@ describe('mcp-bridge registration, env gating, and OpenChamber HTTP forwarding',
         'utf8',
       );
 
-      const cliEntry = path.resolve(import.meta.dirname, '..', 'bin', 'agy-opencode-router.mjs');
+      const cliEntry = path.resolve(import.meta.dirname, '..', 'bin', 'agy-gate.mjs');
       const first = ensureOpenChamberMcpConfig({
         cliEntryPath: cliEntry,
         env: { AGY_MCP_CONFIG_PATH: mcpConfig },

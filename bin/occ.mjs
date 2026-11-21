@@ -29,7 +29,7 @@ const IS_WIN = process.platform === 'win32';
 const PKG_OPENCODE = '@opencode/cli';
 const PKG_OPENCHAMBER = '@openchamber/web';
 const TOOL_DIR = path.dirname(fs.realpathSync(fileURLToPath(import.meta.url)));
-const ROUTER_CLI = path.join(TOOL_DIR, 'agy-opencode-router.mjs');
+const ROUTER_CLI = path.join(TOOL_DIR, 'agy-gate.mjs');
 const ROUTER_BIN = resolveRouterBinary({ binDir: ROUTER_BIN_DIR, cliEntryPath: ROUTER_CLI });
 const STATE_FILE = path.join(resolveDataDir(), 'occ-state.json');
 
@@ -62,9 +62,14 @@ function resolveWebCli() {
 function isRouterPath(candidate) {
   if (typeof candidate !== 'string' || !candidate.trim()) return false;
   const norm = path.resolve(candidate.trim()).toLowerCase();
-  return norm.endsWith(`${path.sep}agy-opencode-router.cmd`)
-    || norm.endsWith(`${path.sep}agy-opencode-router.mjs`)
-    || norm.endsWith(`${path.sep}agy-opencode-router`);
+  return [
+    'agy-gate.cmd',
+    'agy-gate.mjs',
+    'agy-gate',
+    'agy-opencode-router.cmd',
+    'agy-opencode-router.mjs',
+    'agy-opencode-router',
+  ].some((name) => norm.endsWith(`${path.sep}${name}`));
 }
 
 function dataDir() {
@@ -97,7 +102,7 @@ function routerBindingState() {
 }
 
 function quotaAuthPath() {
-  return path.join(os.homedir(), '.config', 'agy-opencode-router', 'quota-auth.json');
+  return path.join(resolveDataDir(), 'quota-auth.json');
 }
 
 function quotaAuthState() {
@@ -544,7 +549,7 @@ function menuRows() {
   const inst = S.instances[0];
   const routerAvailable = fs.existsSync(ROUTER_BIN);
   const routerRight = !routerAvailable
-    ? '未找到 agy-opencode-router 垫片'
+    ? '未找到 agy-gate 垫片'
     : S.routerMode === 'router'
       ? '已启用分流网关（OpenCode + agy-cli）'
       : S.routerMode === 'custom'
@@ -569,7 +574,7 @@ function menuRows() {
       id: 'quota',
       label: 'Agy 用量授权',
       right: !routerAvailable
-        ? '未找到 agy-opencode-router 垫片'
+        ? '未找到 agy-gate 垫片'
         : S.quotaAuth.connected
           ? `已授权${S.quotaAuth.email ? `（${S.quotaAuth.email}）` : ''} · Enter 解绑`
           : '未授权 · Enter 打开 Google 登录',
@@ -1088,7 +1093,7 @@ function buildRouterInvocation(subArgs) {
 
 async function actionQuotaAuth() {
   if (!fs.existsSync(ROUTER_BIN)) {
-    S.message = style.err(`未找到 agy-opencode-router：${ROUTER_BIN}`);
+    S.message = style.err(`未找到 agy-gate：${ROUTER_BIN}`);
     draw();
     return;
   }
@@ -1122,7 +1127,7 @@ async function actionQuotaAuth() {
   if (r.ok && S.quotaAuth.connected) {
     stopSpin(style.ok(`已授权：${S.quotaAuth.email ?? 'Google 账号'}（可在 OpenChamber 设置 → 用量刷新查看）`));
   } else {
-    stopSpin(style.err(`授权未完成：${tail(r.err || r.out, 2).join(' ') || '请改用终端执行 agy-opencode-router quota-login'}`));
+    stopSpin(style.err(`授权未完成：${tail(r.err || r.out, 2).join(' ') || '请改用终端执行 agy-gate quota-login'}`));
   }
   draw();
 }
@@ -1132,9 +1137,9 @@ async function actionSetup() {
   const res = await runSetup({ cliEntryPath: ROUTER_CLI, env: process.env });
   await refreshVersions();
   if (!res.ok) {
-    stopSpin(style.err(`配置未完全成功：${res.warnings[0] || '请运行 agy-opencode-router setup 查看详情'}`));
+    stopSpin(style.err(`配置未完全成功：${res.warnings[0] || '请运行 agy-gate setup 查看详情'}`));
   } else if (res.warnings.length > 0) {
-    stopSpin(style.warn(`已写入配置（${res.warnings.length} 项环境提示，可用 agy-opencode-router doctor 检查）`));
+    stopSpin(style.warn(`已写入配置（${res.warnings.length} 项环境提示，可用 agy-gate doctor 检查）`));
   } else {
     stopSpin(style.ok('已完成一条龙配置（引擎绑定 + agy-quota 扩展 + MCP）'));
   }
@@ -1237,7 +1242,7 @@ function helpText() {
     '  启动服务            启动本地服务并显示地址',
     '  停止服务            停止正在运行的实例',
     '  升级                选择组件（opencode / openchamber / agy-cli）进行升级或回滚',
-    '  引擎入口            在原生 OpenCode 与 agy-opencode-router 分流网关间切换',
+    '  引擎入口            在原生 OpenCode 与 agy-gate 分流网关间切换',
     '  Agy 用量授权        为 Agy CLI 用量扩展完成或解除只读 Google OAuth 授权',
     '  一键配置            绑定分流网关、注册 agy-quota 扩展与 openchamber MCP',
     '  退出                等同于 q',
