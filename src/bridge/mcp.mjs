@@ -24,6 +24,12 @@ export const OPENCHAMBER_TOOL_NAMES = new Set([
   'openchamber_workflow',
 ]);
 
+export function isOpenChamberToolName(name) {
+  const s = String(name || '').trim();
+  if (!s) return false;
+  return OPENCHAMBER_TOOL_NAMES.has(s) || /^openchamber(?:_[a-z0-9_]+)?$/i.test(s);
+}
+
 /**
  * Unwrap either direct OpenChamber tool name or `agy-cli`'s `call_mcp_tool` wrapper.
  * @param {string} rawName
@@ -44,14 +50,14 @@ export function unwrapOpenChamberToolCall(rawName, rawParams) {
     return {
       name: innerName,
       input: innerInput,
-      isOpenChamberTool: OPENCHAMBER_TOOL_NAMES.has(innerName),
+      isOpenChamberTool: isOpenChamberToolName(innerName),
     };
   }
   const normalized = normalizeOpenChamberToolName(s);
   return {
     name: normalized,
     input: rawParams && typeof rawParams === 'object' ? rawParams : {},
-    isOpenChamberTool: OPENCHAMBER_TOOL_NAMES.has(normalized),
+    isOpenChamberTool: isOpenChamberToolName(normalized),
   };
 }
 
@@ -64,7 +70,7 @@ export function normalizeOpenChamberToolName(rawName) {
   for (const prefix of ['mcp__openchamber__', 'openchamber__', 'openchamber/', 'openchamber:']) {
     if (s.startsWith(prefix)) {
       const bare = s.slice(prefix.length);
-      if (OPENCHAMBER_TOOL_NAMES.has(bare)) return bare;
+      if (isOpenChamberToolName(bare)) return bare;
     }
   }
   return s;

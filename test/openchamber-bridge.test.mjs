@@ -13,8 +13,10 @@ import {
 } from '../src/bridge/openchamber.mjs';
 import {
   ensureOpenChamberMcpConfig,
+  isOpenChamberToolName,
   normalizeOpenChamberToolName,
   runMcpBridgeServer,
+  unwrapOpenChamberToolCall,
 } from '../src/bridge/mcp.mjs';
 import { AgyTurnTranslator } from '../src/agy/event-translator.mjs';
 
@@ -113,6 +115,17 @@ describe('mcp-bridge registration, env gating, and OpenChamber HTTP forwarding',
       assert.deepEqual(saved.mcpServers['unity-mcp'], { command: 'uv.exe', args: ['run'], disabled: false });
       assert.equal(saved.mcpServers.openchamber.disabled, false);
       assert.ok(saved.mcpServers.openchamber.args.includes('mcp-bridge'));
+
+      assert.equal(isOpenChamberToolName('openchamber_future_tool'), true);
+      assert.equal(normalizeOpenChamberToolName('mcp__openchamber__openchamber_future_tool'), 'openchamber_future_tool');
+      assert.deepEqual(
+        unwrapOpenChamberToolCall('call_mcp_tool', {
+          ServerName: 'openchamber',
+          ToolName: 'openchamber_future_tool',
+          Arguments: { action: 'ping' },
+        }),
+        { name: 'openchamber_future_tool', input: { action: 'ping' }, isOpenChamberTool: true },
+      );
     });
   });
 
