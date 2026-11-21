@@ -258,6 +258,7 @@ async function evaluatePluginSourceForSchemas(pluginSource, guidance) {
       transform: async (fn) => {
         await fn({
           namespace: () => {},
+          remove: () => {},
           add: (spec) => {
             if (!spec?.name) return;
             const name = String(spec.name);
@@ -269,6 +270,9 @@ async function evaluatePluginSourceForSchemas(pluginSource, guidance) {
           },
         });
       },
+    },
+    session: {
+      hook: () => {},
     },
   });
   return captured;

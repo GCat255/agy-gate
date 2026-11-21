@@ -37,6 +37,8 @@ describe('openchamber-bridge dynamic discovery & guidance', () => {
       const liveTools = await loadOpenChamberToolSpecs({ env: process.env, forceRefresh: true });
       const names = liveTools.map((t) => t.name);
       assert.ok(names.includes('openchamber'));
+      const openchamberTool = liveTools.find((t) => t.name === 'openchamber');
+      assert.ok(openchamberTool.description.length > 200, 'Should capture full OpenChamber tool schema rather than fallback');
       const renderTool = liveTools.find((t) => t.name === 'openchamber_render');
       assert.ok(renderTool);
       assert.ok(renderTool.description.includes('openui-lang'));
