@@ -74,6 +74,46 @@ export class AgyRunner {
   }
 
   /**
+   * Build child environment and base CLI flags for `agy-cli`.
+   * @param {{ realModelID?: string, conversationId?: string | null }} opts
+   */
+  _buildAgySpawnConfig(opts = {}) {
+    const agyBin = resolveAgyBinary(this.env);
+    if (!agyBin) return null;
+
+    const useMagpie = this.env.AGY_ROUTER_USE_MAGPIE === '1';
+    const childEnv = { ...this.env };
+    const args = [];
+
+    if (useMagpie) {
+      const magpie = loadMagpieAgyEnv({ env: this.env });
+      Object.assign(childEnv, magpie.envPatch);
+      if (magpie.settingsPath) args.push('--settings', magpie.settingsPath);
+    } else {
+      delete childEnv.GEMINI_API_KEY;
+      delete childEnv.GOOGLE_GEMINI_BASE_URL;
+    }
+
+    return { agyBin, childEnv, args };
+  }
+
+  /**
+   * Terminate a child process cleanly on Windows/POSIX.
+   * @param {import('node:child_process').ChildProcess} child
+   */
+  _killChild(child) {
+    try {
+      if (IS_WIN && child.pid) {
+        spawnSync('taskkill', ['/pid', String(child.pid), '/f', '/t'], { windowsHide: true });
+      } else {
+        child.kill('SIGTERM');
+      }
+    } catch {
+      // Ignore kill errors
+    }
+  }
+
+  /**
    * @param {string} sessionID
    * @param {boolean} [forceKill]
    */
@@ -98,15 +138,7 @@ export class AgyRunner {
       }
     }
 
-    try {
-      if (IS_WIN && w.child.pid) {
-        spawnSync('taskkill', ['/pid', String(w.child.pid), '/f', '/t'], { windowsHide: true });
-      } else {
-        w.child.kill('SIGTERM');
-      }
-    } catch {
-      // Ignore kill errors
-    }
+    this._killChild(w.child);
   }
 
   /**
@@ -114,22 +146,11 @@ export class AgyRunner {
    * @param {{ sessionID: string, realModelID: string, cwd: string, promptText: string }} opts
    */
   _spawnWorker(opts) {
-    const agyBin = resolveAgyBinary(this.env);
-    if (!agyBin) return null;
+    const cfg = this._buildAgySpawnConfig();
+    if (!cfg) return null;
 
-    const useMagpie = this.env.AGY_ROUTER_USE_MAGPIE === '1';
-    const childEnv = { ...this.env };
     const sessionState = this.store.getSession(opts.sessionID);
-
-    const args = [];
-    if (useMagpie) {
-      const magpie = loadMagpieAgyEnv({ env: this.env });
-      Object.assign(childEnv, magpie.envPatch);
-      if (magpie.settingsPath) args.push('--settings', magpie.settingsPath);
-    } else {
-      delete childEnv.GEMINI_API_KEY;
-      delete childEnv.GOOGLE_GEMINI_BASE_URL;
-    }
+    const args = [...cfg.args];
 
     if (this.useWarmWorker) {
       args.push('--input-format', 'stream-json');
@@ -150,10 +171,10 @@ export class AgyRunner {
       args.push('-p', opts.promptText);
     }
 
-    const spec = buildSpawnSpec(agyBin, args);
+    const spec = buildSpawnSpec(cfg.agyBin, args);
     const child = spawn(spec.command, spec.args, {
       cwd: opts.cwd,
-      env: childEnv,
+      env: cfg.childEnv,
       windowsHide: true,
       stdio: [this.useWarmWorker ? 'pipe' : 'ignore', 'pipe', 'pipe'],
     });
@@ -346,6 +367,140 @@ export class AgyRunner {
     }
 
     return { ok: true };
+  }
+
+  /**
+   * Run a stateless one-shot text generation via `agy-cli` for `/api/experimental/generate/text`.
+   * Sends prompt via stdin (`stream-json`) to avoid OS command-line length limits.
+   * @param {{ prompt: string, modelID: string, variant?: string, directory?: string | null, timeoutMs?: number, signal?: AbortSignal }} params
+   * @returns {Promise<string>}
+   */
+  generateText(params) {
+    const cfg = this._buildAgySpawnConfig();
+    if (!cfg) {
+      return Promise.reject(new Error('agy executable not found on this machine'));
+    }
+
+    const realModelID = resolveRealAgyModelId(params.modelID, params.variant, { env: this.env });
+    const cwd = params.directory && fs.existsSync(params.directory) ? params.directory : process.cwd();
+    const args = [...cfg.args, '--input-format', 'stream-json', '--output-format', 'stream-json'];
+    if (realModelID) args.push('--model', realModelID);
+    if (this.env.AGY_ROUTER_AGY_AUTO_APPROVE !== '0') {
+      args.push('--dangerously-skip-permissions');
+    }
+    args.push('--print=');
+
+    const spec = buildSpawnSpec(cfg.agyBin, args);
+    const child = spawn(spec.command, spec.args, {
+      cwd,
+      env: cfg.childEnv,
+      windowsHide: true,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    child.stdin?.on('error', () => {});
+
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      let stdoutBuf = '';
+      let stderrBuf = '';
+      let deltaText = '';
+      let resultText = '';
+      let timer = null;
+
+      const finish = (err, text) => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        if (params.signal) params.signal.removeEventListener('abort', onAbort);
+        try {
+          if (child.stdin && !child.stdin.destroyed) child.stdin.end();
+        } catch {}
+        if (err) {
+          this._killChild(child);
+          reject(err);
+        } else {
+          resolve(text ?? '');
+        }
+      };
+
+      const onAbort = () => {
+        finish(new Error('agy-cli text generation aborted'));
+      };
+      if (params.signal) {
+        if (params.signal.aborted) {
+          onAbort();
+          return;
+        }
+        params.signal.addEventListener('abort', onAbort, { once: true });
+      }
+
+      const timeoutMs = Number.isFinite(params.timeoutMs) && params.timeoutMs > 0 ? params.timeoutMs : 55_000;
+      timer = setTimeout(() => {
+        finish(new Error(`agy-cli text generation timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+      timer.unref?.();
+
+      const processLine = (rawLine) => {
+        const line = rawLine.trim();
+        if (!line) return;
+        let parsed;
+        try {
+          parsed = JSON.parse(line);
+        } catch {
+          return;
+        }
+        if (parsed?.event === 'step_update' && parsed.step_update?.step_type === 'agent_response') {
+          if (typeof parsed.step_update.text_delta === 'string') {
+            deltaText += parsed.step_update.text_delta;
+          }
+        } else if (parsed?.event === 'result' && parsed.result) {
+          if (typeof parsed.result.response === 'string') {
+            resultText = parsed.result.response;
+          }
+          if (parsed.result.status && parsed.result.status !== 'SUCCESS') {
+            finish(new Error(parsed.result.error || `agy-cli exited with status ${parsed.result.status}`));
+            return;
+          }
+          finish(null, resultText || deltaText);
+        }
+      };
+
+      child.stdout?.on('data', (chunk) => {
+        stdoutBuf += chunk.toString();
+        const lines = stdoutBuf.split(/\r?\n/);
+        stdoutBuf = lines.pop() ?? '';
+        for (const line of lines) {
+          processLine(line);
+        }
+      });
+
+      child.stderr?.on('data', (chunk) => {
+        stderrBuf = (stderrBuf + chunk.toString()).slice(-4096);
+      });
+
+      child.on('close', (code) => {
+        if (stdoutBuf.trim()) {
+          processLine(stdoutBuf);
+          stdoutBuf = '';
+        }
+        if (settled) return;
+        if (code === 0 && (resultText || deltaText)) {
+          finish(null, resultText || deltaText);
+        } else {
+          finish(new Error(stderrBuf.trim() || `agy-cli exited with code ${code}`));
+        }
+      });
+
+      child.on('error', (err) => {
+        finish(err instanceof Error ? err : new Error(String(err)));
+      });
+
+      try {
+        child.stdin.write(`${JSON.stringify({ event: 'user', message: { content: String(params.prompt || '') } })}\n`);
+      } catch (err) {
+        finish(err instanceof Error ? err : new Error('Failed to write prompt to agy-cli stdin'));
+      }
+    });
   }
 
   /**

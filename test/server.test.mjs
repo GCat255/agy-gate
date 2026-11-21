@@ -124,6 +124,13 @@ test('router server injects variant models, reuses warm agy worker across turns,
       return;
     }
 
+    if (req.method === 'POST' && url.pathname === '/api/experimental/generate/text') {
+      const parsed = JSON.parse(bodyText || '{}');
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ data: { text: `upstream:${parsed?.model?.id}:${parsed?.prompt}` } }));
+      return;
+    }
+
     res.writeHead(404);
     res.end();
   });
@@ -259,6 +266,31 @@ test('router server injects variant models, reuses warm agy worker across turns,
     });
     assert.equal(upstreamPrompts.length, 1);
     assert.equal(upstreamPrompts[0].text, 'hello opencode again');
+
+    // 8. /api/experimental/generate/text routes agy-cli locally and forwards opencode upstream
+    const genAgy = await (
+      await fetch(`${gwBase}/api/experimental/generate/text`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-opencode-directory': 'E:/proj' },
+        body: JSON.stringify({
+          prompt: 'summarize session',
+          model: { providerID: AGY_PROVIDER_ID, id: 'gemini-4-hydrogen', variant: 'low' },
+        }),
+      })
+    ).json();
+    assert.equal(genAgy.data.text, 'hi from agy');
+
+    const genUp = await (
+      await fetch(`${gwBase}/api/experimental/generate/text`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          prompt: 'hello small model',
+          model: { providerID: 'opencode', id: 'gpt-5' },
+        }),
+      })
+    ).json();
+    assert.equal(genUp.data.text, 'upstream:gpt-5:hello small model');
 
     sseAbort.abort();
     await pump;

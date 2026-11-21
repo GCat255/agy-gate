@@ -164,7 +164,70 @@ export function createRouterServer(deps) {
         return;
       }
 
-      // 4. Create Session (strip virtual agy-cli model before sending to OpenCode, overlay back on reply)
+      // 4. Stateless Experimental Text Generation (Small Model / Session Assist)
+      if (method === 'POST' && pathname === '/api/experimental/generate/text') {
+        const bodyBuf = await readBodyBuffer(req);
+        let parsed = {};
+        try {
+          parsed = bodyBuf.length ? JSON.parse(bodyBuf.toString('utf8')) : {};
+        } catch {}
+
+        const targetModel = parsed?.model;
+        if (targetModel?.providerID === AGY_PROVIDER_ID) {
+          const prompt = String(parsed?.prompt || '');
+          const modelID = String(targetModel?.id || targetModel?.modelID || '').trim();
+          if (!prompt.trim()) {
+            sendJson(res, 400, { error: 'prompt is required' });
+            return;
+          }
+          if (!modelID) {
+            sendJson(res, 400, { error: 'model.id is required' });
+            return;
+          }
+
+          const ac = new AbortController();
+          const onResClose = () => {
+            if (!res.writableEnded) ac.abort();
+          };
+          res.on('close', onResClose);
+
+          try {
+            const text = await deps.agyRunner.generateText({
+              prompt,
+              modelID,
+              variant: targetModel?.variant,
+              directory,
+              signal: ac.signal,
+            });
+            if (!res.writableEnded) {
+              sendJson(res, 200, { data: { text } });
+            }
+          } catch (error) {
+            if (!res.writableEnded) {
+              sendJson(res, 502, { error: error?.message || 'agy-cli generate.text failed' });
+            }
+          } finally {
+            res.off('close', onResClose);
+          }
+          return;
+        }
+
+        // Non-agy-cli model -> forward to internal OpenCode
+        const up = await fetchUpstream({
+          upstreamBase: deps.upstreamBase(),
+          authHeader: expectedAuth,
+          req,
+          method,
+          pathAndQuery,
+          body: bodyBuf,
+        });
+        const text = await up.text();
+        res.writeHead(up.status, { 'Content-Type': up.headers.get('content-type') || 'application/json' });
+        res.end(text);
+        return;
+      }
+
+      // 5. Create Session (strip virtual agy-cli model before sending to OpenCode, overlay back on reply)
       if (method === 'POST' && pathname === '/api/session') {
         const bodyBuf = await readBodyBuffer(req);
         let parsed = {};
