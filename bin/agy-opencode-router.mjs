@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 import crypto from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import process from 'node:process';
+import readline from 'node:readline';
 import { parseCliArgs } from '../src/cli-args.mjs';
 import { resolveAgyBinary, resolveDataDir, resolveMagpieBinary, resolveRealOpenCode } from '../src/config.mjs';
 import { loadMagpieAgyEnv, redactMagpieSummary } from '../src/magpie-env.mjs';
@@ -10,6 +12,8 @@ import { RouterStore } from '../src/store.mjs';
 import { SseHub } from '../src/sse-hub.mjs';
 import { AgyRunner } from '../src/agy-runner.mjs';
 import { createRouterServer } from '../src/server.mjs';
+import { createOAuthManager } from '../extensions/agy-quota/service/oauth.js';
+import { readAntigravityQuota } from '../extensions/agy-quota/service/quota.js';
 
 function printHelp() {
   process.stdout.write(
@@ -21,6 +25,9 @@ function printHelp() {
       '  agy-opencode-router serve [--stdio] [--hostname <host>] [--port <port>]',
       '  agy-opencode-router models',
       '  agy-opencode-router doctor',
+      '  agy-opencode-router quota-login',
+      '  agy-opencode-router quota-status',
+      '  agy-opencode-router quota-logout',
       '  agy-opencode-router --help',
       '',
     ].join('\n'),
@@ -154,6 +161,96 @@ async function cmdServe(opts) {
   process.stdout.write(`server listening on http://${host}:${actualPort}\n`);
 }
 
+function openBrowserUrl(url) {
+  if (process.platform === 'win32') {
+    const res = spawnSync('rundll32', ['url.dll,FileProtocolHandler', url], {
+      stdio: 'ignore',
+      windowsHide: true,
+    });
+    return res.status === 0;
+  }
+  const opener = process.platform === 'darwin' ? 'open' : 'xdg-open';
+  const res = spawnSync(opener, [url], { stdio: 'ignore', windowsHide: true });
+  return res.status === 0;
+}
+
+async function cmdQuotaLogin() {
+  const oauth = createOAuthManager();
+  try {
+    const started = await oauth.startLogin();
+    const authUrl = started?.pendingAuth?.authUrl;
+    if (!authUrl) {
+      process.stderr.write('无法生成 Google 授权链接。\n');
+      process.exit(1);
+    }
+
+    const opened = openBrowserUrl(authUrl);
+    process.stdout.write(
+      [
+        opened
+          ? '已在默认浏览器打开 Google 授权页，请完成登录授权…'
+          : '未能自动打开浏览器，请手动复制下方链接到浏览器打开：',
+        authUrl,
+        '',
+        '等待本地回调完成授权（若浏览器无法回环跳转，也可直接在此粘贴回调 URL 或 code 后按回车）：',
+      ].join('\n') + '\n',
+    );
+
+    const rl = process.stdin.isTTY || !process.stdin.readableEnded
+      ? readline.createInterface({ input: process.stdin })
+      : null;
+
+    const manualPromise = new Promise((resolve, reject) => {
+      if (!rl) return;
+      rl.on('line', (line) => {
+        const trimmed = line.trim();
+        if (!trimmed) return;
+        oauth.completeManualCallback(trimmed).then(resolve, reject);
+      });
+    });
+
+    try {
+      const record = await Promise.race([oauth.waitForCompletion(), manualPromise]);
+      process.stdout.write(`授权成功：${record.email || 'Google 账号'}（凭证已保存至 ${oauth.authFilePath}）\n`);
+    } finally {
+      rl?.close();
+    }
+  } finally {
+    await oauth.close();
+  }
+}
+
+async function cmdQuotaStatus() {
+  const oauth = createOAuthManager();
+  const status = await oauth.getStatus();
+  if (!status.connected) {
+    process.stdout.write(JSON.stringify({ connected: false, authFilePath: status.authFilePath }, null, 2) + '\n');
+    return;
+  }
+  const quota = await readAntigravityQuota(oauth);
+  process.stdout.write(
+    JSON.stringify(
+      {
+        connected: true,
+        email: status.email,
+        planLabel: quota.planLabel ?? status.planLabel,
+        authFilePath: status.authFilePath,
+        ok: quota.ok,
+        error: quota.error ?? null,
+        windows: quota.usage?.windows ?? {},
+      },
+      null,
+      2,
+    ) + '\n',
+  );
+}
+
+async function cmdQuotaLogout() {
+  const oauth = createOAuthManager();
+  await oauth.clearAuth();
+  process.stdout.write(`已清除本地 Agy 用量授权凭证（${oauth.authFilePath}）。\n`);
+}
+
 const parsed = parseCliArgs(process.argv.slice(2));
 if (parsed.command === 'help') {
   printHelp();
@@ -164,6 +261,12 @@ if (parsed.command === 'help') {
   cmdModels();
 } else if (parsed.command === 'doctor') {
   cmdDoctor();
+} else if (parsed.command === 'quota-login') {
+  await cmdQuotaLogin();
+} else if (parsed.command === 'quota-status') {
+  await cmdQuotaStatus();
+} else if (parsed.command === 'quota-logout') {
+  await cmdQuotaLogout();
 } else if (parsed.command === 'serve') {
   await cmdServe(parsed);
 } else {

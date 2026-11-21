@@ -46,25 +46,24 @@ function parseResetTimestamp(resetTime) {
 
 function inferWindowSeconds(windowKey) {
   const lower = String(windowKey ?? '').toLowerCase();
-  if (lower.includes('5h') || lower.includes('5_h') || lower.includes('five')) return 18_000;
   if (lower.includes('week') || lower.includes('7d')) return 604_800;
   if (lower.includes('day') || lower.includes('daily') || lower.includes('24h')) return 86_400;
-  return null;
+  return 18_000;
 }
 
 function formatBucketLabel(bucket) {
   const raw = String(bucket?.window || bucket?.bucketId || '').trim();
   const lower = raw.toLowerCase();
-  if (lower === '5h' || lower.includes('5h')) return '5h';
-  if (lower === 'weekly' || lower.includes('week') || lower.includes('7d')) return 'Weekly';
-  if (lower === 'daily' || lower.includes('24h')) return 'Daily';
-  return raw || 'Quota';
+  if (lower.includes('week') || lower.includes('7d')) return 'Weekly';
+  if (lower.includes('day') || lower.includes('daily') || lower.includes('24h')) return 'Daily';
+  if (lower.includes('5h') || lower === '' || lower.includes('five')) return '5h';
+  return raw;
 }
 
 function formatGroupLabel(group) {
   const name = String(group?.displayName || group?.groupId || '').trim();
   if (!name) return 'Quota';
-  if (/third[\s-]*party|claude/i.test(name)) return 'Claude / 3P';
+  if (/third[\s-]*party|claude|gpt|3p/i.test(name)) return 'Claude / GPT';
   if (/gemini/i.test(name)) return 'Gemini';
   return name;
 }
@@ -155,7 +154,13 @@ export async function discoverProjectAndTier(accessToken, options = {}) {
   }
 }
 
-export function transformQuotaPayloads({ summaryPayload, modelsPayload, planLabel = null }) {
+function pickSummaryFallbackBucket(existing, candidate) {
+  if (!existing) return candidate;
+  if ((candidate.usedPercent ?? -1) > (existing.usedPercent ?? -1)) return candidate;
+  return existing;
+}
+
+export function transformQuotaPayloads({ summaryPayload, modelsPayload = null, planLabel = null }) {
   const windows = {};
   const groups = Array.isArray(summaryPayload?.groups) ? summaryPayload.groups : [];
 
@@ -177,50 +182,32 @@ export function transformQuotaPayloads({ summaryPayload, modelsPayload, planLabe
     }
   }
 
-  const models = {};
-  const rawModels = modelsPayload?.models && typeof modelsPayload.models === 'object' ? modelsPayload.models : {};
-  for (const [modelId, info] of Object.entries(rawModels)) {
-    const remainingFraction = info?.quotaInfo?.remainingFraction;
-    if (typeof remainingFraction !== 'number') continue;
-    const usedPercent = clampPercent((1 - remainingFraction) * 100);
-    if (usedPercent === null) continue;
-    const resetAt = parseResetTimestamp(info?.quotaInfo?.resetTime);
-    const displayName = typeof info?.displayName === 'string' && info.displayName.trim()
-      ? info.displayName.trim()
-      : modelId;
-    const windowEntry = {
-      usedPercent,
-      windowSeconds: null,
-      resetAt,
-      valueLabel: null,
-    };
-    models[modelId] = {
-      windows: {
-        [displayName]: windowEntry,
-      },
-    };
-  }
-
-  // Fallback synthesis when retrieveUserQuotaSummary is empty but per-model quotas exist.
-  if (Object.keys(windows).length === 0 && Object.keys(models).length > 0) {
-    let geminiWorst = null;
-    let thirdPartyWorst = null;
-    for (const [modelId, entry] of Object.entries(models)) {
-      const win = Object.values(entry.windows)[0];
-      if (!win || typeof win.usedPercent !== 'number') continue;
+  // Only aggregate into Gemini / Claude / GPT pool summaries when summaryPayload had no buckets.
+  if (Object.keys(windows).length === 0) {
+    const rawModels = modelsPayload?.models && typeof modelsPayload.models === 'object' ? modelsPayload.models : {};
+    let gemini = null;
+    let claudeGpt = null;
+    for (const [modelId, info] of Object.entries(rawModels)) {
+      const remainingFraction = info?.quotaInfo?.remainingFraction;
+      if (typeof remainingFraction !== 'number') continue;
+      const usedPercent = clampPercent((1 - remainingFraction) * 100);
+      if (usedPercent === null) continue;
+      const resetAt = parseResetTimestamp(info?.quotaInfo?.resetTime);
+      const candidate = {
+        usedPercent,
+        windowSeconds: 18_000,
+        resetAt,
+        valueLabel: null,
+      };
       const lower = modelId.toLowerCase();
       if (lower.includes('gemini')) {
-        if (!geminiWorst || win.usedPercent > geminiWorst.usedPercent) {
-          geminiWorst = win;
-        }
-      } else if (lower.includes('claude') || lower.includes('gpt') || lower.includes('oss')) {
-        if (!thirdPartyWorst || win.usedPercent > thirdPartyWorst.usedPercent) {
-          thirdPartyWorst = win;
-        }
+        gemini = pickSummaryFallbackBucket(gemini, candidate);
+      } else if (lower.includes('claude') || lower.includes('gpt')) {
+        claudeGpt = pickSummaryFallbackBucket(claudeGpt, candidate);
       }
     }
-    if (geminiWorst) windows['Gemini'] = geminiWorst;
-    if (thirdPartyWorst) windows['Claude / 3P'] = thirdPartyWorst;
+    if (gemini) windows['Gemini'] = gemini;
+    if (claudeGpt) windows['Claude / GPT'] = claudeGpt;
   }
 
   return {
@@ -229,7 +216,6 @@ export function transformQuotaPayloads({ summaryPayload, modelsPayload, planLabe
     planLabel: planLabel ?? null,
     usage: {
       windows,
-      ...(Object.keys(models).length > 0 ? { models } : {}),
     },
   };
 }
@@ -254,7 +240,7 @@ export async function readAntigravityQuota(oauthManager, options = {}) {
     return {
       ok: false,
       configured: false,
-      error: '尚未连接 Google 账号，请点击左侧栏「Agy CLI 用量」完成授权。',
+      error: '尚未授权 Google 账号，请运行 agy-opencode-router quota-login（或在 occ 中登录）。',
       usage: null,
     };
   }
@@ -269,20 +255,43 @@ export async function readAntigravityQuota(oauthManager, options = {}) {
       await oauthManager.updateMetadata({ projectId, planLabel }).catch(() => {});
     }
     const requestBody = projectId ? { project: projectId } : {};
-    const [summaryResult, modelsResult] = await Promise.allSettled([
-      postAcrossEndpoints(endpoints, '/v1internal:retrieveUserQuotaSummary', accessToken, requestBody, fetchImpl),
-      postAcrossEndpoints(endpoints, '/v1internal:fetchAvailableModels', accessToken, requestBody, fetchImpl),
-    ]);
+    let summaryPayload = null;
+    let summaryError = null;
+    try {
+      summaryPayload = await postAcrossEndpoints(
+        endpoints,
+        '/v1internal:retrieveUserQuotaSummary',
+        accessToken,
+        requestBody,
+        fetchImpl,
+      );
+    } catch (error) {
+      if (error && (error.status === 401 || error.status === 403)) {
+        throw error;
+      }
+      summaryError = error;
+    }
 
-    const summaryPayload = summaryResult.status === 'fulfilled' ? summaryResult.value : null;
-    const modelsPayload = modelsResult.status === 'fulfilled' ? modelsResult.value : null;
-
-    if (!summaryPayload && !modelsPayload) {
-      const firstErr =
-        (summaryResult.status === 'rejected' && summaryResult.reason)
-        || (modelsResult.status === 'rejected' && modelsResult.reason)
-        || new Error('无法从 Antigravity 接口获取用量。');
-      throw firstErr;
+    let modelsPayload = null;
+    const hasSummaryBuckets = Array.isArray(summaryPayload?.groups)
+      && summaryPayload.groups.some((g) => Array.isArray(g?.buckets) && g.buckets.length > 0);
+    if (!hasSummaryBuckets) {
+      try {
+        modelsPayload = await postAcrossEndpoints(
+          endpoints,
+          '/v1internal:fetchAvailableModels',
+          accessToken,
+          requestBody,
+          fetchImpl,
+        );
+      } catch (error) {
+        if (error && (error.status === 401 || error.status === 403)) {
+          throw error;
+        }
+        if (!summaryPayload) {
+          throw summaryError || error;
+        }
+      }
     }
 
     return transformQuotaPayloads({

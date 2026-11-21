@@ -3,7 +3,6 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import vm from 'node:vm';
 import { createOAuthManager, extractCodeFromManualInput } from '../extensions/agy-quota/service/oauth.js';
 import { transformQuotaPayloads } from '../extensions/agy-quota/service/quota.js';
 import { startService } from '../extensions/agy-quota/service/main.js';
@@ -21,12 +20,12 @@ async function withTempDir(fn) {
 }
 
 describe('agy-quota extension package & manifest', () => {
-  it('declares valid OpenChamber quota + panel manifest and classic IIFE panel script', async () => {
+  it('declares headless OpenChamber quota manifest without sidebar panel UI', async () => {
     const pkg = JSON.parse(await fs.readFile(path.join(EXT_DIR, 'package.json'), 'utf8'));
     assert.equal(pkg.openchamber.apiVersion, 1);
     assert.equal(pkg.openchamber.contributes.panel.id, 'agy-quota');
     assert.equal(pkg.openchamber.contributes.panel.icon, 'panel/icon.svg');
-    assert.equal(pkg.openchamber.contributes.panel.entry, 'panel/index.html');
+    assert.equal(pkg.openchamber.contributes.panel.entry, undefined);
     assert.deepEqual(pkg.openchamber.contributes.service, {
       entry: 'service/main.js',
       runtime: 'host',
@@ -35,12 +34,7 @@ describe('agy-quota extension package & manifest', () => {
     assert.deepEqual(pkg.openchamber.contributes.quota, { providers: [] });
 
     await fs.access(path.join(EXT_DIR, 'panel', 'icon.svg'));
-    const html = await fs.readFile(path.join(EXT_DIR, 'panel', 'index.html'), 'utf8');
-    assert.ok(html.includes('<script src="main.js"></script>'));
-
-    const panelJs = await fs.readFile(path.join(EXT_DIR, 'panel', 'main.js'), 'utf8');
-    // Must parse cleanly as a classic non-module Script for OpenChamber sandboxed iframe.
-    assert.doesNotThrow(() => new vm.Script(panelJs, { filename: 'panel/main.js' }));
+    await assert.rejects(fs.access(path.join(EXT_DIR, 'panel', 'index.html')));
   });
 });
 
@@ -86,7 +80,11 @@ describe('agy-quota OAuth & token management', () => {
       const redirectUri = started.pendingAuth.redirectUri;
       const state = new URL(started.pendingAuth.authUrl).searchParams.get('state');
 
-      const callbackRes = await fetch(`${redirectUri}?code=auth-code-123&state=${encodeURIComponent(state)}`);
+      const [record, callbackRes] = await Promise.all([
+        oauth.waitForCompletion(),
+        fetch(`${redirectUri}?code=auth-code-123&state=${encodeURIComponent(state)}`),
+      ]);
+      assert.equal(record.email, 'user@example.com');
       assert.equal(callbackRes.status, 200);
       const callbackHtml = await callbackRes.text();
       assert.ok(callbackHtml.includes('Google 授权成功'));
@@ -126,7 +124,7 @@ describe('agy-quota OAuth & token management', () => {
 });
 
 describe('agy-quota payload transformation & HTTP service', () => {
-  it('transforms summary groups and available models into OpenChamber QuotaProviderUsageData', () => {
+  it('returns only concise pool windows without duplicate per-model rows', () => {
     const out = transformQuotaPayloads({
       planLabel: 'Google AI Ultra',
       summaryPayload: {
@@ -142,39 +140,53 @@ describe('agy-quota payload transformation & HTTP service', () => {
             displayName: 'Claude / Third-Party Models',
             buckets: [
               { window: '5h', remainingFraction: 0.9, resetTime: '2026-11-21T14:00:00Z' },
+              { window: 'weekly', remainingFraction: 0.65, resetTime: '2026-11-27T00:00:00Z' },
             ],
           },
         ],
-      },
-      modelsPayload: {
-        models: {
-          'gemini-4-hydrogen-high': {
-            displayName: 'Gemini 4 Hydrogen High',
-            quotaInfo: { remainingFraction: 0.75, resetTime: '2026-11-21T15:00:00Z' },
-          },
-          'claude-opus-5-5': {
-            displayName: 'Claude Opus 5.5',
-            quotaInfo: { remainingFraction: 0.9, resetTime: '2026-11-21T14:00:00Z' },
-          },
-        },
       },
     });
 
     assert.equal(out.ok, true);
     assert.equal(out.configured, true);
     assert.equal(out.planLabel, 'Google AI Ultra');
+    assert.deepEqual(Object.keys(out.usage.windows), [
+      'Gemini (5h)',
+      'Gemini (Weekly)',
+      'Claude / GPT (5h)',
+      'Claude / GPT (Weekly)',
+    ]);
     assert.equal(out.usage.windows['Gemini (5h)'].usedPercent, 25);
     assert.equal(out.usage.windows['Gemini (5h)'].windowSeconds, 18000);
     assert.equal(out.usage.windows['Gemini (Weekly)'].usedPercent, 60);
     assert.equal(out.usage.windows['Gemini (Weekly)'].windowSeconds, 604800);
-    assert.equal(out.usage.windows['Claude / 3P (5h)'].usedPercent, 10);
-    assert.equal(out.usage.models['gemini-4-hydrogen-high'].windows['Gemini 4 Hydrogen High'].usedPercent, 25);
-    assert.equal(out.usage.models['claude-opus-5-5'].windows['Claude Opus 5.5'].usedPercent, 10);
+    assert.equal(out.usage.windows['Claude / GPT (5h)'].usedPercent, 10);
+    assert.equal(out.usage.windows['Claude / GPT (Weekly)'].usedPercent, 35);
+    assert.equal(out.usage.models, undefined);
   });
 
-  it('serves /health, /quota (unconfigured & configured), and enforces service bearer token', async () => {
+  it('falls back to aggregated Gemini and Claude / GPT buckets when summary groups are empty', () => {
+    const out = transformQuotaPayloads({
+      summaryPayload: { groups: [] },
+      modelsPayload: {
+        models: {
+          'gemini-4-neon': { quotaInfo: { remainingFraction: 0.8 } },
+          'gemini-4-carbon': { quotaInfo: { remainingFraction: 0.6 } },
+          'claude-opus-5-5': { quotaInfo: { remainingFraction: 0.9 } },
+          'gpt-oss-120b': { quotaInfo: { remainingFraction: 0.7 } },
+        },
+      },
+    });
+    assert.deepEqual(Object.keys(out.usage.windows), ['Gemini', 'Claude / GPT']);
+    assert.equal(out.usage.windows.Gemini.usedPercent, 40);
+    assert.equal(out.usage.windows['Claude / GPT'].usedPercent, 30);
+    assert.equal(out.usage.models, undefined);
+  });
+
+  it('serves /health and /quota (unconfigured & configured) without calling fetchAvailableModels when summary succeeds', async () => {
     await withTempDir(async (dir) => {
       const authFile = path.join(dir, 'quota-auth.json');
+      let modelsEndpointCalled = false;
       const mockFetch = async (url) => {
         const u = String(url);
         if (u.includes(':loadCodeAssist')) {
@@ -191,11 +203,8 @@ describe('agy-quota payload transformation & HTTP service', () => {
           }), { status: 200 });
         }
         if (u.includes(':fetchAvailableModels')) {
-          return new Response(JSON.stringify({
-            models: {
-              'gemini-4-neon': { displayName: 'Gemini 4 Neon', quotaInfo: { remainingFraction: 0.8 } },
-            },
-          }), { status: 200 });
+          modelsEndpointCalled = true;
+          return new Response('{}', { status: 200 });
         }
         return new Response('{}', { status: 404 });
       };
@@ -250,6 +259,8 @@ describe('agy-quota payload transformation & HTTP service', () => {
         assert.equal(confJson.data.planLabel, 'Gemini Code Assist Standard');
         assert.equal(confJson.data.usage.windows['Gemini (5h)'].usedPercent, 20);
         assert.equal(confJson.data.usage.windows['Gemini (5h)'].resetAt, 1795266000 * 1000);
+        assert.equal(confJson.data.usage.models, undefined);
+        assert.equal(modelsEndpointCalled, false);
       } finally {
         await new Promise((resolve) => server.close(resolve));
       }

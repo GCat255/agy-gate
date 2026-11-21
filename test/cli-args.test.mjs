@@ -7,6 +7,9 @@ test('parseCliArgs handles --version, --help, models, doctor', () => {
   assert.deepEqual(parseCliArgs(['--version']), { command: 'version' });
   assert.deepEqual(parseCliArgs(['models']), { command: 'models' });
   assert.deepEqual(parseCliArgs(['doctor']), { command: 'doctor' });
+  assert.deepEqual(parseCliArgs(['quota-login']), { command: 'quota-login' });
+  assert.deepEqual(parseCliArgs(['quota-status']), { command: 'quota-status' });
+  assert.deepEqual(parseCliArgs(['quota-logout']), { command: 'quota-logout' });
 });
 
 test('parseCliArgs parses serve flags including --stdio, --hostname, --port', () => {

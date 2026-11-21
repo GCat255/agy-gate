@@ -20,6 +20,15 @@ export function parseCliArgs(argv) {
   if (first === 'doctor') {
     return { command: 'doctor' };
   }
+  if (first === 'quota-login') {
+    return { command: 'quota-login' };
+  }
+  if (first === 'quota-status') {
+    return { command: 'quota-status' };
+  }
+  if (first === 'quota-logout') {
+    return { command: 'quota-logout' };
+  }
 
   if (first === 'serve') {
     let stdio = false;

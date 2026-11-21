@@ -26,10 +26,14 @@ export function resolveDefaultAuthFilePath(env = process.env) {
   if (env.AGY_QUOTA_AUTH_FILE?.trim()) {
     return path.resolve(env.AGY_QUOTA_AUTH_FILE.trim());
   }
-  if (env.OPENCHAMBER_SERVICE_DATA_DIR?.trim()) {
-    return path.join(path.resolve(env.OPENCHAMBER_SERVICE_DATA_DIR.trim()), 'quota-auth.json');
-  }
   return path.join(os.homedir(), '.config', 'agy-opencode-router', 'quota-auth.json');
+}
+
+function resolveFallbackAuthFilePath(env = process.env) {
+  if (env.AGY_QUOTA_AUTH_FILE?.trim() || !env.OPENCHAMBER_SERVICE_DATA_DIR?.trim()) {
+    return null;
+  }
+  return path.join(path.resolve(env.OPENCHAMBER_SERVICE_DATA_DIR.trim()), 'quota-auth.json');
 }
 
 function escapeHtml(text) {
@@ -90,6 +94,7 @@ export function extractCodeFromManualInput(rawInput, expectedState) {
 
 export function createOAuthManager(options = {}) {
   const authFilePath = options.authFilePath ?? resolveDefaultAuthFilePath(options.env);
+  const fallbackAuthFilePath = options.authFilePath ? null : resolveFallbackAuthFilePath(options.env);
   const fetchImpl = options.fetchImpl ?? fetch;
   const clientId = options.clientId ?? ANTIGRAVITY_OAUTH_CLIENT.clientId;
   const clientSecret = options.clientSecret ?? ANTIGRAVITY_OAUTH_CLIENT.clientSecret;
@@ -98,9 +103,9 @@ export function createOAuthManager(options = {}) {
   let refreshPromise = null;
   let lastError = null;
 
-  async function readAuth() {
+  async function readJsonIfExists(filePath) {
     try {
-      const raw = await fs.readFile(authFilePath, 'utf8');
+      const raw = await fs.readFile(filePath, 'utf8');
       const parsed = JSON.parse(raw);
       return parsed && typeof parsed === 'object' ? parsed : null;
     } catch (error) {
@@ -109,6 +114,15 @@ export function createOAuthManager(options = {}) {
       }
       throw error;
     }
+  }
+
+  async function readAuth() {
+    const primary = await readJsonIfExists(authFilePath);
+    if (primary) return primary;
+    if (fallbackAuthFilePath && fallbackAuthFilePath !== authFilePath) {
+      return readJsonIfExists(fallbackAuthFilePath);
+    }
+    return null;
   }
 
   async function writeAuth(next) {
@@ -128,11 +142,14 @@ export function createOAuthManager(options = {}) {
 
   async function clearAuth() {
     lastError = null;
-    try {
-      await fs.unlink(authFilePath);
-    } catch (error) {
-      if (!error || error.code !== 'ENOENT') {
-        throw error;
+    for (const target of [authFilePath, fallbackAuthFilePath]) {
+      if (!target) continue;
+      try {
+        await fs.unlink(target);
+      } catch (error) {
+        if (!error || error.code !== 'ENOENT') {
+          throw error;
+        }
       }
     }
   }
@@ -221,6 +238,13 @@ export function createOAuthManager(options = {}) {
     const codeChallenge = crypto.createHash('sha256').update(codeVerifier).digest('base64url');
     const state = crypto.randomBytes(24).toString('base64url');
 
+    let resolveDone;
+    let rejectDone;
+    const completed = new Promise((resolve, reject) => {
+      resolveDone = resolve;
+      rejectDone = reject;
+    });
+
     const server = http.createServer(async (req, res) => {
       try {
         const reqUrl = new URL(req.url || '/', 'http://127.0.0.1');
@@ -234,12 +258,13 @@ export function createOAuthManager(options = {}) {
           lastError = `Google 授权未完成：${err}`;
           res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
           res.end(renderCallbackPage({ ok: false, title: '授权未完成', detail: lastError }));
+          rejectDone(new Error(lastError));
           void closeActiveFlow();
           return;
         }
         const returnedState = reqUrl.searchParams.get('state');
         if (!returnedState || returnedState !== state) {
-          lastError = '授权 state 校验失败，请返回 OpenChamber 重试。';
+          lastError = '授权 state 校验失败，请重试。';
           res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
           res.end(renderCallbackPage({ ok: false, title: '校验失败', detail: lastError }));
           return;
@@ -260,11 +285,13 @@ export function createOAuthManager(options = {}) {
           title: 'Google 授权成功',
           detail: `已连接账号 ${record.email || 'Google 账号'}，现在可以关闭此标签页并返回 OpenChamber。`,
         }));
+        resolveDone(record);
         void closeActiveFlow();
       } catch (error) {
         lastError = error instanceof Error ? error.message : String(error);
         res.writeHead(500, { 'Content-Type': 'text/html; charset=utf-8' });
         res.end(renderCallbackPage({ ok: false, title: '登录失败', detail: lastError }));
+        rejectDone(error);
         void closeActiveFlow();
       }
     });
@@ -289,6 +316,7 @@ export function createOAuthManager(options = {}) {
     });
     const authUrl = `${ANTIGRAVITY_OAUTH_CLIENT.authorizeUrl}?${authParams.toString()}`;
     const timer = setTimeout(() => {
+      rejectDone(new Error('等待 Google 授权超时，请重试。'));
       void closeActiveFlow();
     }, AUTH_FLOW_TIMEOUT_MS);
     timer.unref?.();
@@ -301,14 +329,22 @@ export function createOAuthManager(options = {}) {
       authUrl,
       startedAt: Date.now(),
       timer,
+      completed,
     };
 
     return getStatus();
   }
 
+  function waitForCompletion() {
+    if (!activeFlow) {
+      return Promise.reject(new Error('当前没有进行中的登录会话。'));
+    }
+    return activeFlow.completed;
+  }
+
   async function completeManualCallback(rawInput) {
     if (!activeFlow) {
-      throw new Error('请先点击「使用 Google 登录」发起一次授权，再粘贴回调结果。');
+      throw new Error('请先发起一次授权，再粘贴回调结果。');
     }
     const flow = activeFlow;
     const code = extractCodeFromManualInput(rawInput, flow.state);
@@ -347,7 +383,7 @@ export function createOAuthManager(options = {}) {
       const code = payload?.error || '';
       const desc = payload?.error_description || code || `HTTP ${res.status}`;
       if (code === 'invalid_grant') {
-        lastError = 'Google OAuth 授权已过期或被撤销，请在面板中重新登录。';
+        lastError = 'Google OAuth 授权已过期或被撤销，请重新运行 agy-opencode-router quota-login 授权。';
         throw new Error(lastError);
       }
       throw new Error(`刷新 Google 访问令牌失败：${desc}`);
@@ -407,6 +443,7 @@ export function createOAuthManager(options = {}) {
       planLabel: auth?.planLabel ?? null,
       projectId: auth?.projectId ?? null,
       expiresAt: typeof auth?.expiresAt === 'number' ? auth.expiresAt : null,
+      authFilePath,
       pendingAuth: activeFlow
         ? {
             authUrl: activeFlow.authUrl,
@@ -423,6 +460,7 @@ export function createOAuthManager(options = {}) {
     readAuth,
     clearAuth,
     startLogin,
+    waitForCompletion,
     completeManualCallback,
     getAccessToken,
     updateMetadata,

@@ -28,12 +28,15 @@ agy-opencode-router/
 
 ## Agy CLI 用量扩展（OpenChamber）
 
-`extensions/agy-quota` 是一个零第三方依赖的 OpenChamber 独立扩展（Guest Panel + Host Service），用于直接在 OpenChamber「设置 → 用量」和顶部状态栏展示 Agy CLI / Google Antigravity 的 5h 与周配额，且完全隔离于 OpenCode 与本网关：
+`extensions/agy-quota` 是一个无多余界面、零第三方依赖的 OpenChamber 后台用量扩展（仅保留原生「设置 → 用量」及顶部状态栏展示，不在左侧栏添加额外面板图标）：
 
-1. 在 OpenChamber 打开 **设置 → 扩展 → 添加扩展**，填入本地目录路径：`<repo-dir>\extensions\agy-quota`。
-2. 批准扩展所需的本地服务与用量查询权限后，在左侧栏打开 **Agy CLI 用量** 面板。
-3. 点击 **使用 Google 登录** 完成一次只读 OAuth 授权（回调失败时也支持手动粘贴回调 URL 或授权码）。
-4. 随后即可在 **设置 → 用量 → Agy CLI 用量**（以及顶部状态栏下拉）实时查看订阅配额。
+1. 在 OpenChamber 打开 **设置 → 扩展 → 添加扩展**，填入本地目录路径：`<repo-dir>\extensions\agy-quota`，并批准本地服务与用量查询权限。
+2. 在终端执行一次只读 Google OAuth 授权（也可在 `occ` 菜单中选择 **Agy 用量授权**）：
+   ```bash
+   agy-opencode-router quota-login
+   ```
+   授权凭证以 `0600` 权限保存在 `~/.config/agy-opencode-router/quota-auth.json`（与 OpenCode 完全隔离）；可用 `agy-opencode-router quota-status` 检查或 `agy-opencode-router quota-logout` 解绑。
+3. 随后在 **设置 → 用量 → Agy CLI 用量**（及顶部状态栏下拉）即可只展示精简的 5 小时 / 每周配额池（`Gemini` 与 `Claude / GPT`）。
 
 ## 快速命令
 
