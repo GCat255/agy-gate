@@ -12,7 +12,7 @@
   },
   "scripts": {
     "test": "node --test test/*.test.mjs",
-    "check": "node --check bin/agy-opencode-router.mjs src/*.mjs test/*.mjs",
+    "check": "node --check bin/agy-opencode-router.mjs src/*.mjs test/*.mjs extensions/agy-quota/panel/*.js extensions/agy-quota/service/*.js",
     "smoke": "node ./bin/agy-opencode-router.mjs --help"
   },
   "keywords": [

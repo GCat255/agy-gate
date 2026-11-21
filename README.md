@@ -19,10 +19,21 @@ agy-opencode-router/
 │   ├── agy-opencode-router.mjs   # CLI 主入口（--version / serve / models / doctor / help）
 │   ├── agy-opencode-router.cmd   # Windows 垫片（可填入 OpenChamber opencodeBinary）
 │   └── agy-opencode-router       # POSIX / Git Bash 垫片
+├── extensions/
+│   └── agy-quota/                # OpenChamber 独立用量扩展（B2：自带只读 Google OAuth）
 ├── src/                          # 网关核心模块（纯 Node 24 ESM，零第三方运行时依赖）
 ├── docs/                         # 协议映射与架构说明
 └── test/                         # 单元测试与模拟端到端集成测试
 ```
+
+## Agy CLI 用量扩展（OpenChamber）
+
+`extensions/agy-quota` 是一个零第三方依赖的 OpenChamber 独立扩展（Guest Panel + Host Service），用于直接在 OpenChamber「设置 → 用量」和顶部状态栏展示 Agy CLI / Google Antigravity 的 5h 与周配额，且完全隔离于 OpenCode 与本网关：
+
+1. 在 OpenChamber 打开 **设置 → 扩展 → 添加扩展**，填入本地目录路径：`<repo-dir>\extensions\agy-quota`。
+2. 批准扩展所需的本地服务与用量查询权限后，在左侧栏打开 **Agy CLI 用量** 面板。
+3. 点击 **使用 Google 登录** 完成一次只读 OAuth 授权（回调失败时也支持手动粘贴回调 URL 或授权码）。
+4. 随后即可在 **设置 → 用量 → Agy CLI 用量**（以及顶部状态栏下拉）实时查看订阅配额。
 
 ## 快速命令
 

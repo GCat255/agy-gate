@@ -1,0 +1,28 @@
+{
+  "name": "agy-quota",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "OpenChamber quota extension for Agy CLI / Google Antigravity subscriptions with isolated Google OAuth.",
+  "openchamber": {
+    "apiVersion": 1,
+    "contributes": {
+      "panel": {
+        "id": "agy-quota",
+        "name": "Agy CLI 用量",
+        "icon": "panel/icon.svg",
+        "entry": "panel/index.html"
+      },
+      "service": {
+        "entry": "service/main.js",
+        "runtime": "host",
+        "provides": [
+          "quota"
+        ]
+      },
+      "quota": {
+        "providers": []
+      }
+    }
+  }
+}
