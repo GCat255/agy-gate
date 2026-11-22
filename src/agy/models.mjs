@@ -139,6 +139,18 @@ export function buildAgyProviderInfo() {
 }
 
 /**
+ * Determine whether an `agy-cli` model accepts image inputs.
+ * Text-only models such as `gpt-oss-*` stay text-only; Gemini/Claude models support images.
+ * @param {string} modelId
+ */
+export function modelSupportsImageInput(modelId) {
+  const normalized = String(modelId || '').trim().toLowerCase();
+  if (!normalized) return false;
+  if (normalized.startsWith('gpt-oss-')) return false;
+  return true;
+}
+
+/**
  * Build an OpenCode 2.3.2 `Model.Info` record matching `@opencode/schema/dist/model.d.ts`.
  * @param {{ id: string, name: string, variants?: string[] }} entry
  */
@@ -146,6 +158,7 @@ export function toOpenCodeModelInfo(entry) {
   const variants = Array.isArray(entry.variants)
     ? entry.variants.map((v) => ({ id: v, settings: {} }))
     : [];
+  const inputModalities = modelSupportsImageInput(entry.id) ? ['text', 'image'] : ['text'];
 
   return {
     id: entry.id,
@@ -155,7 +168,7 @@ export function toOpenCodeModelInfo(entry) {
     type: 'chat',
     capabilities: {
       tools: true,
-      input: ['text'],
+      input: inputModalities,
       output: ['text'],
     },
     variants,

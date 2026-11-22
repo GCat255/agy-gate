@@ -14,9 +14,51 @@ const HEADLESS_CHOICE_RULE =
   + 'For interactive choices/forms, use `openchamber_render` (`render.page`, `ui`/`html`, `awaitAnswer: true`) or ```openui-lang blocks. '
   + 'For subagents, use native `invoke_subagent`/`send_message`/`manage_subagents` only (never `openchamber` `ownWork`/`returnResult`).';
 
+const FALLBACK_TOOL_CONTRACT = {
+  source: 'fallback',
+  semanticRoles: {
+    edit: 'edit',
+    execute: 'execute',
+    glob: 'glob',
+    grep: 'grep',
+    patch: 'patch',
+    question: 'question',
+    read: 'read',
+    shell: 'shell',
+    skill: 'skill',
+    subagent: 'subagent',
+    todowrite: 'todowrite',
+    webfetch: 'webfetch',
+    websearch: 'websearch',
+    write: 'write',
+    sessionRename: 'session_rename',
+    sessionMove: 'session_move',
+    models: 'models',
+  },
+  canonicalTools: {
+    read: { displayName: 'Read File', category: 'file', inputFields: ['path', 'offset', 'limit'] },
+    write: { displayName: 'Write File', category: 'file', inputFields: ['path', 'content'] },
+    edit: { displayName: 'Edit File', category: 'file', inputFields: ['path', 'oldString', 'newString', 'replaceAll'] },
+    patch: { displayName: 'Apply Patch', category: 'file', inputFields: ['patchText'] },
+    execute: { displayName: 'Script', category: 'code', inputFields: ['code'] },
+    shell: { displayName: 'Shell Command', category: 'system', inputFields: ['command', 'description', 'timeout', 'background'] },
+    grep: { displayName: 'Search Files', category: 'search', inputFields: ['pattern', 'path', 'include', 'literal', 'caseSensitive'] },
+    glob: { displayName: 'Find Files', category: 'search', inputFields: ['pattern', 'path'] },
+    subagent: { displayName: 'Agent Task', category: 'ai', inputFields: ['description', 'prompt', 'agent'] },
+    webfetch: { displayName: 'Fetch URL', category: 'web', inputFields: ['url', 'format', 'timeout'] },
+    websearch: { displayName: 'Web Search', category: 'web', inputFields: ['query', 'numResults', 'type'] },
+    codesearch: { displayName: 'Code Search', category: 'web', inputFields: ['query', 'tokensNum'] },
+    skill: { displayName: 'Load Skill', category: 'ai', inputFields: ['id'] },
+    question: { displayName: 'Question', category: 'ai', inputFields: ['questions'] },
+    todowrite: { displayName: 'Tasks', category: 'ai', inputFields: [] },
+  },
+};
+
 const cachedWebRootByKey = new Map();
 const cachedGuidanceByKey = new Map();
 const cachedToolsByKey = new Map();
+const cachedToolContractByKey = new Map();
+let latestResolvedToolContract = FALLBACK_TOOL_CONTRACT;
 
 /**
  * Locate the installed `@openchamber/web` directory dynamically so upgrades are picked up automatically.
@@ -277,8 +319,232 @@ export async function loadOpenChamberToolSpecs(options = {}) {
 }
 
 /**
- * Probe whether live OpenChamber runtime bridges (`openui-lang` guidance & tool schemas) resolved cleanly
- * or silently degraded to static fallback after an OpenChamber upgrade.
+ * Extract balanced `{...}` object literal starting at `openBraceIndex` and safely parse it as JSON
+ * without dynamic code evaluation.
+ * @param {string} source
+ * @param {number} openBraceIndex
+ * @returns {any | null}
+ */
+function parseJsObjectLiteral(source, openBraceIndex) {
+  if (openBraceIndex < 0 || source[openBraceIndex] !== '{') return null;
+  let depth = 0;
+  let inStr = false;
+  let quote = '';
+  let escaped = false;
+  let end = -1;
+
+  for (let i = openBraceIndex; i < source.length; i += 1) {
+    const ch = source[i];
+    if (inStr) {
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === quote) inStr = false;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === '`') {
+      inStr = true;
+      quote = ch;
+      continue;
+    }
+    if (ch === '{') depth += 1;
+    else if (ch === '}') {
+      depth -= 1;
+      if (depth === 0) {
+        end = i;
+        break;
+      }
+    }
+  }
+  if (end === -1) return null;
+
+  const raw = source.slice(openBraceIndex, end + 1);
+  // Quote unquoted identifier keys outside string literals so JSON.parse handles Vite bundles cleanly.
+  let out = '';
+  let i = 0;
+  while (i < raw.length) {
+    const ch = raw[i];
+    if (ch === '"' || ch === "'" || ch === '`') {
+      const q = ch;
+      let j = i + 1;
+      let esc = false;
+      let strBody = '';
+      while (j < raw.length) {
+        const sc = raw[j];
+        if (esc) {
+          strBody += sc === "'" ? "'" : `\\${sc}`;
+          esc = false;
+        } else if (sc === '\\') {
+          esc = true;
+        } else if (sc === q) {
+          break;
+        } else {
+          strBody += sc === '"' ? '\\"' : sc;
+        }
+        j += 1;
+      }
+      out += `"${strBody}"`;
+      i = j + 1;
+      continue;
+    }
+    if (ch === '{') {
+      out += ch;
+      i += 1;
+      continue;
+    }
+    if (ch === '!' && (raw[i + 1] === '0' || raw[i + 1] === '1') && !/[\w$]/.test(raw[i + 2] || '')) {
+      out += raw[i + 1] === '0' ? 'true' : 'false';
+      i += 2;
+      continue;
+    }
+    if (raw.startsWith('void 0', i) && !/[\w$]/.test(raw[i + 6] || '')) {
+      out += 'null';
+      i += 6;
+      continue;
+    }
+    if ((ch === ',' || ch === '[') && i + 1 < raw.length) {
+      out += ch;
+      i += 1;
+      continue;
+    }
+    if (/[A-Za-z_$]/.test(ch)) {
+      const prev = out.trimEnd().slice(-1);
+      if (prev === '{' || prev === ',') {
+        let j = i;
+        while (j < raw.length && /[\w$]/.test(raw[j])) j += 1;
+        let k = j;
+        while (k < raw.length && /\s/.test(raw[k])) k += 1;
+        if (raw[k] === ':') {
+          out += `"${raw.slice(i, j)}"`;
+          i = j;
+          continue;
+        }
+      }
+    }
+    out += ch;
+    i += 1;
+  }
+
+  try {
+    return JSON.parse(out);
+  } catch {
+    return null;
+  }
+}
+
+function summarizeRegistryEntry(entry) {
+  if (!entry || typeof entry !== 'object') return null;
+  const fields = Array.isArray(entry.inputFields)
+    ? entry.inputFields.map((f) => String(f?.key || '').trim()).filter(Boolean)
+    : [];
+  return {
+    displayName: typeof entry.displayName === 'string' ? entry.displayName : '',
+    category: typeof entry.category === 'string' ? entry.category : '',
+    inputFields: fields,
+  };
+}
+
+/**
+ * Dynamically discover OpenChamber frontend's canonical tool names & expected input fields
+ * from `@openchamber/web/dist/assets/*.js` so upgrades without breaking signatures adapt automatically.
+ * @param {{ env?: NodeJS.ProcessEnv, forceRefresh?: boolean }} [options]
+ */
+export async function loadOpenChamberToolContract(options = {}) {
+  const env = options.env || process.env;
+  const webRoot = resolveOpenChamberWebRoot(env);
+  const cacheKey = webRoot || 'none';
+  if (!options.forceRefresh && cachedToolContractByKey.has(cacheKey)) {
+    return cachedToolContractByKey.get(cacheKey);
+  }
+
+  let semanticRoles = { ...FALLBACK_TOOL_CONTRACT.semanticRoles };
+  let canonicalTools = { ...FALLBACK_TOOL_CONTRACT.canonicalTools };
+  let foundRoles = false;
+  let foundRegistry = false;
+
+  if (webRoot) {
+    const assetsDir = path.join(webRoot, 'dist', 'assets');
+    try {
+      if (fs.existsSync(assetsDir)) {
+        const jsFiles = fs
+          .readdirSync(assetsDir)
+          .filter((name) => name.endsWith('.js') && !name.startsWith('vendor-'))
+          .map((name) => {
+            const fullPath = path.join(assetsDir, name);
+            let size = 0;
+            try {
+              size = fs.statSync(fullPath).size;
+            } catch {}
+            return { fullPath, size };
+          })
+          // Check substantial app bundles first; small files are syntax/theme assets.
+          .sort((a, b) => b.size - a.size)
+          .filter((item) => item.size >= 64 * 1024);
+
+        for (const item of jsFiles) {
+          if (foundRoles && foundRegistry) break;
+          let content = '';
+          try {
+            content = fs.readFileSync(item.fullPath, 'utf8');
+          } catch {
+            continue;
+          }
+
+          if (!foundRoles) {
+            const roleMatch = /\bconst\s+[A-Za-z_$][\w$]*\s*=\s*(\{edit:"edit",execute:"execute"[^}]+\})/.exec(content);
+            if (roleMatch) {
+              const parsed = parseJsObjectLiteral(roleMatch[1], 0);
+              if (parsed && typeof parsed === 'object' && parsed.read && parsed.write && parsed.shell) {
+                semanticRoles = { ...semanticRoles, ...parsed };
+                foundRoles = true;
+              }
+            }
+          }
+
+          if (!foundRegistry) {
+            const regMatch = /\b[A-Za-z_$][\w$]*\s*=\s*(\{read:\{displayName:"Read File"[^;]+)/.exec(content);
+            if (regMatch) {
+              const braceIdx = content.indexOf('{', regMatch.index);
+              const parsed = parseJsObjectLiteral(content, braceIdx);
+              if (parsed && typeof parsed === 'object' && parsed.read && parsed.write) {
+                const normalized = {};
+                for (const [toolName, meta] of Object.entries(parsed)) {
+                  const summary = summarizeRegistryEntry(meta);
+                  if (summary) normalized[toolName] = summary;
+                }
+                if (Object.keys(normalized).length > 0) {
+                  canonicalTools = { ...canonicalTools, ...normalized };
+                  foundRegistry = true;
+                }
+              }
+            }
+          }
+        }
+      }
+    } catch {
+      // Retain built-in fallback
+    }
+  }
+
+  const contract = {
+    source: foundRoles || foundRegistry ? 'openchamber-live' : 'fallback',
+    semanticRoles,
+    canonicalTools,
+  };
+  cachedToolContractByKey.set(cacheKey, contract);
+  latestResolvedToolContract = contract;
+  return contract;
+}
+
+/**
+ * Synchronously return the latest resolved OpenChamber tool contract (or built-in fallback).
+ */
+export function getCachedOpenChamberToolContract() {
+  return latestResolvedToolContract;
+}
+
+/**
+ * Probe whether live OpenChamber runtime bridges (`openui-lang` guidance, tool schemas & UI tool contract)
+ * resolved cleanly or silently degraded to static fallback after an OpenChamber upgrade.
  * @param {{ env?: NodeJS.ProcessEnv, forceRefresh?: boolean }} [options]
  */
 export async function probeOpenChamberCompat(options = {}) {
@@ -293,20 +559,24 @@ export async function probeOpenChamberCompat(options = {}) {
     }
   }
 
-  const [guidance, toolMeta] = await Promise.all([
+  const [guidance, toolMeta, toolContract] = await Promise.all([
     loadOpenChamberGuidance({ env, forceRefresh: options.forceRefresh }),
     loadToolSpecsWithMeta({ env, forceRefresh: options.forceRefresh }),
+    loadOpenChamberToolContract({ env, forceRefresh: options.forceRefresh }),
   ]);
 
   const degraded = !webRoot
     || guidance.source !== 'openchamber-live'
-    || toolMeta.source !== 'openchamber-live';
+    || toolMeta.source !== 'openchamber-live'
+    || toolContract.source !== 'openchamber-live';
 
   return {
     webRoot,
     webVersion,
     guidanceSource: guidance.source,
     toolSpecSource: toolMeta.source,
+    toolContractSource: toolContract.source,
+    canonicalToolNames: Object.keys(toolContract.canonicalTools),
     toolNames: toolMeta.tools.map((t) => t.name),
     degraded,
   };

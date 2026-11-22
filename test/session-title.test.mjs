@@ -72,13 +72,11 @@ test('agy-runner auto-names untitled sessions after first turn and respects manu
   await new Promise((r) => upstream.listen(0, '127.0.0.1', r));
   const upPort = upstream.address().port;
 
-  // Fake agy script handles both warm stream-json turns and stateless --print= title generation
+  // Fake agy script handles ACP JSON-RPC 2.0 turns and stateless title generation
   const fakeScript = path.join(dir, 'fake-agy.mjs');
   fs.writeFileSync(
     fakeScript,
     `
-const args = process.argv.slice(2);
-const isPrint = args.includes('--print=');
 let buf = '';
 process.stdin.on('data', (d) => {
   buf += d.toString();
@@ -86,12 +84,20 @@ process.stdin.on('data', (d) => {
   buf = lines.pop() ?? '';
   for (const l of lines) {
     if (!l.trim()) continue;
-    const msg = JSON.parse(l);
-    const text = isPrint ? '子代理自动命名' : '已完成子代理功能核验。';
-    process.stdout.write(JSON.stringify({ event: 'init', conversation_id: 'conv_' + (isPrint ? 't' : 'm') }) + '\\n');
-    process.stdout.write(JSON.stringify({ event: 'step_update', step_update: { step_index: 1, state: 'DONE', step_type: 'agent_response', text_delta: text } }) + '\\n');
-    process.stdout.write(JSON.stringify({ event: 'result', conversation_id: 'conv_m', result: { status: 'SUCCESS', response: text, usage: { input_tokens: 10, output_tokens: 5 } } }) + '\\n');
-    if (isPrint) process.exit(0);
+    const req = JSON.parse(l);
+    if (req.method === 'initialize') {
+      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: req.id, result: { protocolVersion: 1 } }) + '\\n');
+    } else if (req.method === 'session/new' || req.method === 'session/resume') {
+      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: req.id, result: { sessionId: 'conv_m' } }) + '\\n');
+    } else if (req.method === 'session/set_model' || req.method === 'session/set_config_option') {
+      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: req.id, result: {} }) + '\\n');
+    } else if (req.method === 'session/prompt') {
+      const promptText = req.params?.prompt?.[0]?.text || '';
+      const isTitle = promptText.includes('Assistant final response');
+      const text = isTitle ? '子代理自动命名' : '已完成子代理功能核验。';
+      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'conv_m', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } } } }) + '\\n');
+      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: req.id, result: { stopReason: 'end_turn', usage: { inputTokens: 10, outputTokens: 5 } } }) + '\\n');
+    }
   }
 });
 `,

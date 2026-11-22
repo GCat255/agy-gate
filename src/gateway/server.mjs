@@ -1,6 +1,7 @@
 import http from 'node:http';
 import { AGY_PROVIDER_ID, getAgyCatalog } from '../agy/models.mjs';
 import { isAgyChildSessionID } from '../agy/subagent-bridge.mjs';
+import { normalizePromptFiles } from './store.mjs';
 
 /**
  * Read full request body as Buffer.
@@ -472,9 +473,10 @@ export function createRouterServer(deps) {
 
             const messageID = parsed.id || `msg_${Date.now()}_u`;
             const now = Date.now();
+            const normalizedFiles = Array.isArray(parsed.files) ? normalizePromptFiles(parsed.files) : undefined;
             const userPayload = {
               text: String(parsed.text || ''),
-              ...(Array.isArray(parsed.files) ? { files: parsed.files } : {}),
+              ...(normalizedFiles ? { files: normalizedFiles } : {}),
               ...(Array.isArray(parsed.agents) ? { agents: parsed.agents } : {}),
               ...(Array.isArray(parsed.skills) ? { skills: parsed.skills } : {}),
               ...(parsed.metadata ? { metadata: parsed.metadata } : {}),
@@ -489,33 +491,54 @@ export function createRouterServer(deps) {
             deps.store.upsertMessage(sessionID, userMessage);
 
             const effectiveDir = directory || sessionState?.directory || null;
+            const loc = effectiveDir ? { location: { directory: effectiveDir } } : {};
+            const delivery = parsed.delivery || 'queue';
+            const wasBusy = deps.agyRunner.isRunning(sessionID);
+
+            deps.store.upsertMessage(sessionID, userMessage);
             deps.sseHub.broadcast({
               type: 'session.inbox.enqueued',
               created: now,
-              ...(effectiveDir ? { location: { directory: effectiveDir } } : {}),
+              ...loc,
               data: {
                 sessionID,
                 inboxID: messageID,
                 item: { type: 'user', payload: userPayload },
               },
             });
-            deps.sseHub.broadcast({
-              type: 'session.inbox.delivered',
-              created: now,
-              ...(effectiveDir ? { location: { directory: effectiveDir } } : {}),
-              data: { sessionID, inboxID: messageID },
-            });
 
-            const started = await deps.agyRunner.startTurn({
-              sessionID,
-              modelID: activeModel.id,
-              variant: activeModel.variant,
-              directory: effectiveDir,
-              promptPayload: userPayload,
-            });
-            if (!started.ok) {
-              sendJson(res, 409, { error: 'Session is busy' });
-              return;
+            if (wasBusy) {
+              deps.agyRunner.enqueueTurnInput(sessionID, {
+                messageID,
+                modelID: activeModel.id,
+                variant: activeModel.variant,
+                directory: effectiveDir,
+                promptPayload: userPayload,
+              });
+            } else {
+              deps.sseHub.broadcast({
+                type: 'session.inbox.delivered',
+                created: now,
+                ...loc,
+                data: { sessionID, inboxID: messageID },
+              });
+
+              const started = await deps.agyRunner.startTurn({
+                sessionID,
+                modelID: activeModel.id,
+                variant: activeModel.variant,
+                directory: effectiveDir,
+                promptPayload: userPayload,
+              });
+              if (!started.ok) {
+                deps.agyRunner.enqueueTurnInput(sessionID, {
+                  messageID,
+                  modelID: activeModel.id,
+                  variant: activeModel.variant,
+                  directory: effectiveDir,
+                  promptPayload: userPayload,
+                });
+              }
             }
 
             sendJson(res, 200, {
@@ -523,7 +546,7 @@ export function createRouterServer(deps) {
                 id: messageID,
                 type: 'user',
                 time: { created: now },
-                delivery: parsed.delivery || 'queue',
+                delivery,
                 payload: userPayload,
               },
             });
@@ -635,6 +658,67 @@ export function createRouterServer(deps) {
           return;
         }
 
+        // 7d-3. Compact Session (route agy-cli sessions to native ACP `/compact`)
+        if (method === 'POST' && sub === 'compact') {
+          const bodyBuf = await readBodyBuffer(req);
+          const sessionState = deps.store.getSession(sessionID);
+          const activeModel = sessionState?.activeModel;
+
+          if (activeModel?.providerID === AGY_PROVIDER_ID) {
+            let parsed = {};
+            try {
+              parsed = bodyBuf.length ? JSON.parse(bodyBuf.toString('utf8')) : {};
+            } catch {}
+
+            const hasHistory = Boolean(sessionState?.agyConversationId) || deps.store.getMessages(sessionID).length > 0;
+            if (!hasHistory) {
+              sendJson(res, 400, { error: 'Nothing to compact yet' });
+              return;
+            }
+            if (deps.agyRunner.isRunning(sessionID)) {
+              sendJson(res, 409, { error: 'Session is busy' });
+              return;
+            }
+
+            const effectiveDir = directory || sessionState?.directory || null;
+            const started = await deps.agyRunner.compactSession({
+              sessionID,
+              modelID: activeModel.id,
+              variant: activeModel.variant,
+              directory: effectiveDir,
+              messageID: parsed.id,
+            });
+            if (!started.ok) {
+              sendJson(res, started.status || 409, { error: started.error || 'Session is busy' });
+              return;
+            }
+
+            sendJson(res, 200, {
+              data: {
+                id: started.messageID,
+                type: 'compaction',
+                time: { created: started.created },
+                delivery: parsed.delivery || 'queue',
+              },
+            });
+            return;
+          }
+
+          // Native OpenCode compact
+          const up = await fetchUpstream({
+            upstreamBase: deps.upstreamBase(),
+            authHeader: expectedAuth,
+            req,
+            method,
+            pathAndQuery,
+            body: bodyBuf,
+          });
+          const text = await up.text();
+          res.writeHead(up.status, { 'Content-Type': up.headers.get('content-type') || 'application/json' });
+          res.end(text);
+          return;
+        }
+
         // 7e. Interrupt Execution
         if (method === 'POST' && sub === 'interrupt') {
           if (deps.agyRunner.interrupt(sessionID)) {
@@ -670,10 +754,12 @@ export function createRouterServer(deps) {
           }
           const json = JSON.parse(text);
           const limit = url.searchParams.get('limit');
+          const inFlight = deps.agyRunner.getInFlightAssistantMessage?.(sessionID);
           json.data = deps.store.mergeMessages(Array.isArray(json.data) ? json.data : [], sessionID, {
             order: url.searchParams.get('order') || undefined,
             type: url.searchParams.get('type') || undefined,
             limit: limit ? Number.parseInt(limit, 10) : undefined,
+            ...(inFlight ? { extraMessages: [inFlight] } : {}),
           });
           sendJson(res, up.status, json);
           return;

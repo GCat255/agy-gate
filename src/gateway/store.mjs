@@ -2,6 +2,81 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { isUntitledSessionTitle } from '../agy/session-title.mjs';
 
+const EXT_MIME_MAP = new Map([
+  ['.png', 'image/png'],
+  ['.jpg', 'image/jpeg'],
+  ['.jpeg', 'image/jpeg'],
+  ['.gif', 'image/gif'],
+  ['.webp', 'image/webp'],
+  ['.bmp', 'image/bmp'],
+  ['.avif', 'image/avif'],
+  ['.svg', 'image/svg+xml'],
+  ['.pdf', 'application/pdf'],
+  ['.txt', 'text/plain'],
+  ['.md', 'text/plain'],
+  ['.json', 'application/json'],
+]);
+
+function inferFileMime(uri, name, explicitMime) {
+  if (typeof explicitMime === 'string' && explicitMime.trim()) {
+    return explicitMime.split(';')[0].trim();
+  }
+  if (typeof uri === 'string' && uri.startsWith('data:')) {
+    const comma = uri.indexOf(',');
+    if (comma > 5) {
+      const first = uri.slice(5, comma).split(';')[0].trim();
+      if (first.includes('/')) return first;
+    }
+  }
+  const candidate = String(name || uri || '').split('?')[0].split('#')[0];
+  const ext = path.extname(candidate).toLowerCase();
+  return EXT_MIME_MAP.get(ext) || 'application/octet-stream';
+}
+
+/**
+ * Normalize prompt/user `files` entries so OpenChamber's message decoder (`bx(file)`)
+ * always sees a valid `source` (`{ type: 'uri', uri }` or `{ type: 'inline' }`) and `mime`.
+ * @param {any[] | undefined} files
+ */
+export function normalizePromptFiles(files) {
+  if (!Array.isArray(files)) return undefined;
+  return files
+    .filter((f) => f && typeof f === 'object')
+    .map((file) => {
+      const uri = typeof file.uri === 'string' && file.uri
+        ? file.uri
+        : typeof file.url === 'string' && file.url
+          ? file.url
+          : file.source?.type === 'uri' && typeof file.source.uri === 'string'
+            ? file.source.uri
+            : undefined;
+      const mime = inferFileMime(uri, file.name || file.filename, file.mime || file.mimeType);
+      const hasValidSource =
+        (file.source?.type === 'uri' && typeof file.source.uri === 'string')
+        || (file.source?.type === 'inline' && typeof file.data === 'string');
+      const source = hasValidSource
+        ? file.source
+        : uri
+          ? { type: 'uri', uri }
+          : { type: 'inline' };
+      return {
+        ...file,
+        ...(uri ? { uri } : {}),
+        ...(file.name || file.filename ? { name: file.name || file.filename } : {}),
+        mime,
+        source,
+      };
+    });
+}
+
+function normalizeStoredMessage(msg) {
+  if (!msg || typeof msg !== 'object') return msg;
+  if (msg.type === 'user' && Array.isArray(msg.files) && msg.files.length > 0) {
+    return { ...msg, files: normalizePromptFiles(msg.files) };
+  }
+  return msg;
+}
+
 /**
  * Persistent store for `agy-cli` session bindings, model overrides, and messages.
  * One JSON file per session under `<dataDir>/sessions/` with atomic temp-file writes.
@@ -134,10 +209,24 @@ export class RouterStore {
     this._save(sessionID);
   }
 
+  /**
+   * @param {string} sessionID
+   * @param {string} messageID
+   */
+  deleteMessage(sessionID, messageID) {
+    const s = this.getSession(sessionID);
+    if (!s || !Array.isArray(s.messages)) return false;
+    const next = s.messages.filter((m) => m?.id !== messageID);
+    if (next.length === s.messages.length) return false;
+    s.messages = next;
+    this._save(sessionID);
+    return true;
+  }
+
   /** @param {string} sessionID */
   getMessages(sessionID) {
     const s = this.getSession(sessionID);
-    return s && Array.isArray(s.messages) ? s.messages : [];
+    return s && Array.isArray(s.messages) ? s.messages.map(normalizeStoredMessage) : [];
   }
 
   /**
@@ -399,20 +488,22 @@ export class RouterStore {
   }
 
   /**
-   * Merge upstream OpenCode messages with locally persisted `agy-cli` messages.
+   * Merge upstream OpenCode messages with locally persisted `agy-cli` messages
+   * (plus an optional in-flight live assistant snapshot).
    * @param {any[]} upstreamMessages
    * @param {string} sessionID
-   * @param {{ order?: string, type?: string, limit?: number }} [query]
+   * @param {{ order?: string, type?: string, limit?: number, extraMessages?: any[] }} [query]
    */
   mergeMessages(upstreamMessages, sessionID, query = {}) {
     const local = this.getMessages(sessionID);
-    if (local.length === 0) return upstreamMessages;
+    const extras = Array.isArray(query.extraMessages) ? query.extraMessages.filter(Boolean) : [];
+    if (local.length === 0 && extras.length === 0) return upstreamMessages;
 
     const byId = new Map();
     for (const msg of upstreamMessages || []) {
       if (msg?.id) byId.set(msg.id, msg);
     }
-    for (const msg of local) {
+    for (const msg of [...local, ...extras]) {
       if (!msg?.id) continue;
       if (query.type && msg.type !== query.type) continue;
       byId.set(msg.id, msg);

@@ -31,10 +31,14 @@ test('parseAgyModelsOutput parses tab-separated models and skips noise', () => {
   const modelInfo = toOpenCodeModelInfo({ id: 'gemini-4-neon', name: 'Gemini 4 Neon', variants: ['low', 'high'] });
   assert.equal(modelInfo.providerID, AGY_PROVIDER_ID);
   assert.equal(modelInfo.modelID, 'gemini-4-neon');
+  assert.deepEqual(modelInfo.capabilities.input, ['text', 'image']);
   assert.deepEqual(modelInfo.variants, [
     { id: 'low', settings: {} },
     { id: 'high', settings: {} },
   ]);
+
+  const textOnlyInfo = toOpenCodeModelInfo({ id: 'gpt-oss-120b-medium', name: 'GPT-OSS 120B (Medium)' });
+  assert.deepEqual(textOnlyInfo.capabilities.input, ['text']);
 });
 
 test('groupAgyModels collapses multi-tier models into native variants and keeps single-tier models intact', () => {

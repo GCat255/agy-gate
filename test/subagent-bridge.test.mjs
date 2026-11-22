@@ -157,59 +157,44 @@ test('AgyTranscriptTranslator and AgySubagentWatcher convert transcript.jsonl in
   }
 });
 
-test('AgyTurnTranslator maps invoke_subagent to OpenCode subagent tool for foreground & background completions', () => {
+test('AgyTurnTranslator maps ACP invoke_subagent to OpenCode subagent tool for foreground & background completions', () => {
   const fgEvents = [];
-  let discovered = null;
+  let syncCalls = 0;
   const trFg = new AgyTurnTranslator({
     sessionID: 'ses_p1',
     assistantMessageID: 'msg_p1',
     modelID: 'gemini-4-hydrogen-high',
     emit: (ev) => fgEvents.push(ev),
-    onSubagentDiscovered: (info) => {
-      discovered = info;
+    onSyncSubagents: () => {
+      syncCalls += 1;
     },
   });
 
-  trFg.handleLine({
-    event: 'step_update',
-    step_update: {
-      step_index: 2,
-      state: 'ACTIVE',
-      step_type: 'subagent',
-      tool_name: 'invoke_subagent',
-      subagent_info: {
-        subagents: [{ type_name: 'research', role: 'Code Scout', initial_prompt: 'Inspect foo.js' }],
-      },
-    },
+  trFg.begin();
+  trFg.handleAcpUpdate({
+    sessionUpdate: 'tool_call',
+    toolCallId: 'call_sub_fg',
+    name: 'invoke_subagent',
+    args: { TypeName: 'research', Role: 'Code Scout', Prompt: 'Inspect foo.js' },
+    rawInput: { TypeName: 'research', Role: 'Code Scout', Prompt: 'Inspect foo.js' },
+    status: 'in_progress',
   });
-  trFg.handleLine({
-    event: 'step_update',
-    step_update: {
-      step_index: 2,
-      state: 'DONE',
-      step_type: 'subagent',
-      tool_name: 'invoke_subagent',
-      subagent_info: {
-        subagents: [
-          {
-            type_name: 'research',
-            role: 'Code Scout',
-            initial_prompt: 'Inspect foo.js',
-            conversation_id: 'uuid-fg-1',
-            log_uri: 'file:///tmp/transcript.jsonl',
-          },
-        ],
-      },
-    },
+  trFg.handleAcpUpdate({
+    sessionUpdate: 'tool_call_update',
+    toolCallId: 'call_sub_fg',
+    name: 'invoke_subagent',
+    rawInput: { TypeName: 'research', Role: 'Code Scout', Prompt: 'Inspect foo.js' },
+    status: 'completed',
   });
 
-  assert.equal(discovered.childSessionID, 'agy_sub_uuid-fg-1');
+  assert.equal(syncCalls, 1);
+  assert.equal(trFg.attachDiscoveredSubagent('agy_sub_uuid-fg-1'), true);
   assert.ok(fgEvents.some((e) => e.type === 'session.tool.called' && e.data.input.agent === 'research' && e.data.input.description === 'Code Scout'));
   assert.ok(fgEvents.some((e) => e.type === 'session.tool.progress' && e.data.metadata.sessionID === 'agy_sub_uuid-fg-1'));
 
   // Foreground resolution inside the same turn
   assert.equal(trFg.resolveSubagent('agy_sub_uuid-fg-1', { state: 'completed', output: 'All clear' }), true);
-  trFg.handleLine({ event: 'result', result: { status: 'SUCCESS', response: 'Done' } });
+  trFg.completeFromPromptResult({ stopReason: 'end_turn' });
   const fgMsg = trFg.toAssistantMessage();
   assert.equal(fgMsg.content[0].name, 'subagent');
   assert.equal(fgMsg.content[0].state.metadata.status, 'completed');
@@ -223,19 +208,16 @@ test('AgyTurnTranslator maps invoke_subagent to OpenCode subagent tool for foreg
     modelID: 'gemini-4-hydrogen-high',
     emit: (ev) => bgEvents.push(ev),
   });
-  trBg.handleLine({
-    event: 'step_update',
-    step_update: {
-      step_index: 2,
-      state: 'DONE',
-      step_type: 'subagent',
-      tool_name: 'invoke_subagent',
-      subagent_info: {
-        subagents: [{ type_name: 'research', role: 'Bg Scout', initial_prompt: 'Scan', conversation_id: 'uuid-bg-1' }],
-      },
-    },
+  trBg.begin();
+  trBg.handleAcpUpdate({
+    sessionUpdate: 'tool_call',
+    toolCallId: 'call_sub_bg',
+    name: 'invoke_subagent',
+    rawInput: { TypeName: 'research', Role: 'Bg Scout', Prompt: 'Scan' },
+    status: 'in_progress',
   });
-  trBg.handleLine({ event: 'result', result: { status: 'SUCCESS', response: 'Started' } });
+  trBg.attachDiscoveredSubagent('agy_sub_uuid-bg-1');
+  trBg.completeFromPromptResult({ stopReason: 'end_turn' });
   assert.equal(trBg.resolveSubagent('agy_sub_uuid-bg-1', { state: 'completed', output: 'late' }), false);
   const bgMsg = trBg.toAssistantMessage();
   const bgTool = bgMsg.content.find((c) => c.type === 'tool' && c.name === 'subagent');
@@ -297,18 +279,29 @@ test('server queues /synthetic resume calls when agy-cli session is busy instead
     mockAgyJs,
     [
       "import readline from 'node:readline';",
-      "console.log(JSON.stringify({ event: 'init', conversation_id: 'conv_q', init: { model: 'gemini-4-hydrogen-high' } }));",
       "const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });",
       "let turn = 0;",
       "rl.on('line', (line) => {",
       "  if (!line.trim()) return;",
-      "  const msg = JSON.parse(line);",
-      "  if (msg.event !== 'user') return;",
+      "  const req = JSON.parse(line);",
+      "  if (req.method === 'initialize') {",
+      "    console.log(JSON.stringify({ jsonrpc: '2.0', id: req.id, result: { protocolVersion: 1 } }));",
+      "    return;",
+      "  }",
+      "  if (req.method === 'session/new' || req.method === 'session/resume') {",
+      "    console.log(JSON.stringify({ jsonrpc: '2.0', id: req.id, result: { sessionId: 'conv_q' } }));",
+      "    return;",
+      "  }",
+      "  if (req.method === 'session/set_model' || req.method === 'session/set_config_option') {",
+      "    console.log(JSON.stringify({ jsonrpc: '2.0', id: req.id, result: {} }));",
+      "    return;",
+      "  }",
+      "  if (req.method !== 'session/prompt') return;",
       "  turn += 1;",
       "  const delay = turn === 1 ? 150 : 20;",
       "  setTimeout(() => {",
-      "    console.log(JSON.stringify({ event: 'step_update', step_update: { step_index: turn, state: 'DONE', step_type: 'agent_response', text_delta: `reply_${turn}`, usage: { input_tokens: 10, output_tokens: 2, total_tokens: 12 } } }));",
-      "    console.log(JSON.stringify({ event: 'result', result: { conversation_id: 'conv_q', status: 'SUCCESS', response: `reply_${turn}` } }));",
+      "    console.log(JSON.stringify({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'conv_q', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `reply_${turn}` } } } }));",
+      "    console.log(JSON.stringify({ jsonrpc: '2.0', id: req.id, result: { stopReason: 'end_turn', usage: { inputTokens: 10, outputTokens: 2, totalTokens: 12 } } }));",
       "  }, delay);",
       "});",
     ].join('\n'),
@@ -727,5 +720,137 @@ test('system_message wakeup flush does not split trailing child prose and sync r
     watcher.close('completed');
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('AgyRunner ACP discovers subagents from parent transcript.jsonl and spawns child watcher', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-acp-sub-e2e-'));
+  try {
+    const parentConv = 'parent-acp-conv-1';
+    const childConv = 'child-acp-conv-1';
+    const parentTranscriptDir = path.join(dir, '.gemini', 'antigravity-cli', 'brain', parentConv, '.system_generated', 'logs');
+    const childTranscriptDir = path.join(dir, '.gemini', 'antigravity-cli', 'brain', childConv, '.system_generated', 'logs');
+    fs.mkdirSync(parentTranscriptDir, { recursive: true });
+    fs.mkdirSync(childTranscriptDir, { recursive: true });
+    const parentTranscriptPath = path.join(parentTranscriptDir, 'transcript.jsonl');
+    const childTranscriptPath = path.join(childTranscriptDir, 'transcript.jsonl');
+
+    fs.writeFileSync(
+      childTranscriptPath,
+      [
+        JSON.stringify({
+          step_index: 0,
+          source: 'SYSTEM',
+          type: 'SYSTEM_MESSAGE',
+          status: 'DONE',
+          created_at: '2026-11-22T10:00:01Z',
+          content: `<SYSTEM_MESSAGE>\n[Message] sender=${parentConv} content=Check README\n</SYSTEM_MESSAGE>`,
+        }),
+        JSON.stringify({
+          step_index: 1,
+          source: 'MODEL',
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          created_at: '2026-11-22T10:00:02Z',
+          model: 'gemini-3.8-flash-low',
+          input_tokens: 100,
+          output_tokens: 15,
+          content: 'CHILD_ACP_OK',
+        }),
+      ].join('\n') + '\n',
+      'utf8',
+    );
+
+    const mockAgyJs = path.join(dir, 'mock-acp-sub.mjs');
+    const mockAgyCmd = path.join(dir, process.platform === 'win32' ? 'mock-acp-sub.cmd' : 'mock-acp-sub.sh');
+    fs.writeFileSync(
+      mockAgyJs,
+      [
+        "import fs from 'node:fs';",
+        "import readline from 'node:readline';",
+        `const parentTranscriptPath = ${JSON.stringify(parentTranscriptPath)};`,
+        `const childTranscriptPath = ${JSON.stringify(childTranscriptPath)};`,
+        `const parentConv = ${JSON.stringify(parentConv)};`,
+        `const childConv = ${JSON.stringify(childConv)};`,
+        "const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });",
+        "rl.on('line', (line) => {",
+        "  if (!line.trim()) return;",
+        "  const req = JSON.parse(line);",
+        "  if (req.method === 'initialize') return console.log(JSON.stringify({ jsonrpc: '2.0', id: req.id, result: { protocolVersion: 1 } }));",
+        "  if (req.method === 'session/new' || req.method === 'session/resume') return console.log(JSON.stringify({ jsonrpc: '2.0', id: req.id, result: { sessionId: parentConv } }));",
+        "  if (req.method === 'session/set_model' || req.method === 'session/set_config_option') return console.log(JSON.stringify({ jsonrpc: '2.0', id: req.id, result: {} }));",
+        "  if (req.method !== 'session/prompt') return;",
+        "  console.log(JSON.stringify({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: parentConv, update: { sessionUpdate: 'tool_call', toolCallId: 'call_sub_1', name: 'invoke_subagent', rawInput: { TypeName: 'research', Role: 'ACP Scout', Prompt: 'Check README' }, status: 'in_progress' } } }));",
+        "  fs.writeFileSync(parentTranscriptPath, JSON.stringify({ step_index: 2, source: 'MODEL', type: 'GENERIC', status: 'DONE', created_at: '2026-11-22T10:00:01Z', content: 'Created the following subagent:\\n' + JSON.stringify({ conversationId: childConv, logAbsoluteUri: childTranscriptPath }) }) + '\\n', 'utf8');",
+        "  console.log(JSON.stringify({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: parentConv, update: { sessionUpdate: 'tool_call_update', toolCallId: 'call_sub_1', name: 'invoke_subagent', rawInput: { TypeName: 'research', Role: 'ACP Scout', Prompt: 'Check README' }, status: 'completed' } } }));",
+        "  setTimeout(() => {",
+        "    console.log(JSON.stringify({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: parentConv, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'All done.' } } } }));",
+        "    console.log(JSON.stringify({ jsonrpc: '2.0', id: req.id, result: { stopReason: 'end_turn', usage: { inputTokens: 50, outputTokens: 10 } } }));",
+        "  }, 80);",
+        "});",
+      ].join('\n'),
+      'utf8',
+    );
+    if (process.platform === 'win32') {
+      fs.writeFileSync(mockAgyCmd, `@echo off\r\n"${process.execPath}" "${mockAgyJs}" %*\r\n`, 'utf8');
+    } else {
+      fs.writeFileSync(mockAgyCmd, `#!/usr/bin/env bash\n"${process.execPath}" "${mockAgyJs}" "$@"\n`, { mode: 0o755 });
+    }
+
+    const store = new RouterStore(dir);
+    store.setSessionModel('ses_acp_sub', { providerID: 'agy-cli', id: 'gemini-4-hydrogen', variant: 'high' });
+    store.setSessionDirectory('ses_acp_sub', dir);
+
+    const events = [];
+    const runner = new AgyRunner({
+      store,
+      sseHub: { broadcast: (ev) => events.push(ev) },
+      env: {
+        ...process.env,
+        AGY_ROUTER_AGY_BIN: mockAgyCmd,
+        AGY_ROUTER_MAGPIE_BIN: path.join(dir, 'no-magpie.exe'),
+        AGY_ROUTER_HOME_DIR: dir,
+        AGY_ROUTER_DISABLE_UI_GUIDANCE: '1',
+      },
+    });
+
+    try {
+      await runner.startTurn({
+        sessionID: 'ses_acp_sub',
+        modelID: 'gemini-4-hydrogen',
+        variant: 'high',
+        directory: dir,
+        promptPayload: { text: 'run subagent' },
+      });
+
+      const deadline = Date.now() + 5000;
+      while (Date.now() < deadline) {
+        const done = events.some((e) => e.type === 'session.idle' && e.data?.sessionID === 'ses_acp_sub');
+        const child = store.getChildSessionInfo(toChildSessionID(childConv));
+        if (done && child?.outcome === 'succeeded') break;
+        await new Promise((r) => setTimeout(r, 30));
+      }
+
+      const childID = toChildSessionID(childConv);
+      const childInfo = store.getChildSessionInfo(childID);
+      assert.ok(childInfo, 'Child session should be discovered from parent transcript.jsonl');
+      assert.equal(childInfo.title, 'ACP Scout');
+      assert.equal(childInfo.outcome, 'succeeded');
+      const childMsgs = store.getMessages(childID);
+      assert.equal(childMsgs[1].content.find((p) => p.type === 'text')?.text, 'CHILD_ACP_OK');
+
+      const parentMsgs = store.getMessages('ses_acp_sub');
+      const subTool = parentMsgs.find((m) => m.type === 'assistant')?.content?.find((p) => p.type === 'tool' && p.name === 'subagent');
+      assert.ok(subTool);
+      assert.equal(subTool.state.metadata.sessionID, childID);
+      assert.equal(subTool.state.metadata.status, 'completed');
+    } finally {
+      runner.stopAll();
+      await new Promise((r) => setTimeout(r, 100));
+    }
+  } finally {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+    } catch {}
   }
 });

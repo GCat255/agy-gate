@@ -7,6 +7,7 @@ import { PassThrough } from 'node:stream';
 import {
   buildSessionGuidancePrefix,
   loadOpenChamberGuidance,
+  loadOpenChamberToolContract,
   loadOpenChamberToolSpecs,
   probeOpenChamberCompat,
   resolveOpenChamberWebRoot,
@@ -70,6 +71,15 @@ describe('openchamber-bridge dynamic discovery & guidance', () => {
       assert.equal(degradedProbe.webVersion, '9.9.9');
       assert.equal(degradedProbe.guidanceSource, 'fallback');
       assert.equal(degradedProbe.toolSpecSource, 'fallback');
+      assert.equal(degradedProbe.toolContractSource, 'fallback');
+
+      const fallbackContract = await loadOpenChamberToolContract({
+        env: { OPENCHAMBER_WEB_ROOT: fakeRoot },
+        forceRefresh: true,
+      });
+      assert.equal(fallbackContract.source, 'fallback');
+      assert.equal(fallbackContract.semanticRoles.shell, 'shell');
+      assert.ok(fallbackContract.canonicalTools.write.inputFields.includes('path'));
     });
 
     if (installedRoot) {
@@ -77,7 +87,15 @@ describe('openchamber-bridge dynamic discovery & guidance', () => {
       assert.equal(liveProbe.degraded, false);
       assert.equal(liveProbe.guidanceSource, 'openchamber-live');
       assert.equal(liveProbe.toolSpecSource, 'openchamber-live');
+      assert.equal(liveProbe.toolContractSource, 'openchamber-live');
+      assert.ok(liveProbe.canonicalToolNames.includes('read'));
+      assert.ok(liveProbe.canonicalToolNames.includes('shell'));
       assert.ok(liveProbe.toolNames.includes('openchamber_render'));
+
+      const contract = await loadOpenChamberToolContract({ env: process.env, forceRefresh: true });
+      assert.equal(contract.source, 'openchamber-live');
+      assert.equal(contract.semanticRoles.read, 'read');
+      assert.ok(contract.canonicalTools.read.inputFields.includes('path'));
     }
   });
 });
@@ -240,21 +258,17 @@ describe('event-translator OpenChamber MCP normalization', () => {
         },
       });
 
-      tr.handleLine({
-        event: 'step_update',
-        step_update: {
-          step_index: 1,
-          state: 'ACTIVE',
-          step_type: 'tool',
-          tool_name: 'call_mcp_tool',
-          tool_info: {
-            parameters: {
-              ServerName: 'openchamber',
-              ToolName: 'openchamber_render',
-              Arguments: { action: 'render.page', parameters: { ui: 'root = Stack([])', awaitAnswer: true } },
-            },
-          },
+      tr.begin();
+      tr.handleAcpUpdate({
+        sessionUpdate: 'tool_call',
+        toolCallId: 'call_acp_oc_1',
+        name: 'call_mcp_tool',
+        rawInput: {
+          ServerName: 'openchamber',
+          ToolName: 'openchamber_render',
+          Arguments: { action: 'render.page', parameters: { ui: 'root = Stack([])', awaitAnswer: true } },
         },
+        status: 'in_progress',
       });
 
       await new Promise((r) => setTimeout(r, 30));
@@ -292,29 +306,24 @@ describe('event-translator OpenChamber MCP normalization', () => {
       stdin.end();
       await done;
 
-      tr.handleLine({
-        event: 'step_update',
-        step_update: {
-          step_index: 1,
-          state: 'DONE',
-          step_type: 'tool',
-          tool_name: 'call_mcp_tool',
-          tool_info: {
-            parameters: {
-              ServerName: 'openchamber',
-              ToolName: 'openchamber_render',
-              Arguments: { action: 'render.page', parameters: { ui: 'root = Stack([])', awaitAnswer: true } },
-            },
-            output: JSON.stringify({
-              schemaVersion: 1,
-              ok: true,
-              action: 'render.page',
-              data: { answer: { answered: true, summary: 'Use B' } },
-            }),
-          },
+      tr.handleAcpUpdate({
+        sessionUpdate: 'tool_call_update',
+        toolCallId: 'call_acp_oc_1',
+        name: 'call_mcp_tool',
+        rawInput: {
+          ServerName: 'openchamber',
+          ToolName: 'openchamber_render',
+          Arguments: { action: 'render.page', parameters: { ui: 'root = Stack([])', awaitAnswer: true } },
         },
+        status: 'completed',
+        rawOutput: JSON.stringify({
+          schemaVersion: 1,
+          ok: true,
+          action: 'render.page',
+          data: { answer: { answered: true, summary: 'Use B' } },
+        }),
       });
-      const msg = tr.complete();
+      const msg = tr.completeFromPromptResult({ stopReason: 'end_turn' });
 
       const started = events.find((e) => e.type === 'session.tool.input.started');
       assert.equal(started.data.name, 'openchamber_render');

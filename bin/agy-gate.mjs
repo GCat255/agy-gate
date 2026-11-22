@@ -15,7 +15,12 @@ import { AgyRunner } from '../src/agy/runner.mjs';
 import { createRouterServer } from '../src/gateway/server.mjs';
 import { createOAuthManager } from '../extensions/agy-quota/service/oauth.js';
 import { readAntigravityQuota } from '../extensions/agy-quota/service/quota.js';
-import { loadOpenChamberGuidance, probeOpenChamberCompat, resolveOpenChamberWebRoot } from '../src/bridge/openchamber.mjs';
+import {
+  loadOpenChamberGuidance,
+  loadOpenChamberToolContract,
+  probeOpenChamberCompat,
+  resolveOpenChamberWebRoot,
+} from '../src/bridge/openchamber.mjs';
 import { ensureOpenChamberMcpConfig, runMcpBridgeServer } from '../src/bridge/mcp.mjs';
 import { formatSetupReport, runSetup } from '../src/cli/setup.mjs';
 
@@ -109,6 +114,7 @@ async function cmdServe(opts) {
     }
   }
   void loadOpenChamberGuidance().catch(() => {});
+  void loadOpenChamberToolContract().catch(() => {});
 
   const callerPassword = process.env.OPENCODE_SERVER_PASSWORD || process.env.OPENCODE_PASSWORD || '';
   const upstreamPassword = callerPassword || crypto.randomBytes(16).toString('hex');
