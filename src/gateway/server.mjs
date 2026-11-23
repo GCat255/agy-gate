@@ -259,11 +259,14 @@ export function createRouterServer(deps) {
         const json = JSON.parse(text);
         if (json?.data?.id) {
           if (directory) deps.store.setSessionDirectory(json.data.id, directory);
+          if (typeof parsed?.agent === 'string' && parsed.agent.trim()) {
+            deps.store.setSessionAgent(json.data.id, parsed.agent.trim());
+          }
           if (wantsAgy) {
             deps.store.setSessionModel(json.data.id, parsed.model);
-            deps.store.cacheSessionMetadata(json.data);
-            json.data = deps.store.overlaySessionInfo(json.data);
           }
+          deps.store.cacheSessionMetadata(json.data);
+          json.data = deps.store.overlaySessionInfo(json.data);
         }
         sendJson(res, up.status, json);
         return;
@@ -459,6 +462,49 @@ export function createRouterServer(deps) {
           return;
         }
 
+        // 7c-2. Switch Session Agent / Mode (e.g. build <-> plan)
+        if (method === 'POST' && sub === 'agent') {
+          const bodyBuf = await readBodyBuffer(req);
+          let parsed = {};
+          try {
+            parsed = bodyBuf.length ? JSON.parse(bodyBuf.toString('utf8')) : {};
+          } catch {}
+
+          const nextAgent = typeof parsed?.agent === 'string' && parsed.agent.trim() ? parsed.agent.trim() : null;
+          const sessionState = deps.store.getSession(sessionID);
+          const prevAgent = sessionState?.agent || undefined;
+          deps.store.setSessionAgent(sessionID, nextAgent);
+
+          if (sessionState?.activeModel?.providerID === AGY_PROVIDER_ID && nextAgent) {
+            const effectiveDir = directory || sessionState?.directory || null;
+            deps.sseHub.broadcast({
+              type: 'session.agent.selected',
+              ...(effectiveDir ? { location: { directory: effectiveDir } } : {}),
+              data: {
+                sessionID,
+                agent: nextAgent,
+                ...(prevAgent && prevAgent !== nextAgent ? { previous: prevAgent } : {}),
+              },
+            });
+            res.writeHead(204);
+            res.end();
+            return;
+          }
+
+          const up = await fetchUpstream({
+            upstreamBase: deps.upstreamBase(),
+            authHeader: expectedAuth,
+            req,
+            method,
+            pathAndQuery,
+            body: bodyBuf,
+          });
+          const text = await up.text();
+          res.writeHead(up.status, { 'Content-Type': up.headers.get('content-type') || 'application/json' });
+          res.end(text);
+          return;
+        }
+
         // 7d. Send Prompt (route by activeModel.providerID === 'agy-cli')
         if (method === 'POST' && sub === 'prompt') {
           const bodyBuf = await readBodyBuffer(req);
@@ -470,6 +516,11 @@ export function createRouterServer(deps) {
             try {
               parsed = bodyBuf.length ? JSON.parse(bodyBuf.toString('utf8')) : {};
             } catch {}
+
+            if (typeof parsed?.agent === 'string' && parsed.agent.trim()) {
+              deps.store.setSessionAgent(sessionID, parsed.agent.trim());
+            }
+            const activeAgent = deps.store.getSession(sessionID)?.agent || undefined;
 
             const messageID = parsed.id || `msg_${Date.now()}_u`;
             const now = Date.now();
@@ -495,7 +546,6 @@ export function createRouterServer(deps) {
             const delivery = parsed.delivery || 'queue';
             const wasBusy = deps.agyRunner.isRunning(sessionID);
 
-            deps.store.upsertMessage(sessionID, userMessage);
             deps.sseHub.broadcast({
               type: 'session.inbox.enqueued',
               created: now,
@@ -512,6 +562,7 @@ export function createRouterServer(deps) {
                 messageID,
                 modelID: activeModel.id,
                 variant: activeModel.variant,
+                agent: activeAgent,
                 directory: effectiveDir,
                 promptPayload: userPayload,
               });
@@ -527,6 +578,7 @@ export function createRouterServer(deps) {
                 sessionID,
                 modelID: activeModel.id,
                 variant: activeModel.variant,
+                agent: activeAgent,
                 directory: effectiveDir,
                 promptPayload: userPayload,
               });
@@ -535,6 +587,7 @@ export function createRouterServer(deps) {
                   messageID,
                   modelID: activeModel.id,
                   variant: activeModel.variant,
+                  agent: activeAgent,
                   directory: effectiveDir,
                   promptPayload: userPayload,
                 });
@@ -599,6 +652,7 @@ export function createRouterServer(deps) {
               return;
             }
 
+            const activeAgent = deps.store.getSession(sessionID)?.agent || undefined;
             const effectiveDir = directory || sessionState?.directory || null;
             deps.sseHub.broadcast({
               type: 'session.inbox.enqueued',
@@ -611,32 +665,49 @@ export function createRouterServer(deps) {
                   type: 'synthetic',
                   payload: {
                     text,
+                    ...(syntheticMsg.description ? { description: syntheticMsg.description } : {}),
                     ...(parsed.metadata ? { metadata: parsed.metadata } : {}),
                   },
                 },
               },
             });
-            deps.sseHub.broadcast({
-              type: 'session.inbox.delivered',
-              created: now,
-              ...(effectiveDir ? { location: { directory: effectiveDir } } : {}),
-              data: { sessionID, inboxID: messageID },
-            });
 
-            const started = await deps.agyRunner.startTurn({
-              sessionID,
-              modelID: activeModel.id,
-              variant: activeModel.variant,
-              directory: effectiveDir,
-              promptPayload: { text },
-            });
-            if (!started.ok) {
+            const wasBusy = deps.agyRunner.isRunning(sessionID);
+            if (wasBusy) {
               deps.agyRunner.enqueueTurnInput(sessionID, {
+                messageID,
                 modelID: activeModel.id,
                 variant: activeModel.variant,
+                agent: activeAgent,
                 directory: effectiveDir,
                 promptPayload: { text },
               });
+            } else {
+              deps.sseHub.broadcast({
+                type: 'session.inbox.delivered',
+                created: now,
+                ...(effectiveDir ? { location: { directory: effectiveDir } } : {}),
+                data: { sessionID, inboxID: messageID },
+              });
+
+              const started = await deps.agyRunner.startTurn({
+                sessionID,
+                modelID: activeModel.id,
+                variant: activeModel.variant,
+                agent: activeAgent,
+                directory: effectiveDir,
+                promptPayload: { text },
+              });
+              if (!started.ok) {
+                deps.agyRunner.enqueueTurnInput(sessionID, {
+                  messageID,
+                  modelID: activeModel.id,
+                  variant: activeModel.variant,
+                  agent: activeAgent,
+                  directory: effectiveDir,
+                  promptPayload: { text },
+                });
+              }
             }
 
             sendJson(res, 200, { data: syntheticMsg });
@@ -754,12 +825,17 @@ export function createRouterServer(deps) {
           }
           const json = JSON.parse(text);
           const limit = url.searchParams.get('limit');
-          const inFlight = deps.agyRunner.getInFlightAssistantMessage?.(sessionID);
+          const inFlight = deps.agyRunner.getInFlightAssistantMessages
+            ? deps.agyRunner.getInFlightAssistantMessages(sessionID)
+            : (() => {
+                const single = deps.agyRunner.getInFlightAssistantMessage?.(sessionID);
+                return single ? [single] : [];
+              })();
           json.data = deps.store.mergeMessages(Array.isArray(json.data) ? json.data : [], sessionID, {
             order: url.searchParams.get('order') || undefined,
             type: url.searchParams.get('type') || undefined,
             limit: limit ? Number.parseInt(limit, 10) : undefined,
-            ...(inFlight ? { extraMessages: [inFlight] } : {}),
+            ...(inFlight.length > 0 ? { extraMessages: inFlight } : {}),
           });
           sendJson(res, up.status, json);
           return;

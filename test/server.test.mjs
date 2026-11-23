@@ -38,13 +38,18 @@ test('router server injects variant models, reuses warm ACP worker across turns,
       `const countFile = ${JSON.stringify(bootCountFile)};`,
       `const logFile = ${JSON.stringify(promptsLogFile)};`,
       `const transcriptPath = ${JSON.stringify(transcriptPath)};`,
+      "const cliArgsLogFile = " + JSON.stringify(path.join(tempDir, 'cli-args-log.json')) + ";",
       "const prev = fs.existsSync(countFile) ? Number(fs.readFileSync(countFile, 'utf8')) : 0;",
       "fs.writeFileSync(countFile, String(prev + 1), 'utf8');",
+      "const argLogs = fs.existsSync(cliArgsLogFile) ? JSON.parse(fs.readFileSync(cliArgsLogFile, 'utf8')) : [];",
+      "argLogs.push(process.argv.slice(2));",
+      "fs.writeFileSync(cliArgsLogFile, JSON.stringify(argLogs), 'utf8');",
       "const conv = 'conv_mock_acp';",
       "const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });",
       "let turn = 0;",
       "let pendingPromptReqId = null;",
       "let pendingTimer = null;",
+      "const modeLogs = [];",
       "rl.on('line', (line) => {",
       "  if (!line.trim()) return;",
       "  const req = JSON.parse(line);",
@@ -56,7 +61,8 @@ test('router server injects variant models, reuses warm ACP worker across turns,
       "    console.log(JSON.stringify({ jsonrpc: '2.0', id: req.id, result: { sessionId: conv } }));",
       "    return;",
       "  }",
-      "  if (req.method === 'session/set_model' || req.method === 'session/set_config_option') {",
+      "  if (req.method === 'session/set_model' || req.method === 'session/set_config_option' || req.method === 'session/set_mode') {",
+      "    if (req.method === 'session/set_mode') modeLogs.push(req.params?.modeId);",
       "    console.log(JSON.stringify({ jsonrpc: '2.0', id: req.id, result: {} }));",
       "    return;",
       "  }",
@@ -109,6 +115,29 @@ test('router server injects variant models, reuses warm ACP worker across turns,
       "    if (firstText.includes('queued follow-up')) {",
       "      console.log(JSON.stringify({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: conv, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'queued done' } } } }));",
       "      console.log(JSON.stringify({ jsonrpc: '2.0', id: req.id, result: { stopReason: 'end_turn' } }));",
+      "      return;",
+      "    }",
+      "    if (firstText.includes('plan mode check')) {",
+      "      const editPermId = 9001;",
+      "      const readPermId = 9002;",
+      "      let editPermOutcome = null;",
+      "      let readPermOutcome = null;",
+      "      const onPerm = (rawLine) => {",
+      "        if (!rawLine.trim()) return;",
+      "        const m = JSON.parse(rawLine);",
+      "        if (m.id === editPermId) editPermOutcome = m.result?.outcome?.optionId || m.result?.outcome?.outcome;",
+      "        if (m.id === readPermId) readPermOutcome = m.result?.outcome?.optionId || m.result?.outcome?.outcome;",
+      "        if (editPermOutcome && readPermOutcome) {",
+      "          rl.off('line', onPerm);",
+      "          const modeStr = modeLogs.join(',');",
+      "          const hasDirective = firstText.includes('[Mode: Plan');",
+      "          console.log(JSON.stringify({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: conv, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `plan:${modeStr}:${hasDirective}:${editPermOutcome}:${readPermOutcome}` } } } }));",
+      "          console.log(JSON.stringify({ jsonrpc: '2.0', id: req.id, result: { stopReason: 'end_turn' } }));",
+      "        }",
+      "      };",
+      "      rl.on('line', onPerm);",
+      "      console.log(JSON.stringify({ jsonrpc: '2.0', id: editPermId, method: 'session/request_permission', params: { toolCall: { kind: 'edit', name: 'edit_file', title: 'Edit a.txt' }, options: [{ kind: 'allow_once', optionId: 'allow_once' }, { kind: 'reject_once', optionId: 'reject_once' }] } }));",
+      "      console.log(JSON.stringify({ jsonrpc: '2.0', id: readPermId, method: 'session/request_permission', params: { toolCall: { kind: 'read', name: 'read_file', title: 'Read a.txt' }, options: [{ kind: 'allow_once', optionId: 'allow_once' }, { kind: 'reject_once', optionId: 'reject_once' }] } }));",
       "      return;",
       "    }",
       "    const reply = turn === 1 ? 'hi from ' : turn === 2 ? 'warm turn 2' : turn === 3 ? 'synthetic reply' : 'image ok';",
@@ -457,8 +486,40 @@ test('router server injects variant models, reuses warm ACP worker across turns,
       await new Promise((r) => setTimeout(r, 20));
     }
     const afterQueueMsgs = await (await fetch(`${gwBase}/api/session/ses_test/message`)).json();
-    assert.ok(afterQueueMsgs.data.some((m) => m.type === 'assistant' && m.content?.some((p) => p.type === 'text' && p.text === 'slow done')));
-    assert.ok(afterQueueMsgs.data.some((m) => m.type === 'assistant' && m.content?.some((p) => p.type === 'text' && p.text === 'queued done')));
+    assert.ok(afterQueueMsgs.data.some((m) => m.type === 'assistant' && m.finish === 'tool-calls' && m.content?.some((p) => p.type === 'tool' && p.id === 'call_slow_1')));
+    assert.ok(afterQueueMsgs.data.some((m) => m.type === 'assistant' && m.finish === 'stop' && m.content?.some((p) => p.type === 'text' && p.text === 'slow done')));
+    assert.ok(afterQueueMsgs.data.some((m) => m.type === 'assistant' && m.finish === 'stop' && m.content?.some((p) => p.type === 'text' && p.text === 'queued done')));
+
+    // 5g. Switch session agent to `plan` -> emits session.agent.selected, respawns without --dangerously-skip-permissions, sends session/set_mode(plan) & Plan directive
+    const idleCountBeforePlan = received.filter((e) => e.type === 'session.idle').length;
+    const agentRes = await fetch(`${gwBase}/api/session/ses_test/agent`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-opencode-directory': 'E:/proj' },
+      body: JSON.stringify({ agent: 'plan' }),
+    });
+    assert.equal(agentRes.status, 204);
+    assert.equal(store.getSession('ses_test')?.agent, 'plan');
+    deadline = Date.now() + 2000;
+    while (!received.some((e) => e.type === 'session.agent.selected' && e.data?.agent === 'plan') && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 15));
+    }
+    const agentEvt = received.find((e) => e.type === 'session.agent.selected' && e.data?.agent === 'plan');
+    assert.ok(agentEvt, 'Switching to plan mode must emit session.agent.selected');
+
+    await fetch(`${gwBase}/api/session/ses_test/prompt`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-opencode-directory': 'E:/proj' },
+      body: JSON.stringify({ id: 'msg_u_plan', text: 'plan mode check' }),
+    });
+    deadline = Date.now() + 4000;
+    while (received.filter((e) => e.type === 'session.idle').length < idleCountBeforePlan + 1 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    const planMsgs = await (await fetch(`${gwBase}/api/session/ses_test/message`)).json();
+    assert.ok(planMsgs.data.some((m) => m.type === 'assistant' && m.content?.[0]?.text === 'plan:plan:true:reject_once:allow_once'));
+    const cliArgsLog = JSON.parse(fs.readFileSync(path.join(tempDir, 'cli-args-log.json'), 'utf8'));
+    assert.equal(cliArgsLog[0].includes('--dangerously-skip-permissions'), true);
+    assert.equal(cliArgsLog.at(-1).includes('--dangerously-skip-permissions'), false);
 
     // 6. Verify merged messages endpoint contains upstream + local agy user, synthetic & assistant messages
     const msgs = await (await fetch(`${gwBase}/api/session/ses_test/message`)).json();

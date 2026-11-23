@@ -73,6 +73,9 @@ test('AgyTurnTranslator maps ACP thought, tool, text delta, usage_update, and pr
     'session.tool.input.started',
     'session.tool.called',
     'session.tool.success',
+    'session.step.ended',
+    'session.step.started',
+    'session.step.first-token',
     'session.text.started',
     'session.text.delta',
     'session.text.delta',
@@ -84,6 +87,27 @@ test('AgyTurnTranslator maps ACP thought, tool, text delta, usage_update, and pr
   ]);
   assert.equal(events[0].location.directory, 'E:/proj');
 
+  const step1Ended = events.find((e) => e.type === 'session.step.ended' && e.data.finish === 'tool-calls');
+  assert.ok(step1Ended);
+  assert.equal(step1Ended.data.assistantMessageID, 'msg_a1');
+
+  const step2Started = events.filter((e) => e.type === 'session.step.started')[1];
+  assert.equal(step2Started.data.assistantMessageID, 'msg_a1_s02');
+
+  const allMsgs = tr.toAssistantMessages();
+  assert.equal(allMsgs.length, 2);
+  assert.equal(allMsgs[0].id, 'msg_a1');
+  assert.equal(allMsgs[0].finish, 'tool-calls');
+  assert.deepEqual(
+    allMsgs[0].content.map((c) => c.type),
+    ['reasoning', 'tool'],
+  );
+  assert.equal(allMsgs[0].content[0].text, 'Plan first.');
+  assert.equal(allMsgs[0].content[1].state.status, 'completed');
+
+  assert.equal(msg.id, 'msg_a1_s02');
+  assert.equal(msg.finish, 'stop');
+  assert.ok(msg.time.created > allMsgs[0].time.created);
   assert.equal(msg.model.providerID, 'agy-cli');
   assert.equal(msg.model.id, 'gemini-4-hydrogen-high');
   assert.equal(msg.tokens.total, 21161);
@@ -93,11 +117,9 @@ test('AgyTurnTranslator maps ACP thought, tool, text delta, usage_update, and pr
   assert.equal(msg.tokens.cache.read, 5);
   assert.deepEqual(
     msg.content.map((c) => c.type),
-    ['reasoning', 'tool', 'text'],
+    ['text'],
   );
-  assert.equal(msg.content[0].text, 'Plan first.');
-  assert.equal(msg.content[1].state.status, 'completed');
-  assert.equal(msg.content[2].text, 'Hello world');
+  assert.equal(msg.content[0].text, 'Hello world');
 });
 
 test('AgyTurnTranslator emits interrupted events on cancelled ACP stopReason or user cancel', () => {
@@ -201,17 +223,20 @@ test('AgyTurnTranslator unwraps call_mcp_tool OpenChamber calls and accumulates 
   });
 });
 
-test('AgyTurnTranslator interleaves multiple reasoning, tool, and text segments cleanly', () => {
+test('AgyTurnTranslator splits multi-step tool turns into OpenCode assistant step messages and isolates pre-tool prose', () => {
   const events = [];
+  const settled = [];
   const tr = new AgyTurnTranslator({
     sessionID: 'ses_r',
     assistantMessageID: 'msg_r1',
     modelID: 'gemini-4-hydrogen-high',
     emit: (ev) => events.push(ev),
+    onStepSettled: (m) => settled.push(m),
   });
 
   tr.begin();
   tr.handleAcpUpdate({ sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'Plan tool read first.' } });
+  tr.handleAcpUpdate({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Checking a.txt...' } });
   tr.handleAcpUpdate({
     sessionUpdate: 'tool_call',
     toolCallId: 'call_r1',
@@ -230,13 +255,198 @@ test('AgyTurnTranslator interleaves multiple reasoning, tool, and text segments 
   tr.handleAcpUpdate({ sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'Summarize file content.' } });
   tr.handleAcpUpdate({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Done.' } });
 
+  const inFlightMid = tr.toInFlightAssistantMessages();
+  assert.equal(inFlightMid.length, 2);
+  assert.equal(inFlightMid[0].id, 'msg_r1');
+  assert.equal(inFlightMid[0].finish, 'tool-calls');
+  assert.equal(inFlightMid[1].id, 'msg_r1_s02');
+  assert.equal(inFlightMid[1].finish, undefined);
+  assert.equal(inFlightMid[1].content[1].text, 'Done.');
+
   const msg = tr.completeFromPromptResult({ stopReason: 'end_turn' });
+  const msgs = tr.toAssistantMessages();
+  assert.equal(msgs.length, 2);
+  assert.equal(settled.length, 1);
+  assert.equal(settled[0].id, 'msg_r1');
+  assert.equal(msgs[0].finish, 'tool-calls');
+  assert.deepEqual(
+    msgs[0].content.map((c) => c.type),
+    ['reasoning', 'text', 'tool'],
+  );
+  assert.equal(msgs[0].content[0].text, 'Plan tool read first.');
+  assert.equal(msgs[0].content[1].text, 'Checking a.txt...');
+
+  assert.equal(msg.id, 'msg_r1_s02');
+  assert.equal(msg.finish, 'stop');
   assert.deepEqual(
     msg.content.map((c) => c.type),
-    ['reasoning', 'tool', 'reasoning', 'text'],
+    ['reasoning', 'text'],
   );
-  assert.equal(msg.content[0].text, 'Plan tool read first.');
-  assert.equal(msg.content[2].text, 'Summarize file content.');
-  assert.equal(msg.content[3].text, 'Done.');
+  assert.equal(msg.content[0].text, 'Summarize file content.');
+  assert.equal(msg.content[1].text, 'Done.');
   assert.equal(events.filter((e) => e.type === 'session.reasoning.ended').length, 2);
+});
+
+test('AgyTurnTranslator keeps parallel tools in one step and avoids trailing empty step when turn ends after tools', () => {
+  const events = [];
+  const tr = new AgyTurnTranslator({
+    sessionID: 'ses_par',
+    assistantMessageID: 'msg_par',
+    modelID: 'gemini-4-hydrogen-high',
+    emit: (ev) => events.push(ev),
+  });
+
+  tr.begin();
+  tr.handleAcpUpdate({
+    sessionUpdate: 'tool_call',
+    toolCallId: 'call_p1',
+    name: 'read_file',
+    rawInput: { Path: 'a.txt' },
+    status: 'in_progress',
+  });
+  tr.handleAcpUpdate({
+    sessionUpdate: 'tool_call',
+    toolCallId: 'call_p2',
+    name: 'read_file',
+    rawInput: { Path: 'b.txt' },
+    status: 'in_progress',
+  });
+  tr.handleAcpUpdate({
+    sessionUpdate: 'tool_call_update',
+    toolCallId: 'call_p1',
+    name: 'read_file',
+    rawInput: { Path: 'a.txt' },
+    status: 'completed',
+    rawOutput: 'A',
+  });
+  assert.equal(events.filter((e) => e.type === 'session.step.started').length, 1);
+
+  tr.handleAcpUpdate({
+    sessionUpdate: 'tool_call_update',
+    toolCallId: 'call_p2',
+    name: 'read_file',
+    rawInput: { Path: 'b.txt' },
+    status: 'completed',
+    rawOutput: 'B',
+  });
+
+  const finalMsg = tr.completeFromPromptResult({ stopReason: 'end_turn' });
+  const msgs = tr.toAssistantMessages();
+  assert.equal(msgs.length, 1);
+  assert.equal(finalMsg.finish, 'stop');
+  assert.deepEqual(
+    finalMsg.content.map((c) => c.type),
+    ['tool', 'tool'],
+  );
+});
+
+test('AgyTurnTranslator routes cross-step subagent completion back to the originating step message', () => {
+  const events = [];
+  const settled = [];
+  const tr = new AgyTurnTranslator({
+    sessionID: 'ses_sub_cross',
+    assistantMessageID: 'msg_sc',
+    modelID: 'gemini-4-hydrogen-high',
+    emit: (ev) => events.push(ev),
+    onStepSettled: (m) => settled.push(m),
+  });
+
+  tr.begin();
+  tr.handleAcpUpdate({
+    sessionUpdate: 'tool_call',
+    toolCallId: 'call_sub_1',
+    name: 'invoke_subagent',
+    rawInput: { TypeName: 'research', Role: 'Scout', Prompt: 'Scan' },
+    status: 'in_progress',
+  });
+  tr.handleAcpUpdate({
+    sessionUpdate: 'tool_call_update',
+    toolCallId: 'call_sub_1',
+    name: 'invoke_subagent',
+    rawInput: { TypeName: 'research', Role: 'Scout', Prompt: 'Scan' },
+    status: 'completed',
+  });
+  assert.equal(tr.attachDiscoveredSubagent('agy_sub_cross_1'), true);
+
+  // Parent moves on to step 2 while subagent is still running
+  tr.handleAcpUpdate({
+    sessionUpdate: 'agent_message_chunk',
+    content: { type: 'text', text: 'Working on next step...' },
+  });
+
+  const mid = tr.toInFlightAssistantMessages();
+  assert.equal(mid.length, 2);
+  assert.equal(mid[0].id, 'msg_sc');
+  assert.equal(mid[0].content[0].state.status, 'running');
+  assert.equal(mid[1].id, 'msg_sc_s02');
+
+  // Subagent resolves while parent is in step 2
+  assert.equal(tr.resolveSubagent('agy_sub_cross_1', { state: 'completed', output: 'Done scan' }), true);
+  const subSuccess = events.find((e) => e.type === 'session.tool.success' && e.data.id === 'call_sub_1');
+  assert.equal(subSuccess.data.assistantMessageID, 'msg_sc');
+  assert.equal(settled.at(-1).id, 'msg_sc');
+  assert.equal(settled.at(-1).content[0].state.status, 'completed');
+
+  tr.completeFromPromptResult({ stopReason: 'end_turn' });
+  const msgs = tr.toAssistantMessages();
+  assert.equal(msgs.length, 2);
+  assert.equal(msgs[0].content[0].name, 'subagent');
+  assert.equal(msgs[1].content[0].text, 'Working on next step...');
+});
+
+test('AgyTurnTranslator preserves openchamber_render answer metadata even when ACP duplicates rawOutput and MCP content', () => {
+  const events = [];
+  const tr = new AgyTurnTranslator({
+    sessionID: 'ses_oc_render',
+    assistantMessageID: 'msg_oc_r1',
+    modelID: 'gemini-4-hydrogen-high',
+    emit: (ev) => events.push(ev),
+  });
+
+  const renderEnvelope = {
+    schemaVersion: 1,
+    ok: true,
+    action: 'render.page',
+    data: {
+      title: 'Timing choice',
+      answer: {
+        answered: true,
+        summary: 'Sync mask fade',
+        data: { button: 'Send', values: { timing: 'Sync mask fade' } },
+      },
+    },
+  };
+  const jsonStr = JSON.stringify(renderEnvelope);
+
+  tr.begin();
+  tr.handleAcpUpdate({
+    sessionUpdate: 'tool_call',
+    toolCallId: 'call_oc_1',
+    name: 'call_mcp_tool',
+    rawInput: {
+      ServerName: 'openchamber',
+      ToolName: 'openchamber_render',
+      Arguments: JSON.stringify({ action: 'render.page', ui: 'root = Stack([])', awaitAnswer: true, title: 'Timing choice' }),
+    },
+    status: 'in_progress',
+  });
+  tr.handleAcpUpdate({
+    sessionUpdate: 'tool_call_update',
+    toolCallId: 'call_oc_1',
+    status: 'completed',
+    rawOutput: { content: [{ type: 'text', text: jsonStr }] },
+    content: [{ type: 'content', content: { type: 'text', text: jsonStr } }],
+  });
+
+  const msg = tr.completeFromPromptResult({ stopReason: 'end_turn' });
+  const successEvt = events.find((e) => e.type === 'session.tool.success' && e.data.id === 'call_oc_1');
+  assert.ok(successEvt);
+  assert.deepEqual(successEvt.data.metadata?.openchamber, {
+    schemaVersion: 1,
+    action: 'render.page',
+    description: 'Timing choice',
+    ok: true,
+    answer: renderEnvelope.data.answer,
+  });
+  assert.deepEqual(msg.content[0].state.metadata?.openchamber, successEvt.data.metadata.openchamber);
 });

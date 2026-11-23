@@ -90,19 +90,227 @@ function resolveCanonicalToolName(roleKey, fallbackName, contract) {
   return candidate;
 }
 
+const DIFF_CONTEXT_LINES = 3;
+const MAX_MYERS_CELLS = 2_500_000;
+const MAX_MYERS_D = 2000;
+
+function computeLineEditOps(oldMid, newMid) {
+  const n = oldMid.length;
+  const m = newMid.length;
+  if (n === 0) return newMid.map((line) => ({ op: '+', line }));
+  if (m === 0) return oldMid.map((line) => ({ op: '-', line }));
+
+  // Myers shortest edit script over trimmed middle slice; falls back to block replace on huge rewrites.
+  if (n * m <= MAX_MYERS_CELLS) {
+    const maxD = Math.min(MAX_MYERS_D, n + m);
+    const offset = maxD;
+    const v = new Int32Array(2 * maxD + 1);
+    const trace = [];
+    for (let d = 0; d <= maxD; d += 1) {
+      trace.push(new Int32Array(v));
+      for (let k = -d; k <= d; k += 2) {
+        const idx = k + offset;
+        let x;
+        if (k === -d || (k !== d && v[idx - 1] < v[idx + 1])) {
+          x = v[idx + 1];
+        } else {
+          x = v[idx - 1] + 1;
+        }
+        let y = x - k;
+        while (x < n && y < m && oldMid[x] === newMid[y]) {
+          x += 1;
+          y += 1;
+        }
+        v[idx] = x;
+        if (x >= n && y >= m) {
+          const ops = [];
+          let curX = n;
+          let curY = m;
+          for (let step = d; step > 0; step -= 1) {
+            const prevV = trace[step];
+            const kCur = curX - curY;
+            const kIdx = kCur + offset;
+            const moveDown = kCur === -step || (kCur !== step && prevV[kIdx - 1] < prevV[kIdx + 1]);
+            const prevK = moveDown ? kCur + 1 : kCur - 1;
+            const prevX = prevV[prevK + offset];
+            const prevY = prevX - prevK;
+            while (curX > prevX && curY > prevY) {
+              curX -= 1;
+              curY -= 1;
+              ops.push({ op: ' ', line: oldMid[curX] });
+            }
+            if (moveDown) {
+              curY -= 1;
+              ops.push({ op: '+', line: newMid[curY] });
+            } else {
+              curX -= 1;
+              ops.push({ op: '-', line: oldMid[curX] });
+            }
+          }
+          while (curX > 0 && curY > 0) {
+            curX -= 1;
+            curY -= 1;
+            ops.push({ op: ' ', line: oldMid[curX] });
+          }
+          ops.reverse();
+          return ops;
+        }
+      }
+    }
+  }
+
+  return [
+    ...oldMid.map((line) => ({ op: '-', line })),
+    ...newMid.map((line) => ({ op: '+', line })),
+  ];
+}
+
 function buildEditDiff(filePath, oldText, newText) {
   if (typeof oldText !== 'string' && typeof newText !== 'string') return '';
+  const hasOld = typeof oldText === 'string';
+  const hasNew = typeof newText === 'string';
+  if (hasOld && hasNew && oldText === newText) return '';
+
   const safePath = String(filePath || 'file').replace(/\\/g, '/');
-  const oldLines = typeof oldText === 'string' ? oldText.split(/\r?\n/) : [];
-  const newLines = typeof newText === 'string' ? newText.split(/\r?\n/) : [];
-  const body = [
-    `--- a/${safePath}`,
-    `+++ b/${safePath}`,
-    `@@ -1,${oldLines.length} +1,${newLines.length} @@`,
-    ...oldLines.map((l) => `-${l}`),
-    ...newLines.map((l) => `+${l}`),
-  ];
-  return body.join('\n');
+  const oldLines = hasOld && oldText.length > 0 ? oldText.replace(/\r\n/g, '\n').split('\n') : [];
+  const newLines = hasNew && newText.length > 0 ? newText.replace(/\r\n/g, '\n').split('\n') : [];
+
+  if (oldLines.length === 0 && newLines.length === 0) return '';
+  if (oldLines.length === 0) {
+    return {
+      patch: [
+        '--- /dev/null',
+        `+++ b/${safePath}`,
+        `@@ -0,0 +1,${newLines.length} @@`,
+        ...newLines.map((l) => `+${l}`),
+      ].join('\n'),
+      additions: newLines.length,
+      deletions: 0,
+    };
+  }
+  if (newLines.length === 0) {
+    return {
+      patch: [
+        `--- a/${safePath}`,
+        '+++ /dev/null',
+        `@@ -1,${oldLines.length} +0,0 @@`,
+        ...oldLines.map((l) => `-${l}`),
+      ].join('\n'),
+      additions: 0,
+      deletions: oldLines.length,
+    };
+  }
+
+  let prefix = 0;
+  const minLen = Math.min(oldLines.length, newLines.length);
+  while (prefix < minLen && oldLines[prefix] === newLines[prefix]) {
+    prefix += 1;
+  }
+  let suffix = 0;
+  while (
+    suffix < minLen - prefix &&
+    oldLines[oldLines.length - 1 - suffix] === newLines[newLines.length - 1 - suffix]
+  ) {
+    suffix += 1;
+  }
+
+  if (prefix + suffix >= oldLines.length && prefix + suffix >= newLines.length) {
+    return '';
+  }
+
+  const oldMid = oldLines.slice(prefix, oldLines.length - suffix);
+  const newMid = newLines.slice(prefix, newLines.length - suffix);
+  const midOps = computeLineEditOps(oldMid, newMid);
+
+  // Reconstruct full op list only across [prefixStart .. midEnd + context] with exact 1-based line coordinates
+  const fullOps = [];
+  for (let i = 0; i < prefix; i += 1) {
+    fullOps.push({ op: ' ', line: oldLines[i], oldLine: i + 1, newLine: i + 1 });
+  }
+  let oldCursor = prefix + 1;
+  let newCursor = prefix + 1;
+  for (const item of midOps) {
+    if (item.op === ' ') {
+      fullOps.push({ op: ' ', line: item.line, oldLine: oldCursor, newLine: newCursor });
+      oldCursor += 1;
+      newCursor += 1;
+    } else if (item.op === '-') {
+      fullOps.push({ op: '-', line: item.line, oldLine: oldCursor, newLine: newCursor });
+      oldCursor += 1;
+    } else {
+      fullOps.push({ op: '+', line: item.line, oldLine: oldCursor, newLine: newCursor });
+      newCursor += 1;
+    }
+  }
+  for (let i = oldLines.length - suffix; i < oldLines.length; i += 1) {
+    fullOps.push({ op: ' ', line: oldLines[i], oldLine: oldCursor, newLine: newCursor });
+    oldCursor += 1;
+    newCursor += 1;
+  }
+
+  // Build unified hunks grouping nearby changes within 2 * DIFF_CONTEXT_LINES
+  const changeIndices = [];
+  for (let i = 0; i < fullOps.length; i += 1) {
+    if (fullOps[i].op !== ' ') changeIndices.push(i);
+  }
+  if (changeIndices.length === 0) return '';
+
+  const hunkLines = [`--- a/${safePath}`, `+++ b/${safePath}`];
+  let additions = 0;
+  let deletions = 0;
+  let groupStart = 0;
+
+  while (groupStart < changeIndices.length) {
+    const startIdx = Math.max(0, changeIndices[groupStart] - DIFF_CONTEXT_LINES);
+    let groupEnd = groupStart;
+    while (
+      groupEnd + 1 < changeIndices.length &&
+      changeIndices[groupEnd + 1] - changeIndices[groupEnd] <= DIFF_CONTEXT_LINES * 2 + 1
+    ) {
+      groupEnd += 1;
+    }
+    const endIdx = Math.min(fullOps.length - 1, changeIndices[groupEnd] + DIFF_CONTEXT_LINES);
+
+    let oldCount = 0;
+    let newCount = 0;
+    let firstOld = null;
+    let firstNew = null;
+    const lines = [];
+    for (let i = startIdx; i <= endIdx; i += 1) {
+      const entry = fullOps[i];
+      if (entry.op === ' ') {
+        if (firstOld === null) firstOld = entry.oldLine;
+        if (firstNew === null) firstNew = entry.newLine;
+        oldCount += 1;
+        newCount += 1;
+        lines.push(` ${entry.line}`);
+      } else if (entry.op === '-') {
+        if (firstOld === null) firstOld = entry.oldLine;
+        if (firstNew === null) firstNew = entry.newLine;
+        oldCount += 1;
+        deletions += 1;
+        lines.push(`-${entry.line}`);
+      } else {
+        if (firstOld === null) firstOld = entry.oldLine;
+        if (firstNew === null) firstNew = entry.newLine;
+        newCount += 1;
+        additions += 1;
+        lines.push(`+${entry.line}`);
+      }
+    }
+
+    const headerOldStart = oldCount === 0 ? Math.max(0, (firstOld ?? 1) - 1) : (firstOld ?? 1);
+    const headerNewStart = newCount === 0 ? Math.max(0, (firstNew ?? 1) - 1) : (firstNew ?? 1);
+    hunkLines.push(`@@ -${headerOldStart},${oldCount} +${headerNewStart},${newCount} @@`);
+    hunkLines.push(...lines);
+    groupStart = groupEnd + 1;
+  }
+
+  return {
+    patch: hunkLines.join('\n'),
+    additions,
+    deletions,
+  };
 }
 
 function buildInlineImageFileItem(filePath) {
@@ -459,6 +667,70 @@ export function normalizeAcpToolInvocation(snapshot, options = {}) {
   };
 }
 
+function tryParseJsonText(text) {
+  if (typeof text !== 'string') return null;
+  const trimmed = text.trim();
+  if (!trimmed || (!trimmed.startsWith('{') && !trimmed.startsWith('['))) return null;
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return null;
+  }
+}
+
+function pushUniqueText(texts, seen, value) {
+  if (typeof value !== 'string') return;
+  const trimmed = value.trim();
+  if (!trimmed || seen.has(trimmed)) return;
+  seen.add(trimmed);
+  texts.push(value);
+}
+
+function unwrapOpenChamberEnvelope(val, depth = 0) {
+  if (depth > 4 || val == null) return null;
+  if (typeof val === 'string') {
+    const parsed = tryParseJsonText(val);
+    return parsed ? unwrapOpenChamberEnvelope(parsed, depth + 1) : null;
+  }
+  if (Array.isArray(val)) {
+    for (const entry of val) {
+      const found = unwrapOpenChamberEnvelope(entry, depth + 1);
+      if (found) return found;
+    }
+    return null;
+  }
+  if (typeof val !== 'object') return null;
+  if (val.schemaVersion === 1 || (typeof val.ok === 'boolean' && (val.action || val.data || val.error))) {
+    return val;
+  }
+  if (typeof val.text === 'string') {
+    const found = unwrapOpenChamberEnvelope(val.text, depth + 1);
+    if (found) return found;
+  }
+  if (val.content !== undefined) {
+    const found = unwrapOpenChamberEnvelope(val.content, depth + 1);
+    if (found) return found;
+  }
+  return null;
+}
+
+/**
+ * Extract structured `{ schemaVersion: 1, ok, action, data }` envelope from an ACP OpenChamber tool update,
+ * handling duplicate `rawOutput` + `content` payloads and MCP `{ content: [{ type: 'text', text }] }` wrappers.
+ * @param {any} update
+ * @param {string} [outputText]
+ */
+export function extractOpenChamberToolPayload(update, outputText) {
+  const direct = unwrapOpenChamberEnvelope(update?.rawOutput);
+  if (direct) return direct;
+  const acpContent = Array.isArray(update?.content) ? update.content : [];
+  for (const item of acpContent) {
+    const found = unwrapOpenChamberEnvelope(item);
+    if (found) return found;
+  }
+  return unwrapOpenChamberEnvelope(outputText);
+}
+
 /**
  * Extract tool output text, metadata (e.g., edit diffs), and inline file/image attachments
  * from an ACP terminal `tool_call_update` payload.
@@ -467,20 +739,27 @@ export function normalizeAcpToolInvocation(snapshot, options = {}) {
  */
 export function buildAcpToolResult(update, normalizedTool) {
   const texts = [];
+  const seenTexts = new Set();
   const diffs = [];
   const files = [];
 
   const rawOutput = update?.rawOutput;
-  if (typeof rawOutput === 'string' && rawOutput.trim()) {
-    texts.push(rawOutput);
+  if (typeof rawOutput === 'string') {
+    pushUniqueText(texts, seenTexts, rawOutput);
   } else if (rawOutput && typeof rawOutput === 'object') {
-    if (typeof rawOutput.output === 'string' && rawOutput.output.trim()) texts.push(rawOutput.output);
-    else if (typeof rawOutput.text === 'string' && rawOutput.text.trim()) texts.push(rawOutput.text);
-    else {
+    if (typeof rawOutput.output === 'string' && rawOutput.output.trim()) {
+      pushUniqueText(texts, seenTexts, rawOutput.output);
+    } else if (typeof rawOutput.text === 'string' && rawOutput.text.trim()) {
+      pushUniqueText(texts, seenTexts, rawOutput.text);
+    } else if (Array.isArray(rawOutput.content) && rawOutput.content.every((c) => c && typeof c.text === 'string')) {
+      for (const c of rawOutput.content) {
+        pushUniqueText(texts, seenTexts, c.text);
+      }
+    } else {
       try {
-        texts.push(JSON.stringify(rawOutput, null, 2));
+        pushUniqueText(texts, seenTexts, JSON.stringify(rawOutput, null, 2));
       } catch {
-        texts.push(String(rawOutput));
+        pushUniqueText(texts, seenTexts, String(rawOutput));
       }
     }
   }
@@ -490,8 +769,15 @@ export function buildAcpToolResult(update, normalizedTool) {
     if (!item || typeof item !== 'object') continue;
     if (item.type === 'diff') {
       const diffPath = item.path || normalizedTool.targetPath || normalizedTool.input?.path;
-      const diffText = buildEditDiff(diffPath, item.oldText, item.newText);
-      if (diffText) diffs.push({ path: diffPath, patch: diffText });
+      const diffResult = buildEditDiff(diffPath, item.oldText, item.newText);
+      if (diffResult && diffResult.patch) {
+        diffs.push({
+          path: diffPath,
+          patch: diffResult.patch,
+          additions: diffResult.additions,
+          deletions: diffResult.deletions,
+        });
+      }
       continue;
     }
     if (item.type === 'image' && typeof item.data === 'string' && item.data) {
@@ -504,10 +790,10 @@ export function buildAcpToolResult(update, normalizedTool) {
       });
       continue;
     }
-    if (typeof item.text === 'string' && item.text.trim()) {
-      texts.push(item.text);
-    } else if (typeof item.content?.text === 'string' && item.content.text.trim()) {
-      texts.push(item.content.text);
+    if (typeof item.text === 'string') {
+      pushUniqueText(texts, seenTexts, item.text);
+    } else if (typeof item.content?.text === 'string') {
+      pushUniqueText(texts, seenTexts, item.content.text);
     } else if (item.content?.type === 'image' && typeof item.content.data === 'string' && item.content.data) {
       const mime = item.content.mimeType || item.content.mime || 'image/png';
       files.push({
@@ -541,16 +827,39 @@ export function buildAcpToolResult(update, normalizedTool) {
   let diffMeta;
   if (diffs.length > 0) {
     diffMeta = diffs.length === 1
-      ? { filediff: { patch: diffs[0].patch, file: diffs[0].path }, diff: diffs[0].patch }
-      : { files: diffs.map((d) => ({ filePath: d.path, patch: d.patch })) };
+      ? {
+          filediff: {
+            patch: diffs[0].patch,
+            file: diffs[0].path,
+            additions: diffs[0].additions,
+            deletions: diffs[0].deletions,
+          },
+          diff: diffs[0].patch,
+        }
+      : {
+          files: diffs.map((d) => ({
+            filePath: d.path,
+            patch: d.patch,
+            additions: d.additions,
+            deletions: d.deletions,
+          })),
+        };
   } else if (
     normalizedTool.name === 'edit' &&
     typeof normalizedTool.input?.oldString === 'string' &&
     typeof normalizedTool.input?.newString === 'string'
   ) {
-    const patch = buildEditDiff(normalizedTool.input.path, normalizedTool.input.oldString, normalizedTool.input.newString);
-    if (patch) {
-      diffMeta = { filediff: { patch, file: normalizedTool.input.path }, diff: patch };
+    const diffResult = buildEditDiff(normalizedTool.input.path, normalizedTool.input.oldString, normalizedTool.input.newString);
+    if (diffResult && diffResult.patch) {
+      diffMeta = {
+        filediff: {
+          patch: diffResult.patch,
+          file: normalizedTool.input.path,
+          additions: diffResult.additions,
+          deletions: diffResult.deletions,
+        },
+        diff: diffResult.patch,
+      };
     }
   }
 

@@ -4,7 +4,11 @@ import { resolveAgyBinary } from '../core/config.mjs';
 import { buildSessionGuidancePrefix, loadOpenChamberToolContract } from '../bridge/openchamber.mjs';
 import { loadMagpieAgyEnv } from './magpie-env.mjs';
 import { AGY_PROVIDER_ID, modelSupportsImageInput, resolveRealAgyModelId } from './models.mjs';
-import { AgyAcpClient } from './acp-client.mjs';
+import {
+  AgyAcpClient,
+  buildDefaultPermissionAllowResult,
+  buildDefaultPermissionRejectResult,
+} from './acp-client.mjs';
 import { AgyTurnTranslator, normalizeUsageBuckets } from './event-translator.mjs';
 import {
   AgySubagentWatcher,
@@ -27,6 +31,23 @@ import {
 const DEFAULT_WORKER_IDLE_MS = 15 * 60_000;
 const CANCEL_FORCE_KILL_DELAY_MS = 3_000;
 const EFFORT_SUFFIX_RE = /^(.+)-(low|medium|high|xhigh|max)$/;
+const PLAN_MODE_DIRECTIVE =
+  '[Mode: Plan — Read-only planning mode is active. Inspect and analyze only; do NOT edit, create, or delete files or execute state-changing commands. Present your plan or ask clarifying questions.]';
+const PLAN_BLOCKED_TOOL_KINDS = new Set(['edit', 'delete', 'move', 'execute']);
+const PLAN_BLOCKED_TOOL_RE = /\b(write_file|write_to_file|edit_file|replace_file_content|multi_replace_file_content|delete_file|run_command|execute_command|shell|bash|write|edit)\b/i;
+
+function isPlanAgent(agent) {
+  return String(agent || '').trim().toLowerCase() === 'plan';
+}
+
+function isPlanBlockedPermissionRequest(params) {
+  const toolCall = params?.toolCall;
+  if (!toolCall || typeof toolCall !== 'object') return false;
+  const kind = String(toolCall.kind || '').trim().toLowerCase();
+  if (PLAN_BLOCKED_TOOL_KINDS.has(kind)) return true;
+  const label = `${toolCall.name || ''} ${toolCall.title || ''} ${toolCall.toolCallId || ''}`;
+  return PLAN_BLOCKED_TOOL_RE.test(label);
+}
 const IMAGE_EXT_MIME = new Map([
   ['.png', 'image/png'],
   ['.jpg', 'image/jpeg'],
@@ -208,6 +229,24 @@ export class AgyRunner {
   }
 
   /**
+   * Return all step messages (settled prior steps + current in-flight step) for an active turn
+   * so `GET /api/session/:id/message` stays aligned across multi-step tool turns.
+   * @param {string} sessionID
+   */
+  getInFlightAssistantMessages(sessionID) {
+    const starting = this.startingSessions.get(sessionID);
+    if (starting?.translator?.toInFlightAssistantMessages) {
+      return starting.translator.toInFlightAssistantMessages();
+    }
+    const worker = this.workers.get(sessionID);
+    if (worker?.busy && worker.turn?.translator?.toInFlightAssistantMessages) {
+      return worker.turn.translator.toInFlightAssistantMessages();
+    }
+    const single = this.getInFlightAssistantMessage(sessionID);
+    return single ? [single] : [];
+  }
+
+  /**
    * Queue a follow-up turn payload when the session is currently busy.
    * @param {string} sessionID
    * @param {{ messageID?: string, modelID: string, variant?: string, directory?: string | null, promptPayload: any }} item
@@ -348,6 +387,7 @@ export class AgyRunner {
       sessionID,
       modelID: next.modelID,
       variant: next.variant,
+      agent: next.agent,
       directory: next.directory,
       promptPayload: next.promptPayload,
     });
@@ -455,12 +495,15 @@ export class AgyRunner {
   /**
    * Build ACP `session/prompt` content blocks (`text` + native `image` blocks).
    * @param {{ text?: string, files?: any[], skills?: any[] }} payload
-   * @param {{ syntheticTexts?: string[], guidancePrefix?: string | null, allowImages?: boolean }} [options]
+   * @param {{ syntheticTexts?: string[], guidancePrefix?: string | null, agent?: string, allowImages?: boolean }} [options]
    */
   buildPromptBlocks(payload, options = {}) {
     const sections = [];
     if (options.guidancePrefix) {
       sections.push(options.guidancePrefix);
+    }
+    if (isPlanAgent(options.agent)) {
+      sections.push(PLAN_MODE_DIRECTIVE);
     }
     if (Array.isArray(options.syntheticTexts) && options.syntheticTexts.length > 0) {
       sections.push(options.syntheticTexts.join('\n\n'));
@@ -530,7 +573,7 @@ export class AgyRunner {
 
   /**
    * Build child environment and base CLI flags for `agy acp`.
-   * @param {{ sessionID?: string, cwd?: string, callLogPath?: string }} opts
+   * @param {{ sessionID?: string, cwd?: string, callLogPath?: string, planMode?: boolean }} opts
    */
   _buildAgySpawnConfig(opts = {}) {
     const agyBin = resolveAgyBinary(this.env);
@@ -552,11 +595,12 @@ export class AgyRunner {
       delete childEnv.GOOGLE_GEMINI_BASE_URL;
     }
 
-    if (this.env.AGY_ROUTER_AGY_AUTO_APPROVE !== '0') {
+    const skipPermissions = this.env.AGY_ROUTER_AGY_AUTO_APPROVE !== '0' && !opts.planMode;
+    if (skipPermissions) {
       args.push('--dangerously-skip-permissions');
     }
 
-    return { agyBin, childEnv, args };
+    return { agyBin, childEnv, args, skipPermissions };
   }
 
   /**
@@ -703,14 +747,44 @@ export class AgyRunner {
   }
 
   /**
+   * Apply session execution mode (`plan`, `accept-edits`, `default`) via ACP `session/set_mode`.
+   * @param {AgyAcpClient} client
+   * @param {string} acpSessionId
+   * @param {'plan' | 'accept-edits' | 'default'} modeId
+   */
+  async _applySessionMode(client, acpSessionId, modeId) {
+    if (!acpSessionId || !modeId) return;
+    try {
+      await client.request('session/set_mode', { sessionId: acpSessionId, modeId }, 5_000);
+      return;
+    } catch {
+      // Fall back to config option update on older ACP servers
+    }
+    try {
+      await client.request(
+        'session/set_config_option',
+        {
+          sessionId: acpSessionId,
+          configId: 'mode',
+          value: modeId,
+        },
+        5_000,
+      );
+    } catch {
+      // Optional when ACP mock/binary does not advertise mode config
+    }
+  }
+
+  /**
    * Spawn and initialize a session-scoped `agy acp` worker.
-   * @param {{ sessionID: string, cwd: string, callLogPath: string, existingConvId: string | null }} opts
+   * @param {{ sessionID: string, cwd: string, callLogPath: string, existingConvId: string | null, planMode?: boolean, onClientCreated?: (c: AgyAcpClient) => void }} opts
    */
   async _spawnAndInitWorker(opts) {
     const cfg = this._buildAgySpawnConfig({
       sessionID: opts.sessionID,
       cwd: opts.cwd,
       callLogPath: opts.callLogPath,
+      planMode: opts.planMode,
     });
     if (!cfg) return null;
 
@@ -720,6 +794,17 @@ export class AgyRunner {
       args: cfg.args,
       cwd: opts.cwd,
       env: cfg.childEnv,
+      onPermissionRequest: (params) => {
+        const mode = worker?.permissionMode || (opts.planMode ? 'plan' : 'build');
+        if (mode === 'plan') {
+          return isPlanBlockedPermissionRequest(params)
+            ? buildDefaultPermissionRejectResult(params)
+            : buildDefaultPermissionAllowResult(params);
+        }
+        return this.env.AGY_ROUTER_AGY_AUTO_APPROVE !== '0'
+          ? buildDefaultPermissionAllowResult(params)
+          : buildDefaultPermissionRejectResult(params);
+      },
       onNotification: (method, params) => {
         if (method !== 'session/update' || !worker?.turn) return;
         const update = params?.update;
@@ -758,7 +843,11 @@ export class AgyRunner {
       client,
       acpSessionId: '',
       cwd: opts.cwd,
+      skipPermissions: Boolean(cfg.skipPermissions),
+      permissionMode: opts.planMode ? 'plan' : 'build',
+      availableModes: new Set(),
       appliedModelKey: null,
+      appliedModeId: null,
       busy: false,
       exited: false,
       interrupted: false,
@@ -809,6 +898,11 @@ export class AgyRunner {
       }
 
       worker.acpSessionId = String(sessionResult.sessionId || '');
+      const rawModes = Array.isArray(sessionResult?.modes?.availableModes) ? sessionResult.modes.availableModes : [];
+      worker.availableModes = new Set(rawModes.map((m) => m?.id).filter((id) => typeof id === 'string' && id));
+      if (typeof sessionResult?.modes?.currentModeId === 'string' && sessionResult.modes.currentModeId) {
+        worker.appliedModeId = sessionResult.modes.currentModeId;
+      }
       if (worker.acpSessionId) {
         this.store.setAgyConversationId(opts.sessionID, worker.acpSessionId);
       }
@@ -849,8 +943,7 @@ export class AgyRunner {
     } else if (payload && typeof payload === 'object') {
       if (
         activeTurn.checkpointSummary
-        && activeTurn.translator.content.length === 0
-        && !activeTurn.translator.openStream
+        && !activeTurn.translator.hasAnyContent()
       ) {
         activeTurn.translator._appendStreamDelta('text', activeTurn.checkpointSummary);
       }
@@ -859,15 +952,21 @@ export class AgyRunner {
       assistantMsg = activeTurn.translator.complete();
     }
 
-    if (assistantMsg) {
-      this.store.upsertMessage(activeTurn.sessionID, assistantMsg);
+    const stepMessages = activeTurn.translator.toAssistantMessages?.() || [];
+    const messagesToPersist = stepMessages.length > 0 ? stepMessages : assistantMsg ? [assistantMsg] : [];
+    for (const stepMsg of messagesToPersist) {
+      this.store.upsertMessage(activeTurn.sessionID, stepMsg);
     }
     if (outcome === 'complete' && assistantMsg && assistantMsg.finish === 'stop') {
-      const assistantText = (assistantMsg.content || [])
-        .filter((p) => p?.type === 'text' && typeof p.text === 'string')
-        .map((p) => p.text)
-        .join('\n')
-        .trim();
+      const extractText = (msg) =>
+        (msg?.content || [])
+          .filter((p) => p?.type === 'text' && typeof p.text === 'string')
+          .map((p) => p.text)
+          .join('\n')
+          .trim();
+      const assistantText =
+        extractText(assistantMsg)
+        || messagesToPersist.map(extractText).filter(Boolean).join('\n').trim();
       this._maybeAutoNameSession({
         sessionID: activeTurn.sessionID,
         modelID: activeTurn.modelID,
@@ -909,6 +1008,15 @@ export class AgyRunner {
     }
 
     const sessionState = this.store.getSession(sessionID);
+    const activeAgent = agent || sessionState?.agent || undefined;
+    const isPlan = isPlanAgent(activeAgent);
+    const wantSkipPermissions = this.env.AGY_ROUTER_AGY_AUTO_APPROVE !== '0' && !isPlan;
+    const targetModeId = isPlan
+      ? 'plan'
+      : this.env.AGY_ROUTER_AGY_AUTO_APPROVE !== '0'
+        ? 'accept-edits'
+        : 'default';
+
     const realModelID = params.realModelID || resolveRealAgyModelId(modelID, variant, { env: this.env });
     const cwd = directory && fs.existsSync(directory) ? directory : process.cwd();
     const safeSession = String(sessionID).replace(/[^a-zA-Z0-9._-]/g, '_');
@@ -920,10 +1028,15 @@ export class AgyRunner {
       assistantMessageID,
       modelID,
       variant,
-      agent,
+      agent: activeAgent,
       directory,
       priorSessionTokens: sessionState?.sessionTokens || null,
       emit: (ev) => this.sseHub.broadcast(ev),
+      onStepSettled: (stepMsg) => {
+        if (stepMsg) {
+          this.store.upsertMessage(sessionID, stepMsg);
+        }
+      },
       onOpenChamberToolStart: ({ tool, callID }) => {
         try {
           fs.appendFileSync(callLogPath, `${JSON.stringify({ tool, callID, ts: Date.now() })}\n`, 'utf8');
@@ -966,6 +1079,7 @@ export class AgyRunner {
       const { blocks } = this.buildPromptBlocks(promptPayload, {
         syntheticTexts,
         guidancePrefix,
+        agent: activeAgent,
         allowImages: modelSupportsImageInput(realModelID),
       });
 
@@ -974,7 +1088,8 @@ export class AgyRunner {
         && existing
         && !existing.exited
         && !existing.busy
-        && existing.cwd === cwd;
+        && existing.cwd === cwd
+        && existing.skipPermissions === wantSkipPermissions;
 
       worker = canReuse ? existing : null;
       if (!worker) {
@@ -987,6 +1102,7 @@ export class AgyRunner {
           cwd,
           callLogPath,
           existingConvId: sessionState?.agyConversationId || null,
+          planMode: isPlan,
           onClientCreated: (client) => {
             startingEntry.client = client;
           },
@@ -1033,12 +1149,20 @@ export class AgyRunner {
       worker.busy = true;
       worker.interrupted = false;
       worker.hadFirstTurn = true;
+      worker.permissionMode = isPlan ? 'plan' : 'build';
       worker.turn = turnState;
 
       const modelKey = `${modelID}|${variant || ''}|${realModelID}`;
       if (worker.appliedModelKey !== modelKey) {
         await this._applySessionModel(worker.client, worker.acpSessionId, realModelID, variant);
         worker.appliedModelKey = modelKey;
+      }
+      const shouldApplyMode =
+        worker.appliedModeId !== targetModeId &&
+        (isPlan || worker.appliedModeId === 'plan' || worker.availableModes?.has(targetModeId));
+      if (shouldApplyMode) {
+        await this._applySessionMode(worker.client, worker.acpSessionId, targetModeId);
+        worker.appliedModeId = targetModeId;
       }
 
       if (startingEntry.aborted || worker.interrupted) {

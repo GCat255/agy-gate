@@ -184,6 +184,18 @@ export class RouterStore {
 
   /**
    * @param {string} sessionID
+   * @param {string | null | undefined} agent
+   */
+  setSessionAgent(sessionID, agent) {
+    const s = this._ensureSession(sessionID);
+    const trimmed = typeof agent === 'string' && agent.trim() ? agent.trim() : null;
+    if (s.agent === trimmed) return;
+    s.agent = trimmed;
+    this._save(sessionID);
+  }
+
+  /**
+   * @param {string} sessionID
    * @param {string} conversationId
    */
   setAgyConversationId(sessionID, conversationId) {
@@ -277,6 +289,10 @@ export class RouterStore {
     const dir = sessionInfo.location?.directory ?? sessionInfo.directory;
     if (dir && !s.directory) {
       s.directory = dir;
+      changed = true;
+    }
+    if (typeof sessionInfo.agent === 'string' && sessionInfo.agent.trim() && !s.agent) {
+      s.agent = sessionInfo.agent.trim();
       changed = true;
     }
     if (typeof sessionInfo.title === 'string' && !isUntitledSessionTitle(sessionInfo.title)) {
@@ -475,6 +491,9 @@ export class RouterStore {
     }
     if (s.activeModel) {
       next.model = s.activeModel;
+    }
+    if (s.agent) {
+      next.agent = s.agent;
     }
     if (s.sessionTokens) {
       next.tokens = s.sessionTokens;

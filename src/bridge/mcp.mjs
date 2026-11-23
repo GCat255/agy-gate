@@ -46,7 +46,15 @@ export function unwrapOpenChamberToolCall(rawName, rawParams) {
     && typeof rawParams.ToolName === 'string'
   ) {
     const innerName = normalizeOpenChamberToolName(rawParams.ToolName);
-    const innerInput = rawParams.Arguments && typeof rawParams.Arguments === 'object' ? rawParams.Arguments : {};
+    let rawArgs = rawParams.Arguments;
+    if (typeof rawArgs === 'string') {
+      try {
+        rawArgs = JSON.parse(rawArgs);
+      } catch {
+        rawArgs = {};
+      }
+    }
+    const innerInput = rawArgs && typeof rawArgs === 'object' ? rawArgs : {};
     return {
       name: innerName,
       input: innerInput,

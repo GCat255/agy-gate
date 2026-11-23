@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   buildAcpToolResult,
+  extractOpenChamberToolPayload,
   mergeAcpToolSnapshot,
   normalizeAcpToolInvocation,
 } from '../src/agy/tool-adapter.mjs';
@@ -184,5 +185,69 @@ describe('tool-adapter OpenChamber normalization & extensibility', () => {
 
     const res = buildAcpToolResult({ content: [{ type: 'content', content: { type: 'text', text: 'ok' } }] }, normalized);
     assert.equal(res.outputText, 'ok');
+  });
+
+  it('produces minimal unified diff hunks instead of whole-file replacement on partial edits', () => {
+    const oldLines = Array.from({ length: 800 }, (_, i) => `line ${i + 1}: original`);
+    const newLines = [...oldLines];
+    newLines[19] = 'line 20: updated one';
+    newLines.splice(500, 1, 'line 501: replaced A', 'line 501b: added B');
+
+    const res = buildAcpToolResult(
+      {
+        content: [
+          {
+            type: 'diff',
+            path: 'Assets/Scripts/PanelBlackMaskTransition.cs',
+            oldText: oldLines.join('\n'),
+            newText: newLines.join('\n'),
+          },
+        ],
+      },
+      normalizeAcpToolInvocation({ name: 'edit_file', rawInput: { TargetFile: 'Assets/Scripts/PanelBlackMaskTransition.cs' } }),
+    );
+
+    assert.ok(res.diffMeta?.filediff?.patch);
+    assert.equal(res.diffMeta.filediff.additions, 3);
+    assert.equal(res.diffMeta.filediff.deletions, 2);
+    const hunkHeaders = res.diffMeta.filediff.patch.match(/^@@ -\d+,\d+ \+\d+,\d+ @@$/gm) || [];
+    assert.equal(hunkHeaders.length, 2);
+    assert.ok(res.diffMeta.filediff.patch.includes('-line 20: original'));
+    assert.ok(res.diffMeta.filediff.patch.includes('+line 20: updated one'));
+    assert.ok(!res.diffMeta.filediff.patch.includes('line 100: original'));
+
+    // New file creation emits /dev/null header
+    const createdRes = buildAcpToolResult(
+      { content: [{ type: 'diff', path: 'src/new.mjs', oldText: '', newText: 'a\nb' }] },
+      normalizeAcpToolInvocation({ name: 'write_file', rawInput: { Path: 'src/new.mjs' } }),
+    );
+    assert.equal(createdRes.diffMeta.filediff.additions, 2);
+    assert.equal(createdRes.diffMeta.filediff.deletions, 0);
+    assert.ok(createdRes.diffMeta.filediff.patch.startsWith('--- /dev/null\n+++ b/src/new.mjs\n@@ -0,0 +1,2 @@'));
+  });
+
+  it('deduplicates rawOutput + content and extracts wrapped OpenChamber tool payloads', () => {
+    const envelope = {
+      schemaVersion: 1,
+      ok: true,
+      action: 'render.page',
+      data: {
+        title: 'Choose timing',
+        answer: { answered: true, summary: 'Option A', data: { button: 'Send', values: { seq: 'Option A' } } },
+      },
+    };
+    const jsonStr = JSON.stringify(envelope);
+    const update = {
+      rawOutput: { content: [{ type: 'text', text: jsonStr }] },
+      content: [{ type: 'content', content: { type: 'text', text: jsonStr } }],
+    };
+    const normalized = normalizeAcpToolInvocation({
+      name: 'mcp__openchamber__openchamber_render',
+      rawInput: { ui: 'root = Stack([])', awaitAnswer: true },
+    });
+    const res = buildAcpToolResult(update, normalized);
+    assert.equal(res.outputText, jsonStr);
+    const extracted = extractOpenChamberToolPayload(update, res.outputText);
+    assert.deepEqual(extracted, envelope);
   });
 });

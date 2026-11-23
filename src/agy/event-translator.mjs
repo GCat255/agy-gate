@@ -1,6 +1,7 @@
 import { AGY_PROVIDER_ID } from './models.mjs';
 import {
   buildAcpToolResult,
+  extractOpenChamberToolPayload,
   mergeAcpToolSnapshot,
   normalizeAcpToolInvocation,
   unwrapToolParamValue,
@@ -95,6 +96,7 @@ export class AgyTurnTranslator {
    *   directory?: string | null,
    *   toolContract?: any,
    *   emit: (event: any) => void,
+   *   onStepSettled?: (msg: any) => void,
    *   onOpenChamberToolStart?: (info: { tool: string, callID: string }) => void,
    *   onSyncSubagents?: () => void,
    *   onSubagentWake?: (info: { recipientId: string }) => void,
@@ -104,13 +106,14 @@ export class AgyTurnTranslator {
    */
   constructor(options) {
     this.sessionID = options.sessionID;
-    this.assistantMessageID = options.assistantMessageID;
+    this.baseAssistantMessageID = options.assistantMessageID;
     this.modelID = options.modelID;
     this.variant = options.variant;
     this.agent = options.agent || 'agy-cli';
     this.directory = options.directory || null;
     this.toolContract = options.toolContract || null;
     this.emit = options.emit;
+    this.onStepSettled = options.onStepSettled;
     this.onOpenChamberToolStart = options.onOpenChamberToolStart;
     this.onSyncSubagents = options.onSyncSubagents;
     this.onSubagentWake = options.onSubagentWake;
@@ -120,22 +123,75 @@ export class AgyTurnTranslator {
     this.created = Date.now();
     this.started = false;
     this.finished = false;
-    this.firstTokenSent = false;
-    this.textOrdinal = 0;
-    this.reasoningOrdinal = 0;
 
-    /** @type {{ kind: 'text'|'reasoning', ordinal: number, buffer: string } | null} */
+    /** @type {{ kind: 'text'|'reasoning', ordinal: number, buffer: string, startedAt: number, step: any } | null} */
     this.openStream = null;
-    /** @type {Map<string, { callID: string, name: string, input: any, startedAt: number, closed: boolean, isOpenChamberTool: boolean }>} */
+    /** @type {Map<string, { callID: string, name: string, rawName: string, input: any, inputJson: string, snapshot: any, normalized: any, startedAt: number, closed: boolean, isOpenChamberTool: boolean, step: any }>} */
     this.activeTools = new Map();
-    /** @type {Array<{ callID: string, input: any, childSessionID: string | null, startedAt: number, notified: boolean, closed: boolean }>} */
+    /** @type {Array<{ callID: string, input: any, childSessionID: string | null, startedAt: number, notified: boolean, acpClosed: boolean, closed: boolean, step: any }>} */
     this.activeSubagents = [];
 
     this.latestWindowUsed = 0;
     this.tokens = emptyTokenBuckets();
     this.sessionTokens = addTokenBuckets(this.priorSessionTokens, emptyTokenBuckets());
     /** @type {any[]} */
-    this.content = [];
+    this.steps = [];
+    this.currentStep = this._createStep(1, this.created);
+    this.steps.push(this.currentStep);
+  }
+
+  get assistantMessageID() {
+    return this.currentStep.id;
+  }
+
+  get content() {
+    return this.currentStep.content;
+  }
+
+  hasAnyContent() {
+    return this.steps.some((step) => step.content.length > 0) || Boolean(this.openStream);
+  }
+
+  _createStep(index, created) {
+    const suffix = index === 1 ? '' : `_s${String(index).padStart(2, '0')}`;
+    return {
+      index,
+      id: `${this.baseAssistantMessageID}${suffix}`,
+      created,
+      firstTokenSent: false,
+      textOrdinal: 0,
+      reasoningOrdinal: 0,
+      hasTools: false,
+      openToolCount: 0,
+      content: [],
+      closed: false,
+      completed: undefined,
+      finish: undefined,
+      error: undefined,
+      tokens: emptyTokenBuckets(),
+      record: null,
+    };
+  }
+
+  _buildStepRecord(step, finishOverride = step.finish, errorOverride = step.error, completedOverride = step.completed) {
+    const finish = finishOverride || 'stop';
+    const completed = completedOverride ?? step.completed ?? Date.now();
+    return {
+      id: step.id,
+      type: 'assistant',
+      time: { created: step.created, completed },
+      agent: this.agent,
+      model: {
+        providerID: AGY_PROVIDER_ID,
+        id: this.modelID,
+        ...(this.variant ? { variant: this.variant } : {}),
+      },
+      finish,
+      ...(errorOverride ? { error: errorOverride } : {}),
+      cost: 0,
+      tokens: step.tokens,
+      content: step.content,
+    };
   }
 
   _location() {
@@ -151,14 +207,10 @@ export class AgyTurnTranslator {
     });
   }
 
-  /** Start the turn and emit execution + step started events. */
-  begin() {
-    if (this.started) return;
-    this.started = true;
-    this._send('session.execution.started', { sessionID: this.sessionID });
+  _emitStepStarted(step) {
     this._send('session.step.started', {
       sessionID: this.sessionID,
-      assistantMessageID: this.assistantMessageID,
+      assistantMessageID: step.id,
       agent: this.agent,
       model: {
         providerID: AGY_PROVIDER_ID,
@@ -168,23 +220,67 @@ export class AgyTurnTranslator {
     });
   }
 
+  /**
+   * Close the current tool-bearing step with `finish: 'tool-calls'` and open a fresh step
+   * when new LLM output arrives after all tools in the current step have completed.
+   */
+  _maybeAdvanceStep() {
+    if (this.finished) return;
+    if (!this.currentStep.hasTools || this.currentStep.openToolCount > 0) return;
+
+    this._closeOpenStream();
+
+    const prevStep = this.currentStep;
+    const settledAt = Math.max(Date.now(), prevStep.created + 1);
+    prevStep.closed = true;
+    prevStep.completed = settledAt;
+    prevStep.finish = 'tool-calls';
+    prevStep.tokens = emptyTokenBuckets();
+    prevStep.record = this._buildStepRecord(prevStep);
+
+    this._send('session.step.ended', {
+      sessionID: this.sessionID,
+      assistantMessageID: prevStep.id,
+      finish: 'tool-calls',
+      cost: 0,
+      tokens: prevStep.tokens,
+    });
+    if (this.onStepSettled) {
+      this.onStepSettled(prevStep.record);
+    }
+
+    const nextStep = this._createStep(this.steps.length + 1, Math.max(Date.now(), settledAt + 1));
+    this.steps.push(nextStep);
+    this.currentStep = nextStep;
+    this._emitStepStarted(nextStep);
+  }
+
+  /** Start the turn and emit execution + step started events. */
+  begin() {
+    if (this.started) return;
+    this.started = true;
+    this._send('session.execution.started', { sessionID: this.sessionID });
+    this._emitStepStarted(this.currentStep);
+  }
+
   _closeOpenStream() {
     const stream = this.openStream;
     if (!stream) return;
     this.openStream = null;
+    const step = stream.step;
     this._send(stream.kind === 'text' ? 'session.text.ended' : 'session.reasoning.ended', {
       sessionID: this.sessionID,
-      assistantMessageID: this.assistantMessageID,
+      assistantMessageID: step.id,
       ordinal: stream.ordinal,
       text: stream.buffer,
     });
     if (stream.kind === 'text') {
-      this.content.push({ type: 'text', text: stream.buffer });
+      step.content.push({ type: 'text', text: stream.buffer });
     } else {
-      this.content.push({
+      step.content.push({
         type: 'reasoning',
         text: stream.buffer,
-        time: { created: this.created, completed: Date.now() },
+        time: { created: stream.startedAt, completed: Date.now() },
       });
     }
   }
@@ -197,11 +293,14 @@ export class AgyTurnTranslator {
   _appendStreamDelta(kind, delta) {
     if (typeof delta !== 'string' || delta.length === 0) return;
 
-    if (!this.firstTokenSent) {
-      this.firstTokenSent = true;
+    this._maybeAdvanceStep();
+
+    const step = this.currentStep;
+    if (!step.firstTokenSent) {
+      step.firstTokenSent = true;
       this._send('session.step.first-token', {
         sessionID: this.sessionID,
-        assistantMessageID: this.assistantMessageID,
+        assistantMessageID: step.id,
       });
     }
 
@@ -210,11 +309,11 @@ export class AgyTurnTranslator {
     }
 
     if (!this.openStream) {
-      const ordinal = kind === 'text' ? this.textOrdinal++ : this.reasoningOrdinal++;
-      this.openStream = { kind, ordinal, buffer: '' };
+      const ordinal = kind === 'text' ? step.textOrdinal++ : step.reasoningOrdinal++;
+      this.openStream = { kind, ordinal, buffer: '', startedAt: Date.now(), step };
       this._send(kind === 'text' ? 'session.text.started' : 'session.reasoning.started', {
         sessionID: this.sessionID,
-        assistantMessageID: this.assistantMessageID,
+        assistantMessageID: step.id,
         ordinal,
       });
     }
@@ -222,7 +321,7 @@ export class AgyTurnTranslator {
     this.openStream.buffer += delta;
     this._send(kind === 'text' ? 'session.text.delta' : 'session.reasoning.delta', {
       sessionID: this.sessionID,
-      assistantMessageID: this.assistantMessageID,
+      assistantMessageID: step.id,
       ordinal: this.openStream.ordinal,
       delta,
     });
@@ -268,7 +367,8 @@ export class AgyTurnTranslator {
   _handleAcpToolEvent(update) {
     this._closeOpenStream();
 
-    const callID = String(update.toolCallId || `call_${this.assistantMessageID}_${this.activeTools.size}`);
+    const step = this.currentStep;
+    const callID = String(update.toolCallId || `call_${step.id}_${this.activeTools.size}`);
     const existingTool = this.activeTools.get(callID);
     const snapshot = mergeAcpToolSnapshot(existingTool?.snapshot, update);
     const status = String(update.status || 'in_progress').toLowerCase();
@@ -284,13 +384,19 @@ export class AgyTurnTranslator {
       ? {
           openchamber: {
             schemaVersion: 1,
-            ...(typeof normalized.input.action === 'string' ? { action: normalized.input.action } : {}),
+            ...(typeof normalized.input?.action === 'string'
+              ? { action: normalized.input.action }
+              : typeof normalized.input?.parameters?.action === 'string'
+                ? { action: normalized.input.parameters.action }
+                : {}),
           },
         }
       : undefined;
 
     let tool = existingTool;
     if (!tool) {
+      step.hasTools = true;
+      step.openToolCount += 1;
       tool = {
         callID,
         name: normalized.name,
@@ -302,6 +408,7 @@ export class AgyTurnTranslator {
         startedAt: Date.now(),
         closed: false,
         isOpenChamberTool: normalized.isOpenChamberTool,
+        step,
       };
       this.activeTools.set(callID, tool);
       if (tool.isOpenChamberTool && this.onOpenChamberToolStart) {
@@ -309,13 +416,13 @@ export class AgyTurnTranslator {
       }
       this._send('session.tool.input.started', {
         sessionID: this.sessionID,
-        assistantMessageID: this.assistantMessageID,
+        assistantMessageID: tool.step.id,
         id: callID,
         name: tool.name,
       });
       this._send('session.tool.called', {
         sessionID: this.sessionID,
-        assistantMessageID: this.assistantMessageID,
+        assistantMessageID: tool.step.id,
         id: callID,
         input: tool.input,
         executed: true,
@@ -326,15 +433,17 @@ export class AgyTurnTranslator {
       tool.normalized = normalized;
       tool.name = normalized.name;
       tool.rawName = normalized.rawName;
+      tool.isOpenChamberTool = normalized.isOpenChamberTool;
       if (nextInputJson !== tool.inputJson) {
         tool.input = normalized.input;
         tool.inputJson = nextInputJson;
         this._send('session.tool.called', {
           sessionID: this.sessionID,
-          assistantMessageID: this.assistantMessageID,
+          assistantMessageID: tool.step.id,
           id: callID,
           input: tool.input,
           executed: true,
+          ...(openchamberStartMeta ? { metadata: openchamberStartMeta } : {}),
         });
       }
     }
@@ -350,6 +459,7 @@ export class AgyTurnTranslator {
     if (!terminal || tool.closed) return;
 
     tool.closed = true;
+    tool.step.openToolCount = Math.max(0, tool.step.openToolCount - 1);
     if (normalized.rawName === 'manage_subagents' && this.onSubagentKilled) {
       const action = String(unwrapToolParamValue(snapshot.rawInput.Action ?? snapshot.rawInput.action) || '').trim();
       if (action === 'kill_all') {
@@ -373,21 +483,31 @@ export class AgyTurnTranslator {
 
     let mergedMeta = diffMeta ? { ...diffMeta } : undefined;
     if (tool.isOpenChamberTool) {
-      let parsedOut = null;
-      try {
-        parsedOut = outputText ? JSON.parse(outputText) : null;
-      } catch {}
+      const parsedOut = extractOpenChamberToolPayload(update, outputText);
       const ok = parsedOut?.schemaVersion === 1 ? Boolean(parsedOut.ok) : !errorMsg;
       const answer = parsedOut?.data?.answer && typeof parsedOut.data.answer === 'object' ? parsedOut.data.answer : undefined;
+      const action =
+        typeof parsedOut?.action === 'string'
+          ? parsedOut.action
+          : typeof tool.input?.action === 'string'
+            ? tool.input.action
+            : typeof tool.input?.parameters?.action === 'string'
+              ? tool.input.parameters.action
+              : undefined;
+      const description =
+        typeof parsedOut?.data?.title === 'string' && parsedOut.data.title.trim()
+          ? parsedOut.data.title.trim()
+          : typeof tool.input?.title === 'string' && tool.input.title.trim()
+            ? tool.input.title.trim()
+            : typeof tool.input?.parameters?.title === 'string' && tool.input.parameters.title.trim()
+              ? tool.input.parameters.title.trim()
+              : undefined;
       mergedMeta = {
         ...mergedMeta,
         openchamber: {
           schemaVersion: 1,
-          ...(typeof parsedOut?.action === 'string'
-            ? { action: parsedOut.action }
-            : typeof tool.input?.action === 'string'
-              ? { action: tool.input.action }
-              : {}),
+          ...(action ? { action } : {}),
+          ...(description ? { description } : {}),
           ok,
           ...(answer ? { answer } : {}),
         },
@@ -397,14 +517,14 @@ export class AgyTurnTranslator {
     if (errorMsg) {
       this._send('session.tool.failed', {
         sessionID: this.sessionID,
-        assistantMessageID: this.assistantMessageID,
+        assistantMessageID: tool.step.id,
         id: tool.callID,
         error: { type: 'unknown', message: errorMsg },
         content: contentItems,
         executed: true,
         ...(mergedMeta ? { metadata: mergedMeta } : {}),
       });
-      this.content.push({
+      tool.step.content.push({
         type: 'tool',
         id: tool.callID,
         name: tool.name,
@@ -421,13 +541,13 @@ export class AgyTurnTranslator {
     } else {
       this._send('session.tool.success', {
         sessionID: this.sessionID,
-        assistantMessageID: this.assistantMessageID,
+        assistantMessageID: tool.step.id,
         id: tool.callID,
         content: contentItems,
         executed: true,
         ...(mergedMeta ? { metadata: mergedMeta } : {}),
       });
-      this.content.push({
+      tool.step.content.push({
         type: 'tool',
         id: tool.callID,
         name: tool.name,
@@ -441,11 +561,23 @@ export class AgyTurnTranslator {
         },
       });
     }
+    this._syncSettledStepRecord(tool.step);
+  }
+
+  _syncSettledStepRecord(step) {
+    if (!step?.closed || !step.record) return;
+    step.record = this._buildStepRecord(step);
+    if (this.onStepSettled) {
+      this.onStepSettled(step.record);
+    }
   }
 
   _handleSubagentToolEvent(callID, parameters, status) {
     let entry = this.activeSubagents.find((s) => s.callID === callID);
     if (!entry) {
+      const step = this.currentStep;
+      step.hasTools = true;
+      step.openToolCount += 1;
       const input = {
         agent: String(unwrapToolParamValue(parameters.TypeName ?? parameters.type_name) || 'subagent'),
         description: String(
@@ -459,27 +591,35 @@ export class AgyTurnTranslator {
         childSessionID: null,
         startedAt: Date.now(),
         notified: false,
+        acpClosed: false,
         closed: false,
+        step,
       };
       this.activeSubagents.push(entry);
 
       this._send('session.tool.input.started', {
         sessionID: this.sessionID,
-        assistantMessageID: this.assistantMessageID,
+        assistantMessageID: step.id,
         id: callID,
         name: 'subagent',
       });
       this._send('session.tool.called', {
         sessionID: this.sessionID,
-        assistantMessageID: this.assistantMessageID,
+        assistantMessageID: step.id,
         id: callID,
         input,
         executed: true,
       });
     }
 
-    if ((status === 'completed' || status === 'failed' || status === 'error') && this.onSyncSubagents) {
-      this.onSyncSubagents();
+    if (status === 'completed' || status === 'failed' || status === 'error') {
+      if (!entry.acpClosed) {
+        entry.acpClosed = true;
+        entry.step.openToolCount = Math.max(0, entry.step.openToolCount - 1);
+      }
+      if (this.onSyncSubagents) {
+        this.onSyncSubagents();
+      }
     }
   }
 
@@ -495,7 +635,7 @@ export class AgyTurnTranslator {
     entry.childSessionID = childSessionID;
     this._send('session.tool.progress', {
       sessionID: this.sessionID,
-      assistantMessageID: this.assistantMessageID,
+      assistantMessageID: entry.step.id,
       id: entry.callID,
       metadata: { sessionID: childSessionID },
     });
@@ -514,6 +654,10 @@ export class AgyTurnTranslator {
     if (!entry) return false;
 
     entry.closed = true;
+    if (!entry.acpClosed) {
+      entry.acpClosed = true;
+      entry.step.openToolCount = Math.max(0, entry.step.openToolCount - 1);
+    }
     const state = info.state || 'completed';
     const now = Date.now();
     const output = String(info.output || '');
@@ -523,14 +667,14 @@ export class AgyTurnTranslator {
     if (state === 'error') {
       this._send('session.tool.failed', {
         sessionID: this.sessionID,
-        assistantMessageID: this.assistantMessageID,
+        assistantMessageID: entry.step.id,
         id: entry.callID,
         error: { type: 'unknown', message: output || 'Subagent failed' },
         content: contentItems,
         executed: true,
         metadata,
       });
-      this.content.push({
+      entry.step.content.push({
         type: 'tool',
         id: entry.callID,
         name: 'subagent',
@@ -547,13 +691,13 @@ export class AgyTurnTranslator {
     } else {
       this._send('session.tool.success', {
         sessionID: this.sessionID,
-        assistantMessageID: this.assistantMessageID,
+        assistantMessageID: entry.step.id,
         id: entry.callID,
         content: contentItems,
         executed: true,
         metadata,
       });
-      this.content.push({
+      entry.step.content.push({
         type: 'tool',
         id: entry.callID,
         name: 'subagent',
@@ -567,6 +711,7 @@ export class AgyTurnTranslator {
         },
       });
     }
+    this._syncSettledStepRecord(entry.step);
     return true;
   }
 
@@ -575,18 +720,22 @@ export class AgyTurnTranslator {
     for (const entry of this.activeSubagents) {
       if (entry.closed) continue;
       entry.closed = true;
+      if (!entry.acpClosed) {
+        entry.acpClosed = true;
+        entry.step.openToolCount = Math.max(0, entry.step.openToolCount - 1);
+      }
       if (entry.childSessionID && !interrupted) {
         const metadata = { status: 'running', sessionID: entry.childSessionID };
         const contentItems = [{ type: 'text', text: 'Subagent running in background.' }];
         this._send('session.tool.success', {
           sessionID: this.sessionID,
-          assistantMessageID: this.assistantMessageID,
+          assistantMessageID: entry.step.id,
           id: entry.callID,
           content: contentItems,
           executed: true,
           metadata,
         });
-        this.content.push({
+        entry.step.content.push({
           type: 'tool',
           id: entry.callID,
           name: 'subagent',
@@ -603,14 +752,14 @@ export class AgyTurnTranslator {
         const metadata = entry.childSessionID ? { status: 'cancelled', sessionID: entry.childSessionID } : undefined;
         this._send('session.tool.failed', {
           sessionID: this.sessionID,
-          assistantMessageID: this.assistantMessageID,
+          assistantMessageID: entry.step.id,
           id: entry.callID,
           error: { type: 'unknown', message: interrupted ? 'Subagent interrupted' : 'Subagent did not report a session ID' },
           content: [],
           executed: true,
           ...(metadata ? { metadata } : {}),
         });
-        this.content.push({
+        entry.step.content.push({
           type: 'tool',
           id: entry.callID,
           name: 'subagent',
@@ -625,6 +774,7 @@ export class AgyTurnTranslator {
           },
         });
       }
+      this._syncSettledStepRecord(entry.step);
     }
   }
 
@@ -666,17 +816,29 @@ export class AgyTurnTranslator {
     return this.complete();
   }
 
+  _finalizeTerminalStep(finish, error = undefined) {
+    const step = this.currentStep;
+    const completed = Math.max(Date.now(), step.created);
+    step.closed = true;
+    step.completed = completed;
+    step.finish = finish;
+    if (error) step.error = error;
+    step.tokens = this.tokens;
+    step.record = this._buildStepRecord(step);
+    return step;
+  }
+
   /** Mark turn completed successfully and emit terminal OpenCode events. */
   complete() {
     if (this.finished) return;
     this._closeOpenStream();
     this._flushOpenSubagents(false);
     this.finished = true;
-    const completed = Date.now();
+    const step = this._finalizeTerminalStep('stop');
 
     this._send('session.step.ended', {
       sessionID: this.sessionID,
-      assistantMessageID: this.assistantMessageID,
+      assistantMessageID: step.id,
       finish: 'stop',
       cost: 0,
       tokens: this.tokens,
@@ -689,7 +851,7 @@ export class AgyTurnTranslator {
     this._send('session.execution.succeeded', { sessionID: this.sessionID });
     this._send('session.idle', { sessionID: this.sessionID });
 
-    return this.toAssistantMessage('stop', undefined, completed);
+    return step.record;
   }
 
   /** @param {string} reason */
@@ -698,11 +860,11 @@ export class AgyTurnTranslator {
     this._closeOpenStream();
     this._flushOpenSubagents(true);
     this.finished = true;
-    const completed = Date.now();
+    const step = this._finalizeTerminalStep('unknown');
 
     this._send('session.step.ended', {
       sessionID: this.sessionID,
-      assistantMessageID: this.assistantMessageID,
+      assistantMessageID: step.id,
       finish: 'unknown',
       cost: 0,
       tokens: this.tokens,
@@ -710,7 +872,7 @@ export class AgyTurnTranslator {
     this._send('session.execution.interrupted', { sessionID: this.sessionID, reason });
     this._send('session.idle', { sessionID: this.sessionID });
 
-    return this.toAssistantMessage('unknown', undefined, completed);
+    return step.record;
   }
 
   /** @param {string} message */
@@ -719,12 +881,12 @@ export class AgyTurnTranslator {
     this._closeOpenStream();
     this._flushOpenSubagents(true);
     this.finished = true;
-    const completed = Date.now();
     const errObj = { type: 'unknown', message: String(message || 'agy-cli error') };
+    const step = this._finalizeTerminalStep('error', errObj);
 
     this._send('session.step.failed', {
       sessionID: this.sessionID,
-      assistantMessageID: this.assistantMessageID,
+      assistantMessageID: step.id,
       finish: 'error',
       error: errObj,
       cost: 0,
@@ -736,49 +898,42 @@ export class AgyTurnTranslator {
     });
     this._send('session.idle', { sessionID: this.sessionID });
 
-    return this.toAssistantMessage('error', errObj, completed);
+    return step.record;
   }
 
-  /** Build the persisted `SessionMessage.Assistant` wire object. */
-  toAssistantMessage(finish = 'stop', error = undefined, completed = Date.now()) {
-    return {
-      id: this.assistantMessageID,
-      type: 'assistant',
-      time: { created: this.created, completed },
-      agent: this.agent,
-      model: {
-        providerID: AGY_PROVIDER_ID,
-        id: this.modelID,
-        ...(this.variant ? { variant: this.variant } : {}),
-      },
-      finish,
-      ...(error ? { error } : {}),
-      cost: 0,
-      tokens: this.tokens,
-      content: this.content,
-    };
+  /** Build the persisted `SessionMessage.Assistant` wire object for the final/active step. */
+  toAssistantMessage(finish = undefined, error = undefined, completed = undefined) {
+    if (this.currentStep.record && finish === undefined && error === undefined && completed === undefined) {
+      return this.currentStep.record;
+    }
+    return this._buildStepRecord(
+      this.currentStep,
+      finish ?? this.currentStep.finish ?? 'stop',
+      error ?? this.currentStep.error,
+      completed ?? this.currentStep.completed,
+    );
   }
 
-  /**
-   * Build a live snapshot of an in-progress `SessionMessage.Assistant` for `GET /message`
-   * so refreshing or switching sessions mid-turn preserves active tools, thoughts, and text.
-   */
-  toInFlightAssistantMessage() {
-    if (this.finished) return null;
-    const content = [...this.content];
-    if (this.openStream) {
+  /** Return all completed step `SessionMessage.Assistant` records produced in this turn. */
+  toAssistantMessages() {
+    return this.steps.filter((step) => Boolean(step.record)).map((step) => step.record);
+  }
+
+  _buildRunningPartsForStep(step) {
+    const content = [...step.content];
+    if (this.openStream && this.openStream.step === step) {
       if (this.openStream.kind === 'text') {
         content.push({ type: 'text', text: this.openStream.buffer });
       } else {
         content.push({
           type: 'reasoning',
           text: this.openStream.buffer,
-          time: { created: this.created },
+          time: { created: this.openStream.startedAt },
         });
       }
     }
     for (const tool of this.activeTools.values()) {
-      if (tool.closed) continue;
+      if (tool.closed || tool.step !== step) continue;
       content.push({
         type: 'tool',
         id: tool.callID,
@@ -802,7 +957,7 @@ export class AgyTurnTranslator {
       });
     }
     for (const sub of this.activeSubagents) {
-      if (sub.closed) continue;
+      if (sub.closed || sub.step !== step) continue;
       content.push({
         type: 'tool',
         id: sub.callID,
@@ -816,10 +971,20 @@ export class AgyTurnTranslator {
         },
       });
     }
+    return content;
+  }
+
+  /**
+   * Build a live snapshot of the active in-progress `SessionMessage.Assistant` for `GET /message`
+   * so refreshing or switching sessions mid-turn preserves active tools, thoughts, and text.
+   */
+  toInFlightAssistantMessage() {
+    if (this.finished) return null;
+    const step = this.currentStep;
     return {
-      id: this.assistantMessageID,
+      id: step.id,
       type: 'assistant',
-      time: { created: this.created },
+      time: { created: step.created },
       agent: this.agent,
       model: {
         providerID: AGY_PROVIDER_ID,
@@ -828,7 +993,28 @@ export class AgyTurnTranslator {
       },
       cost: 0,
       tokens: this.tokens,
-      content,
+      content: this._buildRunningPartsForStep(step),
     };
+  }
+
+  /**
+   * Build live snapshots of all step messages (completed prior steps + current in-flight step)
+   * produced so far in the active turn for `GET /message`.
+   */
+  toInFlightAssistantMessages() {
+    if (this.finished) return [];
+    const out = [];
+    for (const step of this.steps) {
+      if (step === this.currentStep) {
+        const current = this.toInFlightAssistantMessage();
+        if (current) out.push(current);
+      } else if (step.record) {
+        out.push({
+          ...step.record,
+          content: this._buildRunningPartsForStep(step),
+        });
+      }
+    }
+    return out;
   }
 }

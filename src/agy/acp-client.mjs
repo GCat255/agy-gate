@@ -21,10 +21,25 @@ export function killChildProcessTree(child) {
 }
 
 /**
+ * Pick an allow/approve outcome when an ACP server sends `session/request_permission`.
+ * @param {any} params
+ */
+export function buildDefaultPermissionAllowResult(params) {
+  const options = Array.isArray(params?.options) ? params.options : [];
+  const allowOpt =
+    options.find((o) => o && typeof o.optionId === 'string' && /allow_once|allow/i.test(`${o.kind || ''} ${o.optionId}`))
+    || options.find((o) => o && typeof o.optionId === 'string' && !/reject|deny|cancel/i.test(`${o.kind || ''} ${o.optionId}`));
+  if (allowOpt) {
+    return { outcome: { outcome: 'selected', optionId: allowOpt.optionId } };
+  }
+  return { outcome: { outcome: 'cancelled' } };
+}
+
+/**
  * Pick a safe rejection/cancellation outcome when an ACP server sends `session/request_permission`.
  * @param {any} params
  */
-function buildDefaultPermissionRejectResult(params) {
+export function buildDefaultPermissionRejectResult(params) {
   const options = Array.isArray(params?.options) ? params.options : [];
   const rejectOpt = options.find((o) =>
     o && typeof o.optionId === 'string' && /reject|deny|cancel/i.test(`${o.kind || ''} ${o.optionId}`),
@@ -45,6 +60,7 @@ export class AgyAcpClient {
    *   args: string[],
    *   cwd: string,
    *   env: NodeJS.ProcessEnv,
+   *   onPermissionRequest?: (params: any) => any,
    *   onNotification?: (method: string, params: any) => void,
    *   onClose?: (info: { code: number | null, stderr: string }) => void,
    * }} options
@@ -58,6 +74,7 @@ export class AgyAcpClient {
       stdio: ['pipe', 'pipe', 'pipe'],
     });
 
+    this.onPermissionRequest = options.onPermissionRequest || null;
     this.onNotification = options.onNotification || null;
     this.onClose = options.onClose || null;
     this.nextId = 1;
@@ -154,10 +171,13 @@ export class AgyAcpClient {
     if (Object.hasOwn(msg, 'id') && typeof msg.method === 'string') {
       try {
         if (msg.method === 'session/request_permission') {
+          const permResult = this.onPermissionRequest
+            ? this.onPermissionRequest(msg.params)
+            : buildDefaultPermissionRejectResult(msg.params);
           this._writeJson({
             jsonrpc: '2.0',
             id: msg.id,
-            result: buildDefaultPermissionRejectResult(msg.params),
+            result: permResult || buildDefaultPermissionRejectResult(msg.params),
           });
         } else {
           this._writeJson({

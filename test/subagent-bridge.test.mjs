@@ -292,7 +292,7 @@ test('server queues /synthetic resume calls when agy-cli session is busy instead
       "    console.log(JSON.stringify({ jsonrpc: '2.0', id: req.id, result: { sessionId: 'conv_q' } }));",
       "    return;",
       "  }",
-      "  if (req.method === 'session/set_model' || req.method === 'session/set_config_option') {",
+      "  if (req.method === 'session/set_model' || req.method === 'session/set_config_option' || req.method === 'session/set_mode') {",
       "    console.log(JSON.stringify({ jsonrpc: '2.0', id: req.id, result: {} }));",
       "    return;",
       "  }",
