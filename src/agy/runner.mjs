@@ -389,6 +389,7 @@ export class AgyRunner {
       variant: next.variant,
       agent: next.agent,
       directory: next.directory,
+      handoverContext: next.handoverContext,
       promptPayload: next.promptPayload,
     });
   }
@@ -495,7 +496,7 @@ export class AgyRunner {
   /**
    * Build ACP `session/prompt` content blocks (`text` + native `image` blocks).
    * @param {{ text?: string, files?: any[], skills?: any[] }} payload
-   * @param {{ syntheticTexts?: string[], guidancePrefix?: string | null, agent?: string, allowImages?: boolean }} [options]
+   * @param {{ syntheticTexts?: string[], guidancePrefix?: string | null, handoverContext?: string | null, agent?: string, allowImages?: boolean }} [options]
    */
   buildPromptBlocks(payload, options = {}) {
     const sections = [];
@@ -504,6 +505,9 @@ export class AgyRunner {
     }
     if (isPlanAgent(options.agent)) {
       sections.push(PLAN_MODE_DIRECTIVE);
+    }
+    if (options.handoverContext) {
+      sections.push(options.handoverContext);
     }
     if (Array.isArray(options.syntheticTexts) && options.syntheticTexts.length > 0) {
       sections.push(options.syntheticTexts.join('\n\n'));
@@ -601,6 +605,14 @@ export class AgyRunner {
     }
 
     return { agyBin, childEnv, args, skipPermissions };
+  }
+
+  /**
+   * Retire any cached warm worker for `sessionID` (e.g. after a committed revert).
+   * @param {string} sessionID
+   */
+  retireWorker(sessionID) {
+    this._retireWorker(sessionID, false);
   }
 
   /**
@@ -1076,9 +1088,12 @@ export class AgyRunner {
         : null;
 
       const syntheticTexts = this.store.consumePendingSynthetic(sessionID);
+      const pendingHandover = this.store.consumePendingHandoverContext(sessionID);
+      const handoverContext = [pendingHandover, params.handoverContext].filter(Boolean).join('\n\n') || null;
       const { blocks } = this.buildPromptBlocks(promptPayload, {
         syntheticTexts,
         guidancePrefix,
+        handoverContext,
         agent: activeAgent,
         allowImages: modelSupportsImageInput(realModelID),
       });
@@ -1212,9 +1227,17 @@ export class AgyRunner {
   }
 
   /**
-   * Compact an existing `agy-cli` session via ACP `/compact` and emit OpenCode
-   * `session.compaction.*` SSE events + persisted `compaction` message.
-   * @param {{ sessionID: string, modelID: string, variant?: string, directory?: string | null, messageID?: string }} params
+   * Compact an existing `agy-cli` session via ACP `/compact` (or summarize upstream pre-switch
+   * history when switching into `agy-cli`) and emit OpenCode `session.compaction.*` SSE events.
+   * @param {{
+   *   sessionID: string,
+   *   modelID: string,
+   *   variant?: string,
+   *   directory?: string | null,
+   *   messageID?: string,
+   *   upstreamHandoverContext?: string | null,
+   *   upstreamCompactionPrompt?: string | null,
+   * }} params
    */
   async compactSession(params) {
     const { sessionID, modelID, variant, directory } = params;
@@ -1224,8 +1247,11 @@ export class AgyRunner {
     }
 
     const sessionState = this.store.getSession(sessionID);
-    const hasHistory = Boolean(sessionState?.agyConversationId) || this.store.getMessages(sessionID).length > 0;
-    if (!hasHistory) {
+    const hasAgyHistory = Boolean(sessionState?.agyConversationId) || this.store.getMessages(sessionID).length > 0;
+    const upstreamHandover = typeof params.upstreamHandoverContext === 'string' && params.upstreamHandoverContext.trim()
+      ? params.upstreamHandoverContext.trim()
+      : null;
+    if (!hasAgyHistory && !upstreamHandover) {
       return { ok: false, status: 400, error: 'Nothing to compact yet' };
     }
 
@@ -1243,6 +1269,98 @@ export class AgyRunner {
       id: modelID,
       ...(variant ? { variant } : {}),
     };
+
+    if (!hasAgyHistory && upstreamHandover) {
+      this.store.upsertMessage(sessionID, {
+        id: messageID,
+        type: 'compaction',
+        status: 'running',
+        reason: 'manual',
+        summary: '',
+        time: { created },
+      });
+      this.sseHub.broadcast({
+        type: 'session.execution.started',
+        created,
+        ...loc,
+        data: { sessionID },
+      });
+      this.sseHub.broadcast({
+        id: eventID,
+        type: 'session.compaction.started',
+        created,
+        ...loc,
+        data: { sessionID, reason: 'manual', inputID: messageID },
+      });
+
+      const summarizePrompt = params.upstreamCompactionPrompt || upstreamHandover;
+      void (async () => {
+        let summary = '';
+        try {
+          summary = (await this.generateText({
+            prompt: summarizePrompt,
+            modelID,
+            variant,
+            directory: effectiveDir,
+          })).trim();
+        } catch {
+          summary = '';
+        } finally {
+          this.startingSessions.delete(sessionID);
+        }
+        if (!summary) {
+          summary = upstreamHandover;
+        }
+        const completedAt = Date.now();
+        this.store.setPendingHandoverContext(
+          sessionID,
+          `<cross_engine_context>\nCompacted summary of conversation before switching to agy-cli:\n\n${summary}\n</cross_engine_context>`,
+        );
+        this.store.upsertMessage(sessionID, {
+          id: messageID,
+          type: 'compaction',
+          status: 'completed',
+          reason: 'manual',
+          summary,
+          model: modelRef,
+          cost: 0,
+          time: { created, completed: completedAt },
+        });
+        this.sseHub.broadcast({
+          type: 'session.compaction.delta',
+          created: completedAt,
+          ...loc,
+          data: { sessionID, text: summary },
+        });
+        this.sseHub.broadcast({
+          id: eventID,
+          type: 'session.compaction.ended',
+          created: completedAt,
+          ...loc,
+          data: {
+            sessionID,
+            reason: 'manual',
+            model: modelRef,
+            text: summary,
+            cost: 0,
+          },
+        });
+        this.sseHub.broadcast({
+          type: 'session.execution.succeeded',
+          created: completedAt,
+          ...loc,
+          data: { sessionID },
+        });
+        this.sseHub.broadcast({
+          type: 'session.idle',
+          created: completedAt,
+          ...loc,
+          data: { sessionID, outcome: 'succeeded' },
+        });
+      })();
+
+      return { ok: true, messageID, created };
+    }
 
     const emitCompactionFailed = (message) => {
       const now = Date.now();
@@ -1393,10 +1511,14 @@ export class AgyRunner {
         worker.appliedModelKey = modelKey;
       }
 
+      const pendingHandover = this.store.consumePendingHandoverContext(sessionID);
+      const extraCompactContext = [pendingHandover, upstreamHandover].filter(Boolean).join('\n\n');
+      const compactPromptText = extraCompactContext ? `${extraCompactContext}\n\n/compact` : '/compact';
+
       void worker.client
         .request('session/prompt', {
           sessionId: worker.acpSessionId,
-          prompt: [{ type: 'text', text: '/compact' }],
+          prompt: [{ type: 'text', text: compactPromptText }],
         })
         .then(
           (result) => {

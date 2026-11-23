@@ -1,6 +1,11 @@
 import http from 'node:http';
 import { AGY_PROVIDER_ID, getAgyCatalog } from '../agy/models.mjs';
 import { isAgyChildSessionID } from '../agy/subagent-bridge.mjs';
+import {
+  buildUpstreamCompactionPrompt,
+  extractUpstreamOnlyMessages,
+  formatMessagesAsHandoverContext,
+} from './context-bridge.mjs';
 import { normalizePromptFiles } from './store.mjs';
 
 /**
@@ -91,6 +96,80 @@ async function fetchUpstream(opts) {
 export function createRouterServer(deps) {
   const loadCatalog = deps.getAgyCatalogFn || getAgyCatalog;
   const getClientAuth = deps.clientAuthHeader || deps.authHeader;
+
+  async function fetchUpstreamMessages(sessionID, req, expectedAuth) {
+    try {
+      const up = await fetchUpstream({
+        upstreamBase: deps.upstreamBase(),
+        authHeader: expectedAuth,
+        req,
+        method: 'GET',
+        pathAndQuery: `/api/session/${encodeURIComponent(sessionID)}/message`,
+      });
+      if (!up.ok) return [];
+      const json = await up.json().catch(() => null);
+      return Array.isArray(json?.data) ? json.data : [];
+    } catch {
+      return [];
+    }
+  }
+
+  async function prepareAgyHandoverContext(sessionID, req, expectedAuth) {
+    const sessionState = deps.store.getSession(sessionID);
+    if (sessionState?.agyConversationId && !sessionState?.needsUpstreamSync) {
+      return { handoverContext: null, upstreamMessageIds: [] };
+    }
+    const upstreamList = await fetchUpstreamMessages(sessionID, req, expectedAuth);
+    const localList = deps.store.getMessages(sessionID);
+    const syncedSet = deps.store.getSyncedUpstreamMessageIdSet(sessionID);
+    const unsynced = extractUpstreamOnlyMessages(upstreamList, localList, syncedSet);
+    if (unsynced.length === 0) {
+      return { handoverContext: null, upstreamMessageIds: [] };
+    }
+    return {
+      handoverContext: formatMessagesAsHandoverContext(unsynced),
+      upstreamMessageIds: unsynced.map((m) => m.id).filter(Boolean),
+    };
+  }
+
+  async function syncAgyContextToUpstream(sessionID, req, expectedAuth) {
+    const unsyncedAgy = deps.store
+      .getUnsyncedAgyMessages(sessionID)
+      .filter((m) => m.type === 'user' || m.type === 'assistant' || m.type === 'compaction');
+    if (unsyncedAgy.length === 0) return;
+
+    const text = formatMessagesAsHandoverContext(unsyncedAgy, {
+      header: 'Previous conversation context from agy-cli before switching models (continue seamlessly):',
+      maxChars: 12_000,
+    });
+    if (!text) return;
+
+    try {
+      const up = await fetchUpstream({
+        upstreamBase: deps.upstreamBase(),
+        authHeader: expectedAuth,
+        req,
+        method: 'POST',
+        pathAndQuery: `/api/session/${encodeURIComponent(sessionID)}/synthetic`,
+        body: Buffer.from(
+          JSON.stringify({
+            text,
+            description: 'Synced agy-cli conversation context',
+            resume: false,
+          }),
+          'utf8',
+        ),
+      });
+      if (up.ok) {
+        deps.store.markAgyMessagesSynced(
+          sessionID,
+          unsyncedAgy.map((m) => m.id).filter(Boolean),
+        );
+      }
+    } catch {
+      // Best-effort upstream context sync; do not block model switch or prompt
+    }
+  }
 
   const server = http.createServer(async (req, res) => {
     try {
@@ -432,6 +511,7 @@ export function createRouterServer(deps) {
           if (nextModel?.providerID === AGY_PROVIDER_ID) {
             const prev = deps.store.getSession(sessionID)?.activeModel || undefined;
             deps.store.setSessionModel(sessionID, nextModel);
+            deps.store.setNeedsUpstreamSync(sessionID, true);
             deps.sseHub.broadcast({
               type: 'session.model.selected',
               ...(directory ? { location: { directory } } : {}),
@@ -446,7 +526,8 @@ export function createRouterServer(deps) {
             return;
           }
 
-          // Switching back to a native OpenCode model
+          // Switching back to a native OpenCode model: sync any unsynced agy-cli turns upstream first
+          await syncAgyContextToUpstream(sessionID, req, expectedAuth);
           deps.store.setSessionModel(sessionID, null);
           const up = await fetchUpstream({
             upstreamBase: deps.upstreamBase(),
@@ -544,6 +625,7 @@ export function createRouterServer(deps) {
             const effectiveDir = directory || sessionState?.directory || null;
             const loc = effectiveDir ? { location: { directory: effectiveDir } } : {};
             const delivery = parsed.delivery || 'queue';
+            const handover = await prepareAgyHandoverContext(sessionID, req, expectedAuth);
             const wasBusy = deps.agyRunner.isRunning(sessionID);
 
             deps.sseHub.broadcast({
@@ -564,8 +646,10 @@ export function createRouterServer(deps) {
                 variant: activeModel.variant,
                 agent: activeAgent,
                 directory: effectiveDir,
+                handoverContext: handover.handoverContext,
                 promptPayload: userPayload,
               });
+              deps.store.markUpstreamMessagesSynced(sessionID, handover.upstreamMessageIds);
             } else {
               deps.sseHub.broadcast({
                 type: 'session.inbox.delivered',
@@ -580,8 +664,10 @@ export function createRouterServer(deps) {
                 variant: activeModel.variant,
                 agent: activeAgent,
                 directory: effectiveDir,
+                handoverContext: handover.handoverContext,
                 promptPayload: userPayload,
               });
+              deps.store.markUpstreamMessagesSynced(sessionID, handover.upstreamMessageIds);
               if (!started.ok) {
                 deps.agyRunner.enqueueTurnInput(sessionID, {
                   messageID,
@@ -606,7 +692,8 @@ export function createRouterServer(deps) {
             return;
           }
 
-          // Native OpenCode prompt
+          // Native OpenCode prompt: ensure any prior agy-cli turns are synced upstream first
+          await syncAgyContextToUpstream(sessionID, req, expectedAuth);
           const up = await fetchUpstream({
             upstreamBase: deps.upstreamBase(),
             authHeader: expectedAuth,
@@ -654,6 +741,7 @@ export function createRouterServer(deps) {
 
             const activeAgent = deps.store.getSession(sessionID)?.agent || undefined;
             const effectiveDir = directory || sessionState?.directory || null;
+            const handover = await prepareAgyHandoverContext(sessionID, req, expectedAuth);
             deps.sseHub.broadcast({
               type: 'session.inbox.enqueued',
               created: now,
@@ -680,8 +768,10 @@ export function createRouterServer(deps) {
                 variant: activeModel.variant,
                 agent: activeAgent,
                 directory: effectiveDir,
+                handoverContext: handover.handoverContext,
                 promptPayload: { text },
               });
+              deps.store.markUpstreamMessagesSynced(sessionID, handover.upstreamMessageIds);
             } else {
               deps.sseHub.broadcast({
                 type: 'session.inbox.delivered',
@@ -696,8 +786,10 @@ export function createRouterServer(deps) {
                 variant: activeModel.variant,
                 agent: activeAgent,
                 directory: effectiveDir,
+                handoverContext: handover.handoverContext,
                 promptPayload: { text },
               });
+              deps.store.markUpstreamMessagesSynced(sessionID, handover.upstreamMessageIds);
               if (!started.ok) {
                 deps.agyRunner.enqueueTurnInput(sessionID, {
                   messageID,
@@ -729,7 +821,7 @@ export function createRouterServer(deps) {
           return;
         }
 
-        // 7d-3. Compact Session (route agy-cli sessions to native ACP `/compact`)
+        // 7d-3. Compact Session (route agy-cli sessions to native ACP `/compact` or pre-switch upstream summary)
         if (method === 'POST' && sub === 'compact') {
           const bodyBuf = await readBodyBuffer(req);
           const sessionState = deps.store.getSession(sessionID);
@@ -741,7 +833,11 @@ export function createRouterServer(deps) {
               parsed = bodyBuf.length ? JSON.parse(bodyBuf.toString('utf8')) : {};
             } catch {}
 
-            const hasHistory = Boolean(sessionState?.agyConversationId) || deps.store.getMessages(sessionID).length > 0;
+            const handover = await prepareAgyHandoverContext(sessionID, req, expectedAuth);
+            const hasHistory =
+              Boolean(sessionState?.agyConversationId) ||
+              deps.store.getMessages(sessionID).length > 0 ||
+              Boolean(handover.handoverContext);
             if (!hasHistory) {
               sendJson(res, 400, { error: 'Nothing to compact yet' });
               return;
@@ -758,11 +854,16 @@ export function createRouterServer(deps) {
               variant: activeModel.variant,
               directory: effectiveDir,
               messageID: parsed.id,
+              upstreamHandoverContext: handover.handoverContext,
+              upstreamCompactionPrompt: handover.handoverContext
+                ? buildUpstreamCompactionPrompt(handover.handoverContext)
+                : null,
             });
             if (!started.ok) {
               sendJson(res, started.status || 409, { error: started.error || 'Session is busy' });
               return;
             }
+            deps.store.markUpstreamMessagesSynced(sessionID, handover.upstreamMessageIds);
 
             sendJson(res, 200, {
               data: {
@@ -790,10 +891,241 @@ export function createRouterServer(deps) {
           return;
         }
 
+        // 7d-4. Slash Commands (route agy-cli commands cleanly; support `/compact` or command prompt)
+        if (method === 'POST' && sub === 'command') {
+          const bodyBuf = await readBodyBuffer(req);
+          const sessionState = deps.store.getSession(sessionID);
+          const activeModel = sessionState?.activeModel;
+
+          if (activeModel?.providerID === AGY_PROVIDER_ID) {
+            let parsed = {};
+            try {
+              parsed = bodyBuf.length ? JSON.parse(bodyBuf.toString('utf8')) : {};
+            } catch {}
+
+            const cmdName = String(parsed?.name || '').trim().replace(/^\/+/, '');
+            const cmdText = String(parsed?.text || '').trim();
+            if (!cmdName) {
+              sendJson(res, 400, { error: 'command name is required' });
+              return;
+            }
+
+            if (cmdName.toLowerCase() === 'compact' && !cmdText) {
+              const handover = await prepareAgyHandoverContext(sessionID, req, expectedAuth);
+              const started = await deps.agyRunner.compactSession({
+                sessionID,
+                modelID: activeModel.id,
+                variant: activeModel.variant,
+                directory: directory || sessionState?.directory || null,
+                upstreamHandoverContext: handover.handoverContext,
+                upstreamCompactionPrompt: handover.handoverContext
+                  ? buildUpstreamCompactionPrompt(handover.handoverContext)
+                  : null,
+              });
+              if (!started.ok) {
+                sendJson(res, started.status || 409, { error: started.error || 'Session is busy' });
+                return;
+              }
+              deps.store.markUpstreamMessagesSynced(sessionID, handover.upstreamMessageIds);
+              res.writeHead(204);
+              res.end();
+              return;
+            }
+
+            const fullText = cmdText ? `/${cmdName} ${cmdText}` : `/${cmdName}`;
+            const messageID = `msg_${Date.now()}_cmd`;
+            const now = Date.now();
+            const normalizedFiles = Array.isArray(parsed.files) ? normalizePromptFiles(parsed.files) : undefined;
+            const userPayload = {
+              text: fullText,
+              ...(normalizedFiles ? { files: normalizedFiles } : {}),
+              ...(Array.isArray(parsed.agents) ? { agents: parsed.agents } : {}),
+              ...(Array.isArray(parsed.skills) ? { skills: parsed.skills } : {}),
+            };
+            deps.store.upsertMessage(sessionID, { id: messageID, type: 'user', time: { created: now }, ...userPayload });
+
+            const effectiveDir = directory || sessionState?.directory || null;
+            const loc = effectiveDir ? { location: { directory: effectiveDir } } : {};
+            const handover = await prepareAgyHandoverContext(sessionID, req, expectedAuth);
+            const activeAgent = deps.store.getSession(sessionID)?.agent || undefined;
+
+            deps.sseHub.broadcast({
+              type: 'session.inbox.enqueued',
+              created: now,
+              ...loc,
+              data: { sessionID, inboxID: messageID, item: { type: 'user', payload: userPayload } },
+            });
+
+            if (deps.agyRunner.isRunning(sessionID)) {
+              deps.agyRunner.enqueueTurnInput(sessionID, {
+                messageID,
+                modelID: activeModel.id,
+                variant: activeModel.variant,
+                agent: activeAgent,
+                directory: effectiveDir,
+                handoverContext: handover.handoverContext,
+                promptPayload: userPayload,
+              });
+              deps.store.markUpstreamMessagesSynced(sessionID, handover.upstreamMessageIds);
+            } else {
+              deps.sseHub.broadcast({
+                type: 'session.inbox.delivered',
+                created: now,
+                ...loc,
+                data: { sessionID, inboxID: messageID },
+              });
+              await deps.agyRunner.startTurn({
+                sessionID,
+                modelID: activeModel.id,
+                variant: activeModel.variant,
+                agent: activeAgent,
+                directory: effectiveDir,
+                handoverContext: handover.handoverContext,
+                promptPayload: userPayload,
+              });
+              deps.store.markUpstreamMessagesSynced(sessionID, handover.upstreamMessageIds);
+            }
+            res.writeHead(204);
+            res.end();
+            return;
+          }
+
+          await syncAgyContextToUpstream(sessionID, req, expectedAuth);
+          const up = await fetchUpstream({
+            upstreamBase: deps.upstreamBase(),
+            authHeader: expectedAuth,
+            req,
+            method,
+            pathAndQuery,
+            body: bodyBuf,
+          });
+          const text = await up.text();
+          res.writeHead(up.status, { 'Content-Type': up.headers.get('content-type') || 'application/json' });
+          res.end(text);
+          return;
+        }
+
+        // 7d-5. Fork Session (carry activeModel, agent, local agy turns & handover context)
+        if (method === 'POST' && sub === 'fork') {
+          const bodyBuf = await readBodyBuffer(req);
+          let parsed = {};
+          try {
+            parsed = bodyBuf.length ? JSON.parse(bodyBuf.toString('utf8')) : {};
+          } catch {}
+
+          const up = await fetchUpstream({
+            upstreamBase: deps.upstreamBase(),
+            authHeader: expectedAuth,
+            req,
+            method,
+            pathAndQuery,
+            body: bodyBuf,
+          });
+          const text = await up.text();
+          if (!up.ok) {
+            res.writeHead(up.status, { 'Content-Type': up.headers.get('content-type') || 'application/json' });
+            res.end(text);
+            return;
+          }
+
+          const json = JSON.parse(text);
+          const newId = json?.data?.id;
+          if (newId && deps.store.getSession(sessionID)) {
+            const srcMsgs = deps.store.getMessages(sessionID);
+            const beforeId = typeof parsed?.before === 'string' && parsed.before.trim() ? parsed.before.trim() : null;
+            const cutIdx = beforeId ? srcMsgs.findIndex((m) => m?.id === beforeId) : srcMsgs.length;
+            const copiedMsgs = srcMsgs.slice(0, cutIdx >= 0 ? cutIdx : srcMsgs.length);
+            const handoverText = formatMessagesAsHandoverContext(copiedMsgs, {
+              header: 'Conversation history inherited from forked parent session (continue seamlessly):',
+            });
+            deps.store.forkSessionState(sessionID, newId, {
+              beforeMessageID: beforeId,
+              handoverContext: handoverText || null,
+              syncedUpstreamMsgIds: [...deps.store.getSyncedUpstreamMessageIdSet(sessionID)],
+            });
+            json.data = deps.store.overlaySessionInfo(json.data);
+          }
+          sendJson(res, up.status, json);
+          return;
+        }
+
+        // 7d-6. Revert Stage / Clear / Commit (keep local agy-cli history & warm ACP worker in sync)
+        if (method === 'POST' && sub === 'revert/stage') {
+          const bodyBuf = await readBodyBuffer(req);
+          let parsed = {};
+          try {
+            parsed = bodyBuf.length ? JSON.parse(bodyBuf.toString('utf8')) : {};
+          } catch {}
+          if (typeof parsed?.messageID === 'string' && parsed.messageID.trim()) {
+            deps.store.setStagedRevertTarget(sessionID, parsed.messageID.trim());
+          }
+          const up = await fetchUpstream({
+            upstreamBase: deps.upstreamBase(),
+            authHeader: expectedAuth,
+            req,
+            method,
+            pathAndQuery,
+            body: bodyBuf,
+          });
+          const text = await up.text();
+          res.writeHead(up.status, { 'Content-Type': up.headers.get('content-type') || 'application/json' });
+          res.end(text);
+          return;
+        }
+
+        if (method === 'DELETE' && sub === 'revert') {
+          deps.store.setStagedRevertTarget(sessionID, null);
+          const up = await fetchUpstream({
+            upstreamBase: deps.upstreamBase(),
+            authHeader: expectedAuth,
+            req,
+            method,
+            pathAndQuery,
+          });
+          const text = await up.text();
+          res.writeHead(up.status, { 'Content-Type': up.headers.get('content-type') || 'application/json' });
+          res.end(text);
+          return;
+        }
+
+        if (method === 'POST' && sub === 'revert/commit') {
+          const bodyBuf = await readBodyBuffer(req);
+          const stagedTarget = deps.store.getStagedRevertTarget(sessionID);
+          const up = await fetchUpstream({
+            upstreamBase: deps.upstreamBase(),
+            authHeader: expectedAuth,
+            req,
+            method,
+            pathAndQuery,
+            body: bodyBuf,
+          });
+          const text = await up.text();
+          if (up.ok && stagedTarget) {
+            const { removedAgyTurns } = deps.store.truncateMessagesFrom(sessionID, stagedTarget);
+            if (removedAgyTurns) {
+              deps.agyRunner.retireWorker?.(sessionID);
+            }
+          }
+          res.writeHead(up.status, { 'Content-Type': up.headers.get('content-type') || 'application/json' });
+          res.end(text);
+          return;
+        }
+
         // 7e. Interrupt Execution
         if (method === 'POST' && sub === 'interrupt') {
           if (deps.agyRunner.interrupt(sessionID)) {
             sendJson(res, 200, { interrupted: true });
+            return;
+          }
+        }
+
+        // 7e-2. Get Single Message (serve local agy-cli message before falling back to upstream)
+        const singleMsgMatch = sub.match(/^message\/([^/]+)$/);
+        if (method === 'GET' && singleMsgMatch) {
+          const targetId = decodeURIComponent(singleMsgMatch[1]);
+          const localMsg = deps.store.getMessages(sessionID).find((m) => m?.id === targetId);
+          if (localMsg) {
+            sendJson(res, 200, { data: localMsg });
             return;
           }
         }

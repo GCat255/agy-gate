@@ -139,6 +139,11 @@ export class RouterStore {
       activeModel: null,
       agyConversationId: null,
       pendingSynthetic: [],
+      pendingHandoverContext: null,
+      needsUpstreamSync: false,
+      syncedUpstreamMsgIds: [],
+      syncedAgyMsgIds: [],
+      stagedRevertTarget: null,
       sessionTokens: null,
       lastAgyResultUsage: null,
       messages: [],
@@ -269,6 +274,155 @@ export class RouterStore {
     s.pendingSynthetic = [];
     this._save(sessionID);
     return items;
+  }
+
+  /** @param {string} sessionID @param {boolean} flag */
+  setNeedsUpstreamSync(sessionID, flag) {
+    const s = this._ensureSession(sessionID);
+    const next = Boolean(flag);
+    if (Boolean(s.needsUpstreamSync) === next) return;
+    s.needsUpstreamSync = next;
+    this._save(sessionID);
+  }
+
+  /** @param {string} sessionID */
+  getSyncedUpstreamMessageIdSet(sessionID) {
+    const s = this.getSession(sessionID);
+    return new Set(Array.isArray(s?.syncedUpstreamMsgIds) ? s.syncedUpstreamMsgIds : []);
+  }
+
+  /** @param {string} sessionID @param {string[]} msgIds */
+  markUpstreamMessagesSynced(sessionID, msgIds) {
+    const ids = (Array.isArray(msgIds) ? msgIds : []).filter((id) => typeof id === 'string' && id);
+    if (ids.length === 0 && !this.getSession(sessionID)?.needsUpstreamSync) return;
+    const s = this._ensureSession(sessionID);
+    const set = new Set(Array.isArray(s.syncedUpstreamMsgIds) ? s.syncedUpstreamMsgIds : []);
+    for (const id of ids) set.add(id);
+    s.syncedUpstreamMsgIds = [...set];
+    s.needsUpstreamSync = false;
+    this._save(sessionID);
+  }
+
+  /** @param {string} sessionID */
+  getUnsyncedAgyMessages(sessionID) {
+    const s = this.getSession(sessionID);
+    if (!s || !Array.isArray(s.messages) || s.messages.length === 0) return [];
+    const synced = new Set(Array.isArray(s.syncedAgyMsgIds) ? s.syncedAgyMsgIds : []);
+    return s.messages.map(normalizeStoredMessage).filter((m) => m?.id && !synced.has(m.id));
+  }
+
+  /** @param {string} sessionID @param {string[]} msgIds */
+  markAgyMessagesSynced(sessionID, msgIds) {
+    const ids = (Array.isArray(msgIds) ? msgIds : []).filter((id) => typeof id === 'string' && id);
+    if (ids.length === 0) return;
+    const s = this._ensureSession(sessionID);
+    const set = new Set(Array.isArray(s.syncedAgyMsgIds) ? s.syncedAgyMsgIds : []);
+    for (const id of ids) set.add(id);
+    s.syncedAgyMsgIds = [...set];
+    this._save(sessionID);
+  }
+
+  /** @param {string} sessionID @param {string | null} text */
+  setPendingHandoverContext(sessionID, text) {
+    const s = this._ensureSession(sessionID);
+    const trimmed = typeof text === 'string' && text.trim() ? text.trim() : null;
+    if ((s.pendingHandoverContext || null) === trimmed) return;
+    s.pendingHandoverContext = trimmed;
+    this._save(sessionID);
+  }
+
+  /** @param {string} sessionID */
+  consumePendingHandoverContext(sessionID) {
+    const s = this.getSession(sessionID);
+    if (!s || !s.pendingHandoverContext) return null;
+    const text = s.pendingHandoverContext;
+    s.pendingHandoverContext = null;
+    this._save(sessionID);
+    return text;
+  }
+
+  /** @param {string} sessionID @param {string | null} messageID */
+  setStagedRevertTarget(sessionID, messageID) {
+    const s = this._ensureSession(sessionID);
+    const next = typeof messageID === 'string' && messageID.trim() ? messageID.trim() : null;
+    if ((s.stagedRevertTarget || null) === next) return;
+    s.stagedRevertTarget = next;
+    this._save(sessionID);
+  }
+
+  /** @param {string} sessionID */
+  getStagedRevertTarget(sessionID) {
+    return this.getSession(sessionID)?.stagedRevertTarget || null;
+  }
+
+  /**
+   * Copy routing state and message prefix from `sourceSessionID` into a newly forked `targetSessionID`.
+   * Leaves `agyConversationId` unset on the fork so the new session opens an independent ACP thread
+   * seeded with `handoverContext`.
+   * @param {string} sourceSessionID
+   * @param {string} targetSessionID
+   * @param {{ beforeMessageID?: string | null, handoverContext?: string | null, syncedUpstreamMsgIds?: string[] }} [options]
+   */
+  forkSessionState(sourceSessionID, targetSessionID, options = {}) {
+    const src = this.getSession(sourceSessionID);
+    if (!src || !targetSessionID) return;
+    const dst = this._ensureSession(targetSessionID);
+    dst.directory = src.directory || dst.directory;
+    dst.projectID = src.projectID || dst.projectID;
+    dst.agent = src.agent || dst.agent;
+    dst.activeModel = src.activeModel ? { ...src.activeModel } : null;
+    dst.agyConversationId = null;
+
+    const beforeId = typeof options.beforeMessageID === 'string' && options.beforeMessageID.trim()
+      ? options.beforeMessageID.trim()
+      : null;
+    const srcMessages = Array.isArray(src.messages) ? src.messages : [];
+    let cutoffIdx = srcMessages.length;
+    if (beforeId) {
+      const idx = srcMessages.findIndex((m) => m?.id === beforeId);
+      if (idx >= 0) cutoffIdx = idx;
+    }
+    dst.messages = srcMessages.slice(0, cutoffIdx).map((m) => structuredClone(m));
+    dst.syncedAgyMsgIds = dst.messages.map((m) => m?.id).filter(Boolean);
+    if (Array.isArray(options.syncedUpstreamMsgIds)) {
+      dst.syncedUpstreamMsgIds = [...new Set(options.syncedUpstreamMsgIds)];
+    }
+    if (typeof options.handoverContext === 'string' && options.handoverContext.trim()) {
+      dst.pendingHandoverContext = options.handoverContext.trim();
+    }
+    this._save(targetSessionID);
+  }
+
+  /**
+   * Truncate local `agy-cli` messages from `targetMessageID` onwards after a committed revert.
+   * Resets `agyConversationId` when any `agy` turn is removed so the next turn starts cleanly synced.
+   * @param {string} sessionID
+   * @param {string | null | undefined} targetMessageID
+   * @returns {{ removedAgyTurns: boolean }}
+   */
+  truncateMessagesFrom(sessionID, targetMessageID) {
+    const s = this.getSession(sessionID);
+    if (!s) return { removedAgyTurns: false };
+    s.stagedRevertTarget = null;
+    const target = typeof targetMessageID === 'string' ? targetMessageID.trim() : '';
+    const prevList = Array.isArray(s.messages) ? s.messages : [];
+    let nextList = prevList;
+    if (target) {
+      const idx = prevList.findIndex((m) => m?.id === target);
+      if (idx >= 0) {
+        nextList = prevList.slice(0, idx);
+      }
+    }
+    const removedAgyTurns = nextList.length !== prevList.length;
+    if (removedAgyTurns) {
+      s.messages = nextList;
+      s.syncedUpstreamMsgIds = [];
+      s.syncedAgyMsgIds = nextList.map((m) => m?.id).filter(Boolean);
+      s.agyConversationId = null;
+      s.needsUpstreamSync = true;
+    }
+    this._save(sessionID);
+    return { removedAgyTurns };
   }
 
   /**
