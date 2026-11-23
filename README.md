@@ -33,6 +33,19 @@ cd agy-gate
 
 安装完成后即可直接在任意终端运行 **`occ`** 启动 OpenChamber、切换引擎、升级组件或授权 Agy 用量（也可手动执行 `agy-gate quota-login` 完成只读 Google OAuth 授权）。
 
+### 日常更新
+
+```bash
+cd agy-gate
+git pull
+# Windows 重新应用更新与环境校验：
+.\scripts\install.ps1
+# macOS / Linux 重新应用更新与环境校验：
+./scripts/install.sh
+```
+
+> 说明：若之前通过 `npm link` 安装，代码在 `git pull` 后即生效；若系统曾自动回退为 `npm install -g .` 拷贝安装，则必须重新运行安装脚本（或 `npm install -g . && agy-gate setup`）以同步全局入口。
+
 ## 核心设计
 
 - **零源码入侵**：在 OpenChamber 的 `opencodeBinary` 中指向本网关即可接入，OpenChamber 仍运行在完整托管模式下，不影响版本升级。
@@ -45,7 +58,7 @@ cd agy-gate
   - **原生子代理桥接**：禁止跨体系混调，将 `agy` 的 `invoke_subagent` / `send_message` / `manage_subagents` 映射为 OpenChamber 子会话树，支持异步回传、二次消息续传及父会话终止清理。
   - **自动会话命名**：首轮对话完成后异步生成简洁标题并通过 `PATCH /api/session/:id` 同步上游并广播 `session.renamed`。
   - **生成式 UI 与工具桥接**：首轮动态提取 `@openchamber/web` 的 `openui-lang` 规范，通过内置 `mcp-bridge`（仅在存在 `OPENCHAMBER_AGENT_TOOL_URL` 时激活）支持 `openchamber_render` 等工具及 `/api/session/:id/synthetic` 交互回传。
-- **混合影子会话**：会话元数据由内部 `opencode serve` 统一维护，`agy-cli` 对话消息由网关本地持久化并与 `GET /api/session/:id/message` 按时间顺序合并返回，支持同一会话内跨引擎切换。
+- **混合影子会话与跨引擎上下文承接**：会话元数据由内部 `opencode serve` 统一维护，`agy-cli` 对话消息由网关本地持久化并与 `GET /api/session/:id/message` 按时间顺序合并返回；在同一会话中从其他模型切换到 `agy-cli`（或反方向切回）时自动承接前置上下文并支持切换后立即 `/compact`、分叉与撤回同步。
 
 ## 目录结构
 

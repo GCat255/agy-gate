@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
@@ -73,7 +74,12 @@ describe('agy-quota OAuth & token management', () => {
         return new Response('not found', { status: 404 });
       };
 
-      const oauth = createOAuthManager({ authFilePath: authFile, fetchImpl: mockFetch });
+      const oauth = createOAuthManager({
+        authFilePath: authFile,
+        fetchImpl: mockFetch,
+        clientId: 'test-client-id',
+        clientSecret: 'test-client-secret',
+      });
       const started = await oauth.startLogin();
       assert.equal(started.connected, false);
       assert.ok(started.pendingAuth.authUrl.includes('https://accounts.google.com/o/oauth2/v2/auth'));
@@ -120,6 +126,44 @@ describe('agy-quota OAuth & token management', () => {
       () => extractCodeFromManualInput('http://127.0.0.1:45678/oauth-callback?state=wrong&code=x', 'st-ok'),
       /state/,
     );
+  });
+
+  it('does not embed literal OAuth client secrets in source and resolves from AGY_ROUTER_AGY_BIN by fingerprint', async () => {
+    const src = await fs.readFile(path.join(EXT_DIR, 'service', 'oauth.js'), 'utf8');
+    assert.equal(/GOCSPX-[0-9A-Za-z_-]{20,}/.test(src), false, 'oauth.js source must not contain literal clientSecret');
+
+    await withTempDir(async (dir) => {
+      const fakeBin = path.join(dir, 'mock-agy-bin.exe');
+      const fakeSecret = 'GOCSPX-' + 'AbCdEfGhIjKlMnOpQrStUvWxYz12';
+      const expectedSha256 = crypto.createHash('sha256').update(fakeSecret).digest('hex');
+      await fs.writeFile(fakeBin, Buffer.from(`padding\0${fakeSecret}\0more`, 'latin1'));
+
+      let seenSecret = null;
+      const oauth = createOAuthManager({
+        authFilePath: path.join(dir, 'quota-auth.json'),
+        env: { AGY_ROUTER_AGY_BIN: fakeBin },
+        clientSecretSha256: expectedSha256,
+        fetchImpl: async (url, init) => {
+          if (String(url).includes('oauth2.googleapis.com/token')) {
+            seenSecret = new URLSearchParams(String(init.body)).get('client_secret');
+            return new Response(
+              JSON.stringify({ access_token: 'acc-1', refresh_token: 'ref-1', expires_in: 3600 }),
+              { status: 200 },
+            );
+          }
+          return new Response(JSON.stringify({ email: 'mock@example.com' }), { status: 200 });
+        },
+      });
+      const started = await oauth.startLogin();
+      const state = new URL(started.pendingAuth.authUrl).searchParams.get('state');
+      const [rec] = await Promise.all([
+        oauth.waitForCompletion(),
+        fetch(`${started.pendingAuth.redirectUri}?code=c1&state=${encodeURIComponent(state)}`),
+      ]);
+      assert.equal(seenSecret, fakeSecret);
+      assert.equal(rec.email, 'mock@example.com');
+      await oauth.close();
+    });
   });
 });
 

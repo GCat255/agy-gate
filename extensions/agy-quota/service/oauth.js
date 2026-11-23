@@ -1,3 +1,4 @@
+import { spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fsSync from 'node:fs';
 import fs from 'node:fs/promises';
@@ -7,7 +8,8 @@ import path from 'node:path';
 
 export const ANTIGRAVITY_OAUTH_CLIENT = Object.freeze({
   clientId: '1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com',
-  clientSecret: process.env.AGY_QUOTA_OAUTH_CLIENT_SECRET || '',
+  // SHA-256 fingerprint of Antigravity CLI's public desktop OAuth client secret so the literal secret is never stored in repo source.
+  clientSecretSha256: '1d2f041093fd95aa8995a038c711d50a7960da09a505381c09a745d6ad0ecc60',
   authorizeUrl: 'https://accounts.google.com/o/oauth2/v2/auth',
   tokenUrl: 'https://oauth2.googleapis.com/token',
   userInfoUrl: 'https://www.googleapis.com/oauth2/v2/userinfo',
@@ -19,6 +21,71 @@ export const ANTIGRAVITY_OAUTH_CLIENT = Object.freeze({
     'https://www.googleapis.com/auth/experimentsandconfigs',
   ],
 });
+
+let cachedBinaryClientSecret = null;
+
+function collectInstalledAgyCandidates(env = process.env) {
+  const candidates = [];
+  const envOverride = env.AGY_ROUTER_AGY_BIN?.trim() || env.AGY_BIN?.trim();
+  if (envOverride) candidates.push(envOverride);
+
+  const locator = process.platform === 'win32' ? 'where' : 'which';
+  const found = spawnSync(locator, ['agy'], { encoding: 'utf8', windowsHide: true });
+  if (found.status === 0 && found.stdout) {
+    for (const line of found.stdout.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (trimmed) candidates.push(trimmed);
+    }
+  }
+
+  if (process.platform === 'win32') {
+    const localAppData = env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local');
+    candidates.push(
+      path.join(localAppData, 'magpie-agy-cli', 'agy.exe'),
+      path.join(localAppData, 'Programs', 'antigravity-cli', 'agy.exe'),
+      path.join(localAppData, 'Programs', 'agy', 'agy.exe'),
+    );
+  } else {
+    candidates.push('/usr/local/bin/agy', path.join(os.homedir(), '.local', 'bin', 'agy'));
+  }
+
+  return [...new Set(candidates)].filter((p) => p && fsSync.existsSync(p));
+}
+
+function resolveDesktopOAuthSecret(env = process.env, explicitSecret = undefined, expectedSha256 = ANTIGRAVITY_OAUTH_CLIENT.clientSecretSha256) {
+  if (typeof explicitSecret === 'string' && explicitSecret.trim()) {
+    return explicitSecret.trim();
+  }
+  const envSecret = env.AGY_QUOTA_OAUTH_CLIENT_SECRET?.trim();
+  if (envSecret) return envSecret;
+  if (cachedBinaryClientSecret && expectedSha256 === ANTIGRAVITY_OAUTH_CLIENT.clientSecretSha256) {
+    return cachedBinaryClientSecret;
+  }
+
+  const candidates = collectInstalledAgyCandidates(env);
+  if (candidates.length === 0) {
+    throw new Error('未找到本地 agy 可执行文件，无法解析 Antigravity OAuth 客户端密钥；请先安装 agy 或设置 AGY_QUOTA_OAUTH_CLIENT_SECRET。');
+  }
+
+  for (const agyBin of candidates) {
+    try {
+      const raw = fsSync.readFileSync(agyBin).toString('latin1');
+      const matches = raw.match(/GOCSPX-[0-9A-Za-z_-]{28}/g) || [];
+      for (const candidate of matches) {
+        const digest = crypto.createHash('sha256').update(candidate).digest('hex');
+        if (digest === expectedSha256) {
+          if (expectedSha256 === ANTIGRAVITY_OAUTH_CLIENT.clientSecretSha256) {
+            cachedBinaryClientSecret = candidate;
+          }
+          return candidate;
+        }
+      }
+    } catch {
+      // Try next candidate
+    }
+  }
+  throw new Error('未能从本地 agy 可执行文件匹配到 Antigravity OAuth 客户端密钥，请设置 AGY_QUOTA_OAUTH_CLIENT_SECRET。');
+}
 
 const TOKEN_REFRESH_SKEW_MS = 5 * 60 * 1000;
 const AUTH_FLOW_TIMEOUT_MS = 10 * 60 * 1000;
@@ -98,11 +165,12 @@ export function extractCodeFromManualInput(rawInput, expectedState) {
 }
 
 export function createOAuthManager(options = {}) {
-  const authFilePath = options.authFilePath ?? resolveDefaultAuthFilePath(options.env);
-  const fallbackAuthFilePath = options.authFilePath ? null : resolveFallbackAuthFilePath(options.env);
+  const env = options.env ?? process.env;
+  const authFilePath = options.authFilePath ?? resolveDefaultAuthFilePath(env);
+  const fallbackAuthFilePath = options.authFilePath ? null : resolveFallbackAuthFilePath(env);
   const fetchImpl = options.fetchImpl ?? fetch;
-  const clientId = options.clientId ?? ANTIGRAVITY_OAUTH_CLIENT.clientId;
-  const clientSecret = options.clientSecret ?? ANTIGRAVITY_OAUTH_CLIENT.clientSecret;
+  const clientId = options.clientId ?? env.AGY_QUOTA_OAUTH_CLIENT_ID?.trim() ?? ANTIGRAVITY_OAUTH_CLIENT.clientId;
+  const resolveSecret = () => resolveDesktopOAuthSecret(env, options.clientSecret, options.clientSecretSha256);
 
   let activeFlow = null;
   let refreshPromise = null;
@@ -190,6 +258,7 @@ export function createOAuthManager(options = {}) {
   }
 
   async function exchangeCode({ code, redirectUri, codeVerifier }) {
+    const clientSecret = resolveSecret();
     const body = new URLSearchParams({
       client_id: clientId,
       client_secret: clientSecret,
@@ -366,6 +435,7 @@ export function createOAuthManager(options = {}) {
     if (!auth?.refreshToken) {
       throw new Error('尚未登录 Google 账号。');
     }
+    const clientSecret = resolveSecret();
     const body = new URLSearchParams({
       client_id: clientId,
       client_secret: clientSecret,
