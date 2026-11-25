@@ -97,18 +97,70 @@ export function createRouterServer(deps) {
   const loadCatalog = deps.getAgyCatalogFn || getAgyCatalog;
   const getClientAuth = deps.clientAuthHeader || deps.authHeader;
 
-  async function fetchUpstreamMessages(sessionID, req, expectedAuth) {
-    try {
+  async function fetchAllUpstreamMessagesResult(sessionID, req, expectedAuth, options = {}) {
+    const pageLimit = 200;
+    const seenCursors = new Set();
+    const collected = [];
+    let cursor = null;
+
+    for (let page = 0; page < 50; page += 1) {
+      const params = new URLSearchParams({ limit: String(pageLimit) });
+      if (options.type) params.set('type', options.type);
+      if (cursor) params.set('cursor', cursor);
+
       const up = await fetchUpstream({
         upstreamBase: deps.upstreamBase(),
         authHeader: expectedAuth,
         req,
         method: 'GET',
-        pathAndQuery: `/api/session/${encodeURIComponent(sessionID)}/message`,
+        pathAndQuery: `/api/session/${encodeURIComponent(sessionID)}/message?${params.toString()}`,
       });
-      if (!up.ok) return [];
-      const json = await up.json().catch(() => null);
-      return Array.isArray(json?.data) ? json.data : [];
+      const text = await up.text();
+      if (!up.ok) {
+        if (page === 0) {
+          return {
+            ok: false,
+            status: up.status,
+            contentType: up.headers.get('content-type') || 'application/json',
+            text,
+          };
+        }
+        break;
+      }
+
+      let json = null;
+      try {
+        json = JSON.parse(text);
+      } catch {
+        if (page === 0) {
+          return {
+            ok: false,
+            status: 502,
+            contentType: 'application/json',
+            text: JSON.stringify({ error: 'Invalid JSON from upstream message list' }),
+          };
+        }
+        break;
+      }
+
+      const items = Array.isArray(json?.data) ? json.data : [];
+      collected.push(...items);
+
+      const nextCursor = typeof json?.cursor?.next === 'string' && json.cursor.next ? json.cursor.next : null;
+      if (!nextCursor || items.length < pageLimit || seenCursors.has(nextCursor)) {
+        break;
+      }
+      seenCursors.add(nextCursor);
+      cursor = nextCursor;
+    }
+
+    return { ok: true, messages: collected };
+  }
+
+  async function fetchUpstreamMessages(sessionID, req, expectedAuth) {
+    try {
+      const result = await fetchAllUpstreamMessagesResult(sessionID, req, expectedAuth);
+      return result.ok ? result.messages : [];
     } catch {
       return [];
     }
@@ -459,6 +511,7 @@ export function createRouterServer(deps) {
         // 7b. Delete Session
         if (method === 'DELETE' && sub === '') {
           deps.agyRunner.interrupt(sessionID);
+          deps.agyRunner.retireWorker?.(sessionID);
           deps.agyRunner.closeWatchersForParent?.(sessionID);
           deps.store.deleteSession(sessionID);
           if (isAgyChildSessionID(sessionID)) {
@@ -511,7 +564,9 @@ export function createRouterServer(deps) {
           if (nextModel?.providerID === AGY_PROVIDER_ID) {
             const prev = deps.store.getSession(sessionID)?.activeModel || undefined;
             deps.store.setSessionModel(sessionID, nextModel);
-            deps.store.setNeedsUpstreamSync(sessionID, true);
+            if (prev?.providerID !== AGY_PROVIDER_ID) {
+              deps.store.setNeedsUpstreamSync(sessionID, true);
+            }
             deps.sseHub.broadcast({
               type: 'session.model.selected',
               ...(directory ? { location: { directory } } : {}),
@@ -623,62 +678,23 @@ export function createRouterServer(deps) {
             deps.store.upsertMessage(sessionID, userMessage);
 
             const effectiveDir = directory || sessionState?.directory || null;
-            const loc = effectiveDir ? { location: { directory: effectiveDir } } : {};
-            const delivery = parsed.delivery || 'queue';
+            const delivery = parsed.delivery === 'steer' ? 'steer' : 'queue';
             const handover = await prepareAgyHandoverContext(sessionID, req, expectedAuth);
-            const wasBusy = deps.agyRunner.isRunning(sessionID);
 
-            deps.sseHub.broadcast({
-              type: 'session.inbox.enqueued',
+            await deps.agyRunner.submitTurnInput(sessionID, {
+              messageID,
+              itemType: 'user',
+              delivery,
               created: now,
-              ...loc,
-              data: {
-                sessionID,
-                inboxID: messageID,
-                item: { type: 'user', payload: userPayload },
-              },
+              inboxPayload: userPayload,
+              modelID: activeModel.id,
+              variant: activeModel.variant,
+              agent: activeAgent,
+              directory: effectiveDir,
+              handoverContext: handover.handoverContext,
+              promptPayload: userPayload,
             });
-
-            if (wasBusy) {
-              deps.agyRunner.enqueueTurnInput(sessionID, {
-                messageID,
-                modelID: activeModel.id,
-                variant: activeModel.variant,
-                agent: activeAgent,
-                directory: effectiveDir,
-                handoverContext: handover.handoverContext,
-                promptPayload: userPayload,
-              });
-              deps.store.markUpstreamMessagesSynced(sessionID, handover.upstreamMessageIds);
-            } else {
-              deps.sseHub.broadcast({
-                type: 'session.inbox.delivered',
-                created: now,
-                ...loc,
-                data: { sessionID, inboxID: messageID },
-              });
-
-              const started = await deps.agyRunner.startTurn({
-                sessionID,
-                modelID: activeModel.id,
-                variant: activeModel.variant,
-                agent: activeAgent,
-                directory: effectiveDir,
-                handoverContext: handover.handoverContext,
-                promptPayload: userPayload,
-              });
-              deps.store.markUpstreamMessagesSynced(sessionID, handover.upstreamMessageIds);
-              if (!started.ok) {
-                deps.agyRunner.enqueueTurnInput(sessionID, {
-                  messageID,
-                  modelID: activeModel.id,
-                  variant: activeModel.variant,
-                  agent: activeAgent,
-                  directory: effectiveDir,
-                  promptPayload: userPayload,
-                });
-              }
-            }
+            deps.store.markUpstreamMessagesSynced(sessionID, handover.upstreamMessageIds);
 
             sendJson(res, 200, {
               data: {
@@ -741,66 +757,28 @@ export function createRouterServer(deps) {
 
             const activeAgent = deps.store.getSession(sessionID)?.agent || undefined;
             const effectiveDir = directory || sessionState?.directory || null;
+            const delivery = parsed.delivery === 'steer' ? 'steer' : 'queue';
             const handover = await prepareAgyHandoverContext(sessionID, req, expectedAuth);
-            deps.sseHub.broadcast({
-              type: 'session.inbox.enqueued',
+            const syntheticPayload = {
+              text,
+              ...(syntheticMsg.description ? { description: syntheticMsg.description } : {}),
+              ...(parsed.metadata ? { metadata: parsed.metadata } : {}),
+            };
+
+            await deps.agyRunner.submitTurnInput(sessionID, {
+              messageID,
+              itemType: 'synthetic',
+              delivery,
               created: now,
-              ...(effectiveDir ? { location: { directory: effectiveDir } } : {}),
-              data: {
-                sessionID,
-                inboxID: messageID,
-                item: {
-                  type: 'synthetic',
-                  payload: {
-                    text,
-                    ...(syntheticMsg.description ? { description: syntheticMsg.description } : {}),
-                    ...(parsed.metadata ? { metadata: parsed.metadata } : {}),
-                  },
-                },
-              },
+              inboxPayload: syntheticPayload,
+              modelID: activeModel.id,
+              variant: activeModel.variant,
+              agent: activeAgent,
+              directory: effectiveDir,
+              handoverContext: handover.handoverContext,
+              promptPayload: { text },
             });
-
-            const wasBusy = deps.agyRunner.isRunning(sessionID);
-            if (wasBusy) {
-              deps.agyRunner.enqueueTurnInput(sessionID, {
-                messageID,
-                modelID: activeModel.id,
-                variant: activeModel.variant,
-                agent: activeAgent,
-                directory: effectiveDir,
-                handoverContext: handover.handoverContext,
-                promptPayload: { text },
-              });
-              deps.store.markUpstreamMessagesSynced(sessionID, handover.upstreamMessageIds);
-            } else {
-              deps.sseHub.broadcast({
-                type: 'session.inbox.delivered',
-                created: now,
-                ...(effectiveDir ? { location: { directory: effectiveDir } } : {}),
-                data: { sessionID, inboxID: messageID },
-              });
-
-              const started = await deps.agyRunner.startTurn({
-                sessionID,
-                modelID: activeModel.id,
-                variant: activeModel.variant,
-                agent: activeAgent,
-                directory: effectiveDir,
-                handoverContext: handover.handoverContext,
-                promptPayload: { text },
-              });
-              deps.store.markUpstreamMessagesSynced(sessionID, handover.upstreamMessageIds);
-              if (!started.ok) {
-                deps.agyRunner.enqueueTurnInput(sessionID, {
-                  messageID,
-                  modelID: activeModel.id,
-                  variant: activeModel.variant,
-                  agent: activeAgent,
-                  directory: effectiveDir,
-                  promptPayload: { text },
-                });
-              }
-            }
+            deps.store.markUpstreamMessagesSynced(sessionID, handover.upstreamMessageIds);
 
             sendJson(res, 200, { data: syntheticMsg });
             return;
@@ -945,46 +923,24 @@ export function createRouterServer(deps) {
             deps.store.upsertMessage(sessionID, { id: messageID, type: 'user', time: { created: now }, ...userPayload });
 
             const effectiveDir = directory || sessionState?.directory || null;
-            const loc = effectiveDir ? { location: { directory: effectiveDir } } : {};
+            const delivery = parsed.delivery === 'steer' ? 'steer' : 'queue';
             const handover = await prepareAgyHandoverContext(sessionID, req, expectedAuth);
             const activeAgent = deps.store.getSession(sessionID)?.agent || undefined;
 
-            deps.sseHub.broadcast({
-              type: 'session.inbox.enqueued',
+            await deps.agyRunner.submitTurnInput(sessionID, {
+              messageID,
+              itemType: 'user',
+              delivery,
               created: now,
-              ...loc,
-              data: { sessionID, inboxID: messageID, item: { type: 'user', payload: userPayload } },
+              inboxPayload: userPayload,
+              modelID: activeModel.id,
+              variant: activeModel.variant,
+              agent: activeAgent,
+              directory: effectiveDir,
+              handoverContext: handover.handoverContext,
+              promptPayload: userPayload,
             });
-
-            if (deps.agyRunner.isRunning(sessionID)) {
-              deps.agyRunner.enqueueTurnInput(sessionID, {
-                messageID,
-                modelID: activeModel.id,
-                variant: activeModel.variant,
-                agent: activeAgent,
-                directory: effectiveDir,
-                handoverContext: handover.handoverContext,
-                promptPayload: userPayload,
-              });
-              deps.store.markUpstreamMessagesSynced(sessionID, handover.upstreamMessageIds);
-            } else {
-              deps.sseHub.broadcast({
-                type: 'session.inbox.delivered',
-                created: now,
-                ...loc,
-                data: { sessionID, inboxID: messageID },
-              });
-              await deps.agyRunner.startTurn({
-                sessionID,
-                modelID: activeModel.id,
-                variant: activeModel.variant,
-                agent: activeAgent,
-                directory: effectiveDir,
-                handoverContext: handover.handoverContext,
-                promptPayload: userPayload,
-              });
-              deps.store.markUpstreamMessagesSynced(sessionID, handover.upstreamMessageIds);
-            }
+            deps.store.markUpstreamMessagesSynced(sessionID, handover.upstreamMessageIds);
             res.writeHead(204);
             res.end();
             return;
@@ -1111,10 +1067,62 @@ export function createRouterServer(deps) {
           return;
         }
 
+        // 7d-7. Session Inbox (list / promote queue->steer / cancel pending inputs)
+        if (method === 'GET' && sub === 'inbox') {
+          if (isAgyChildSessionID(sessionID)) {
+            sendJson(res, 200, { data: [] });
+            return;
+          }
+          const sessionState = deps.store.getSession(sessionID);
+          const pending = deps.agyRunner.listInbox?.(sessionID) || [];
+          if (sessionState?.activeModel?.providerID === AGY_PROVIDER_ID || pending.length > 0) {
+            sendJson(res, 200, { data: pending });
+            return;
+          }
+        }
+
+        const inboxItemMatch = sub.match(/^inbox\/([^/]+)$/);
+        if (inboxItemMatch && (method === 'PATCH' || method === 'DELETE')) {
+          const inboxID = decodeURIComponent(inboxItemMatch[1]);
+          if (isAgyChildSessionID(sessionID)) {
+            res.writeHead(204);
+            res.end();
+            return;
+          }
+          const sessionState = deps.store.getSession(sessionID);
+          const pending = deps.agyRunner.listInbox?.(sessionID) || [];
+          const hasPending = pending.some((item) => item?.id === inboxID);
+          if (sessionState?.activeModel?.providerID === AGY_PROVIDER_ID || hasPending) {
+            if (method === 'DELETE') {
+              deps.agyRunner.cancelInboxItem?.(sessionID, inboxID);
+              res.writeHead(204);
+              res.end();
+              return;
+            }
+            const bodyBuf = await readBodyBuffer(req);
+            let parsed = {};
+            try {
+              parsed = bodyBuf.length ? JSON.parse(bodyBuf.toString('utf8')) : {};
+            } catch {}
+            const outcome = deps.agyRunner.updateInboxDelivery?.(sessionID, inboxID, parsed?.delivery);
+            if (!outcome?.ok) {
+              sendJson(res, outcome?.status || 409, { error: outcome?.error || `Pending input cannot change delivery: ${inboxID}` });
+              return;
+            }
+            res.writeHead(204);
+            res.end();
+            return;
+          }
+        }
+
         // 7e. Interrupt Execution
         if (method === 'POST' && sub === 'interrupt') {
           if (deps.agyRunner.interrupt(sessionID)) {
             sendJson(res, 200, { interrupted: true });
+            return;
+          }
+          if (isAgyChildSessionID(sessionID)) {
+            sendJson(res, 200, { interrupted: false });
             return;
           }
         }
@@ -1130,46 +1138,67 @@ export function createRouterServer(deps) {
           }
         }
 
-        // 7f. List Messages (merge OpenCode messages + local agy-cli messages)
+        // 7f. List Messages (merge OpenCode messages + local agy-cli messages with OpenCode-compatible cursor pagination)
         if (method === 'GET' && sub === 'message') {
+          const limitParam = url.searchParams.get('limit');
+          const parsedLimit = limitParam ? Number.parseInt(limitParam, 10) : undefined;
+          const limit = Number.isFinite(parsedLimit) && parsedLimit > 0 ? parsedLimit : undefined;
+          const order = url.searchParams.get('order') || undefined;
+          const cursor = url.searchParams.get('cursor') || undefined;
+          const type = url.searchParams.get('type') || undefined;
+
           if (isAgyChildSessionID(sessionID)) {
             deps.agyRunner.syncChildSession?.(sessionID);
-            const limitParam = url.searchParams.get('limit');
-            const limit = limitParam ? Number.parseInt(limitParam, 10) : undefined;
-            const order = url.searchParams.get('order') || undefined;
-            const type = url.searchParams.get('type') || undefined;
-            const data = deps.store.mergeMessages([], sessionID, { order, type, limit });
-            sendJson(res, 200, { data });
+            const page = deps.store.paginateMessages([], sessionID, { order, cursor, type, limit });
+            if (page.invalidCursor) {
+              sendJson(res, 400, { error: 'Invalid cursor' });
+              return;
+            }
+            sendJson(res, 200, { data: page.data, cursor: page.cursor });
             return;
           }
-          const up = await fetchUpstream({
-            upstreamBase: deps.upstreamBase(),
-            authHeader: expectedAuth,
-            req,
-            method,
-            pathAndQuery,
-          });
-          const text = await up.text();
-          if (!up.ok) {
-            res.writeHead(up.status, { 'Content-Type': up.headers.get('content-type') || 'application/json' });
-            res.end(text);
-            return;
-          }
-          const json = JSON.parse(text);
-          const limit = url.searchParams.get('limit');
+
           const inFlight = deps.agyRunner.getInFlightAssistantMessages
             ? deps.agyRunner.getInFlightAssistantMessages(sessionID)
             : (() => {
                 const single = deps.agyRunner.getInFlightAssistantMessage?.(sessionID);
                 return single ? [single] : [];
               })();
-          json.data = deps.store.mergeMessages(Array.isArray(json.data) ? json.data : [], sessionID, {
-            order: url.searchParams.get('order') || undefined,
-            type: url.searchParams.get('type') || undefined,
-            limit: limit ? Number.parseInt(limit, 10) : undefined,
+          const hasLocalMessages = deps.store.getMessages(sessionID).length > 0 || inFlight.length > 0;
+
+          if (!hasLocalMessages) {
+            const up = await fetchUpstream({
+              upstreamBase: deps.upstreamBase(),
+              authHeader: expectedAuth,
+              req,
+              method,
+              pathAndQuery,
+            });
+            const text = await up.text();
+            res.writeHead(up.status, { 'Content-Type': up.headers.get('content-type') || 'application/json' });
+            res.end(text);
+            return;
+          }
+
+          const upResult = await fetchAllUpstreamMessagesResult(sessionID, req, expectedAuth, { type });
+          if (!upResult.ok) {
+            res.writeHead(upResult.status, { 'Content-Type': upResult.contentType || 'application/json' });
+            res.end(upResult.text);
+            return;
+          }
+
+          const page = deps.store.paginateMessages(upResult.messages, sessionID, {
+            order,
+            cursor,
+            type,
+            limit,
             ...(inFlight.length > 0 ? { extraMessages: inFlight } : {}),
           });
-          sendJson(res, up.status, json);
+          if (page.invalidCursor) {
+            sendJson(res, 400, { error: 'Invalid cursor' });
+            return;
+          }
+          sendJson(res, 200, { data: page.data, cursor: page.cursor });
           return;
         }
       }

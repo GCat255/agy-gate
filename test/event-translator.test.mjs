@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { AgyTurnTranslator } from '../src/agy/event-translator.mjs';
+import { AgyTurnTranslator, isTransientAgyAuthErrorText } from '../src/agy/event-translator.mjs';
 
 test('AgyTurnTranslator maps ACP thought, tool, text delta, usage_update, and prompt result into OpenCode events', () => {
   const events = [];
@@ -449,4 +449,136 @@ test('AgyTurnTranslator preserves openchamber_render answer metadata even when A
     answer: renderEnvelope.data.answer,
   });
   assert.deepEqual(msg.content[0].state.metadata?.openchamber, successEvt.data.metadata.openchamber);
+});
+
+test('AgyTurnTranslator flushes open tools on interrupt/fail and omits idle on steer interrupt', () => {
+  const steerEvents = [];
+  const trSteer = new AgyTurnTranslator({
+    sessionID: 'ses_steer_tr',
+    assistantMessageID: 'msg_st_1',
+    modelID: 'gemini-4-hydrogen-high',
+    emit: (ev) => steerEvents.push(ev),
+  });
+  trSteer.begin();
+  trSteer.handleAcpUpdate({
+    sessionUpdate: 'tool_call',
+    toolCallId: 'call_open_1',
+    name: 'read_file',
+    rawInput: { Path: 'a.txt' },
+    status: 'in_progress',
+  });
+  const steerMsg = trSteer.interrupt('superseded', { emitIdle: false, toolMessage: 'Interrupted by follow-up message' });
+  assert.equal(steerMsg.finish, 'unknown');
+  assert.equal(steerMsg.content.length, 1);
+  assert.equal(steerMsg.content[0].state.status, 'error');
+  assert.equal(steerMsg.content[0].state.error.message, 'Interrupted by follow-up message');
+  assert.ok(steerEvents.some((e) => e.type === 'session.tool.failed' && e.data.id === 'call_open_1'));
+  assert.ok(steerEvents.some((e) => e.type === 'session.step.ended' && e.data.finish === 'unknown'));
+  assert.equal(steerEvents.some((e) => e.type === 'session.execution.interrupted'), false);
+  assert.equal(steerEvents.some((e) => e.type === 'session.idle'), false);
+
+  const failEvents = [];
+  const trFail = new AgyTurnTranslator({
+    sessionID: 'ses_fail_tr',
+    assistantMessageID: 'msg_fl_1',
+    modelID: 'gemini-4-hydrogen-high',
+    emit: (ev) => failEvents.push(ev),
+  });
+  trFail.begin();
+  trFail.handleAcpUpdate({
+    sessionUpdate: 'tool_call',
+    toolCallId: 'call_open_2',
+    name: 'run_command',
+    rawInput: { CommandLine: 'sleep 10' },
+    status: 'in_progress',
+  });
+  const failMsg = trFail.fail('ACP crashed');
+  assert.equal(failMsg.finish, 'error');
+  assert.equal(failMsg.content[0].state.status, 'error');
+  assert.equal(failMsg.content[0].state.error.message, 'ACP crashed');
+  assert.ok(failEvents.some((e) => e.type === 'session.tool.failed' && e.data.id === 'call_open_2'));
+  assert.ok(failEvents.some((e) => e.type === 'session.execution.failed'));
+});
+
+test('isTransientAgyAuthErrorText matches 401/UNAUTHENTICATED variants and ignores normal text', () => {
+  assert.equal(
+    isTransientAgyAuthErrorText(
+      '⚠ UNAUTHENTICATED (code 401): Request had invalid authentication credentials. Expected OAuth 2 access token, login cookie or other valid authentication credential.',
+    ),
+    true,
+  );
+  assert.equal(
+    isTransientAgyAuthErrorText('agent executor error: UNAUTHENTICATED (code 401): Request had invalid authentication credentials.'),
+    true,
+  );
+  assert.equal(isTransientAgyAuthErrorText('⚠ Caution: workspace has uncommitted files'), false);
+  assert.equal(isTransientAgyAuthErrorText('HTTP 404 Not Found'), false);
+  assert.equal(isTransientAgyAuthErrorText(''), false);
+});
+
+test('AgyTurnTranslator buffers ⚠ prefix, suppresses 401 on retry, flushes benign warnings, and exposes exhausted 401', () => {
+  // 1. Benign ⚠ warning chunked across deltas flushes intact
+  const warnEvents = [];
+  const trWarn = new AgyTurnTranslator({
+    sessionID: 'ses_warn',
+    assistantMessageID: 'msg_warn',
+    modelID: 'gemini-4-hydrogen-high',
+    emit: (ev) => warnEvents.push(ev),
+  });
+  trWarn.begin();
+  trWarn.handleAcpUpdate({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '⚠ ' } });
+  trWarn.handleAcpUpdate({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Watch out for symlinks.' } });
+  const warnMsg = trWarn.completeFromPromptResult({ stopReason: 'end_turn' });
+  assert.equal(trWarn.authErrorDetected, false);
+  assert.equal(warnMsg.content[0].text, '⚠ Watch out for symlinks.');
+  assert.ok(warnEvents.some((e) => e.type === 'session.text.delta' && String(e.data?.delta || '').includes('Watch out')));
+
+  // 2. Step-1 401 is suppressed during retry, leaving zero leaked delta events
+  const retryEvents = [];
+  const trRetry = new AgyTurnTranslator({
+    sessionID: 'ses_auth_retry',
+    assistantMessageID: 'msg_auth_retry',
+    modelID: 'gemini-4-hydrogen-high',
+    emit: (ev) => retryEvents.push(ev),
+  });
+  trRetry.begin();
+  trRetry.handleAcpUpdate({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '⚠ UNAUTHENTICATED (code ' } });
+  trRetry.handleAcpUpdate({
+    sessionUpdate: 'agent_message_chunk',
+    content: { type: 'text', text: '401): Request had invalid authentication credentials.' },
+  });
+  assert.equal(trRetry.authErrorDetected, true);
+  assert.equal(trRetry.hasNonErrorProgress(), false);
+  assert.equal(retryEvents.some((e) => e.type === 'session.text.delta'), false);
+  trRetry.prepareForAuthRetry();
+  assert.equal(trRetry.authErrorDetected, false);
+  trRetry.handleAcpUpdate({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Recovered answer.' } });
+  const recoveredMsg = trRetry.completeFromPromptResult({ stopReason: 'end_turn' });
+  assert.equal(recoveredMsg.content[0].text, 'Recovered answer.');
+
+  // 3. After tool progress, hasNonErrorProgress is true and exhausted retry still surfaces error text
+  const exEvents = [];
+  const trEx = new AgyTurnTranslator({
+    sessionID: 'ses_auth_ex',
+    assistantMessageID: 'msg_auth_ex',
+    modelID: 'gemini-4-hydrogen-high',
+    emit: (ev) => exEvents.push(ev),
+  });
+  trEx.begin();
+  trEx.handleAcpUpdate({
+    sessionUpdate: 'tool_call',
+    toolCallId: 'call_ex_1',
+    name: 'read_file',
+    rawInput: { Path: 'README.md' },
+    status: 'completed',
+    rawOutput: 'ok',
+  });
+  assert.equal(trEx.hasNonErrorProgress(), true);
+  trEx.handleAcpUpdate({
+    sessionUpdate: 'agent_message_chunk',
+    content: { type: 'text', text: '⚠ UNAUTHENTICATED (code 401): Request had invalid authentication credentials.' },
+  });
+  const finalMsg = trEx.completeFromPromptResult({ stopReason: 'end_turn' });
+  assert.equal(trEx.authErrorDetected, true);
+  assert.ok(finalMsg.content.some((p) => p.type === 'text' && p.text.includes('UNAUTHENTICATED (code 401)')));
 });

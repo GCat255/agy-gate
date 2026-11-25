@@ -94,6 +94,7 @@ test('router server injects variant models, reuses warm ACP worker across turns,
       "    }",
       "    if (firstText.includes('wait cancel')) {",
       "      pendingPromptReqId = req.id;",
+      "      console.log(JSON.stringify({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: conv, update: { sessionUpdate: 'tool_call', toolCallId: 'call_wait_1', name: 'read_file', rawInput: { Path: 'wait.txt' }, status: 'in_progress' } } }));",
       "      console.log(JSON.stringify({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: conv, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'partial' } } } }));",
       "      pendingTimer = setTimeout(() => {",
       "        if (pendingPromptReqId === req.id) {",
@@ -101,6 +102,16 @@ test('router server injects variant models, reuses warm ACP worker across turns,
       "          console.log(JSON.stringify({ jsonrpc: '2.0', id: req.id, result: { stopReason: 'end_turn' } }));",
       "        }",
       "      }, 3000);",
+      "      return;",
+      "    }",
+      "    if (firstText.includes('steered immediate')) {",
+      "      console.log(JSON.stringify({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: conv, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'steered ok' } } } }));",
+      "      console.log(JSON.stringify({ jsonrpc: '2.0', id: req.id, result: { stopReason: 'end_turn' } }));",
+      "      return;",
+      "    }",
+      "    if (firstText.includes('promoted inbox steer')) {",
+      "      console.log(JSON.stringify({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: conv, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'promoted ok' } } } }));",
+      "      console.log(JSON.stringify({ jsonrpc: '2.0', id: req.id, result: { stopReason: 'end_turn' } }));",
       "      return;",
       "    }",
       "    if (firstText.includes('slow first')) {",
@@ -490,6 +501,144 @@ test('router server injects variant models, reuses warm ACP worker across turns,
     assert.ok(afterQueueMsgs.data.some((m) => m.type === 'assistant' && m.finish === 'stop' && m.content?.some((p) => p.type === 'text' && p.text === 'slow done')));
     assert.ok(afterQueueMsgs.data.some((m) => m.type === 'assistant' && m.finish === 'stop' && m.content?.some((p) => p.type === 'text' && p.text === 'queued done')));
 
+    // 5f-2. Mid-turn delivery:'steer' cancels running ACP prompt immediately without emitting session.idle
+    const idleCountBeforeSteer = received.filter((e) => e.type === 'session.idle').length;
+    const interruptedCountBeforeSteer = received.filter((e) => e.type === 'session.execution.interrupted').length;
+    const eventCountBeforeSteer = received.length;
+    const tSteerStart = Date.now();
+    await fetch(`${gwBase}/api/session/ses_test/prompt`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-opencode-directory': 'E:/proj' },
+      body: JSON.stringify({ id: 'msg_u_slow_for_steer', text: 'wait cancel for steer' }),
+    });
+    deadline = Date.now() + 2000;
+    while (!received.slice(eventCountBeforeSteer).some((e) => e.type === 'session.text.delta' && e.data?.delta === 'partial') && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 15));
+    }
+
+    // Queue one message first, then send a steer message that must jump ahead AND cancel the slow turn immediately
+    const qBehindRes = await fetch(`${gwBase}/api/session/ses_test/prompt`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-opencode-directory': 'E:/proj' },
+      body: JSON.stringify({ id: 'msg_u_behind_steer', text: 'queued follow-up', delivery: 'queue' }),
+    });
+    assert.equal(qBehindRes.status, 200);
+
+    const steerRes = await fetch(`${gwBase}/api/session/ses_test/prompt`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-opencode-directory': 'E:/proj' },
+      body: JSON.stringify({ id: 'msg_u_steer', text: 'steered immediate', delivery: 'steer' }),
+    });
+    assert.equal(steerRes.status, 200);
+    assert.equal((await steerRes.json()).data.delivery, 'steer');
+
+    deadline = Date.now() + 2000;
+    while (received.filter((e) => e.type === 'session.idle').length < idleCountBeforeSteer + 2 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 15));
+    }
+    const steerElapsed = Date.now() - tSteerStart;
+    assert.ok(steerElapsed < 2000, `Expected steer to cancel slow 3000ms turn immediately, took ${steerElapsed}ms`);
+    assert.equal(
+      received.filter((e) => e.type === 'session.execution.interrupted').length,
+      interruptedCountBeforeSteer,
+      'Steer transition must NOT emit session.execution.interrupted',
+    );
+    const steerSlice = received.slice(eventCountBeforeSteer);
+    assert.ok(steerSlice.some((e) => e.type === 'session.tool.failed' && e.data?.id === 'call_wait_1'), 'Open tool must fail cleanly on steer');
+    const steerDeliveredIdx = steerSlice.findIndex((e) => e.type === 'session.inbox.delivered' && e.data?.inboxID === 'msg_u_steer');
+    const behindDeliveredIdx = steerSlice.findIndex((e) => e.type === 'session.inbox.delivered' && e.data?.inboxID === 'msg_u_behind_steer');
+    assert.ok(steerDeliveredIdx >= 0 && behindDeliveredIdx > steerDeliveredIdx, 'Steer item must be delivered before queued item');
+
+    // Verify GET /message preserves chronological order (?order=asc) and newest-first default after queued/steered delivery timestamp update
+    const afterSteerMsgs = (await (await fetch(`${gwBase}/api/session/ses_test/message?order=asc`)).json()).data;
+    const steerUserIdx = afterSteerMsgs.findIndex((m) => m.id === 'msg_u_steer');
+    const behindUserIdx = afterSteerMsgs.findIndex((m) => m.id === 'msg_u_behind_steer');
+    assert.ok(steerUserIdx >= 0 && behindUserIdx > steerUserIdx, 'GET /message?order=asc must order steered user message before queued message');
+
+    const descPage = await (await fetch(`${gwBase}/api/session/ses_test/message?limit=3`)).json();
+    assert.equal(descPage.data.length, 3);
+    assert.ok((descPage.data[0]?.time?.created ?? 0) >= (descPage.data[1]?.time?.created ?? 0));
+    assert.ok(descPage.cursor?.next, 'GET /message?limit=3 must provide cursor.next when older messages remain');
+    const descPage2 = await (
+      await fetch(`${gwBase}/api/session/ses_test/message?limit=3&cursor=${encodeURIComponent(descPage.cursor.next)}`)
+    ).json();
+    assert.equal(descPage2.data.length, 3);
+    assert.ok(
+      (descPage.data.at(-1)?.time?.created ?? 0) >= (descPage2.data[0]?.time?.created ?? 0),
+      'cursor.next in default desc mode must return strictly older messages',
+    );
+    assert.notEqual(descPage2.data[0]?.id, descPage.data[0]?.id);
+
+    // 5f-3. Inbox API: GET /inbox, DELETE /inbox/:id, PATCH /inbox/:id (promote queue -> steer)
+    const idleCountBeforeInbox = received.filter((e) => e.type === 'session.idle').length;
+    const evCountBeforeInbox = received.length;
+    await fetch(`${gwBase}/api/session/ses_test/prompt`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-opencode-directory': 'E:/proj' },
+      body: JSON.stringify({ id: 'msg_u_slow_inbox', text: 'wait cancel for inbox' }),
+    });
+    deadline = Date.now() + 2000;
+    while (!received.slice(evCountBeforeInbox).some((e) => e.type === 'session.text.delta' && e.data?.delta === 'partial') && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 15));
+    }
+
+    await fetch(`${gwBase}/api/session/ses_test/prompt`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-opencode-directory': 'E:/proj' },
+      body: JSON.stringify({ id: 'msg_inbox_del', text: 'delete me', delivery: 'queue' }),
+    });
+    await fetch(`${gwBase}/api/session/ses_test/prompt`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-opencode-directory': 'E:/proj' },
+      body: JSON.stringify({ id: 'msg_inbox_promote', text: 'promoted inbox steer', delivery: 'queue' }),
+    });
+
+    const inboxList = await (await fetch(`${gwBase}/api/session/ses_test/inbox`)).json();
+    assert.deepEqual(inboxList.data.map((i) => i.id), ['msg_inbox_del', 'msg_inbox_promote']);
+
+    const delInboxRes = await fetch(`${gwBase}/api/session/ses_test/inbox/msg_inbox_del`, { method: 'DELETE' });
+    assert.equal(delInboxRes.status, 204);
+    deadline = Date.now() + 1500;
+    while (!received.some((e) => e.type === 'session.inbox.cancelled' && e.data?.inboxID === 'msg_inbox_del') && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    assert.ok(received.some((e) => e.type === 'session.inbox.cancelled' && e.data?.inboxID === 'msg_inbox_del'));
+
+    const patchInboxRes = await fetch(`${gwBase}/api/session/ses_test/inbox/msg_inbox_promote`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ delivery: 'steer' }),
+    });
+    assert.equal(patchInboxRes.status, 204);
+    deadline = Date.now() + 1500;
+    while (!received.some((e) => e.type === 'session.inbox.delivery.changed' && e.data?.inboxID === 'msg_inbox_promote') && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    assert.ok(received.some((e) => e.type === 'session.inbox.delivery.changed' && e.data?.inboxID === 'msg_inbox_promote' && e.data?.delivery === 'steer'));
+
+    const missingPatchRes = await fetch(`${gwBase}/api/session/ses_test/inbox/msg_missing`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ delivery: 'steer' }),
+    });
+    assert.equal(missingPatchRes.status, 409);
+
+    deadline = Date.now() + 2500;
+    while (received.filter((e) => e.type === 'session.idle').length < idleCountBeforeInbox + 1 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 15));
+    }
+    const inboxAfterMsgs = (await (await fetch(`${gwBase}/api/session/ses_test/message`)).json()).data;
+    assert.equal(inboxAfterMsgs.some((m) => m.id === 'msg_inbox_del'), false, 'Deleted inbox message must be removed from store');
+    assert.ok(inboxAfterMsgs.some((m) => m.type === 'assistant' && m.content?.[0]?.text === 'promoted ok'));
+
+    // Switching between agy-cli models must NOT re-arm needsUpstreamSync
+    await fetch(`${gwBase}/api/session/ses_test/model`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: { providerID: AGY_PROVIDER_ID, id: 'gemini-4-hydrogen', variant: 'low' } }),
+    });
+    assert.equal(store.getSession('ses_test')?.needsUpstreamSync, false);
+
     // 5g. Switch session agent to `plan` -> emits session.agent.selected, respawns without --dangerously-skip-permissions, sends session/set_mode(plan) & Plan directive
     const idleCountBeforePlan = received.filter((e) => e.type === 'session.idle').length;
     const agentRes = await fetch(`${gwBase}/api/session/ses_test/agent`, {
@@ -599,6 +748,354 @@ test('router server injects variant models, reuses warm ACP worker across turns,
     for (const c of upstreamSseClients) c.end();
     await new Promise((resolve) => upstream.close(resolve));
     await new Promise((r) => setTimeout(r, 100));
+    try {
+      fs.rmSync(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+    } catch {}
+  }
+});
+
+test('AgyRunner auto-recovers from transient 401 auth errors, supports interrupt during backoff, and rotates aged workers', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-router-401-'));
+  const mockAgyCmd = path.join(tempDir, process.platform === 'win32' ? 'mock-agy.cmd' : 'mock-agy.sh');
+  const mockAgyJs = path.join(tempDir, 'mock-agy.mjs');
+  const stateFile = path.join(tempDir, 'mock-state.json');
+
+  fs.writeFileSync(
+    mockAgyJs,
+    [
+      "import fs from 'node:fs';",
+      "import readline from 'node:readline';",
+      `const stateFile = ${JSON.stringify(stateFile)};`,
+      "function loadState() {",
+      "  return fs.existsSync(stateFile) ? JSON.parse(fs.readFileSync(stateFile, 'utf8')) : { boots: 0, resumedIds: [], prompts: [] };",
+      "}",
+      "function saveState(st) {",
+      "  fs.writeFileSync(stateFile, JSON.stringify(st), 'utf8');",
+      "}",
+      "const st0 = loadState();",
+      "const myBoot = st0.boots + 1;",
+      "st0.boots = myBoot;",
+      "saveState(st0);",
+      "const conv = 'conv_401_test';",
+      "const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });",
+      "rl.on('line', (line) => {",
+      "  if (!line.trim()) return;",
+      "  const req = JSON.parse(line);",
+      "  if (req.method === 'initialize') {",
+      "    console.log(JSON.stringify({ jsonrpc: '2.0', id: req.id, result: { protocolVersion: 1, agentCapabilities: { promptCapabilities: { image: true } } } }));",
+      "    return;",
+      "  }",
+      "  if (req.method === 'session/new' || req.method === 'session/resume') {",
+      "    if (req.method === 'session/resume') {",
+      "      const s = loadState();",
+      "      s.resumedIds.push(req.params?.sessionId || null);",
+      "      saveState(s);",
+      "    }",
+      "    console.log(JSON.stringify({ jsonrpc: '2.0', id: req.id, result: { sessionId: conv } }));",
+      "    return;",
+      "  }",
+      "  if (req.method === 'session/set_model' || req.method === 'session/set_config_option' || req.method === 'session/set_mode') {",
+      "    console.log(JSON.stringify({ jsonrpc: '2.0', id: req.id, result: {} }));",
+      "    return;",
+      "  }",
+      "  if (req.method === 'session/prompt') {",
+      "    const text = (req.params?.prompt || []).find((b) => b.type === 'text')?.text || '';",
+      "    const s = loadState();",
+      "    s.prompts.push({ boot: myBoot, text });",
+      "    saveState(s);",
+      "    if (text === '/compact') {",
+      "      if (myBoot === 1) {",
+      "        console.log(JSON.stringify({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: conv, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '⚠ UNAUTHENTICATED (code 401): Request had invalid authentication credentials.' } } } }));",
+      "        console.log(JSON.stringify({ jsonrpc: '2.0', id: req.id, result: { stopReason: 'end_turn' } }));",
+      "      } else {",
+      "        console.log(JSON.stringify({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: conv, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Compact recovered ok' } } } }));",
+      "        console.log(JSON.stringify({ jsonrpc: '2.0', id: req.id, result: { stopReason: 'end_turn' } }));",
+      "      }",
+      "      return;",
+      "    }",
+      "    if (text.includes('case-step1-text-401')) {",
+      "      if (myBoot === 1) {",
+      "        console.log(JSON.stringify({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: conv, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '⚠ UNAUTHENTICATED (code ' } } } }));",
+      "        console.log(JSON.stringify({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: conv, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '401): Request had invalid authentication credentials.' } } } }));",
+      "        console.log(JSON.stringify({ jsonrpc: '2.0', id: req.id, result: { stopReason: 'end_turn' } }));",
+      "      } else {",
+      "        console.log(JSON.stringify({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: conv, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'step1 recovered' } } } }));",
+      "        console.log(JSON.stringify({ jsonrpc: '2.0', id: req.id, result: { stopReason: 'end_turn' } }));",
+      "      }",
+      "      return;",
+      "    }",
+      "    if (text.includes('case-rpc-401')) {",
+      "      if (myBoot === 1) {",
+      "        console.log(JSON.stringify({ jsonrpc: '2.0', id: req.id, error: { code: -32603, message: 'UNAUTHENTICATED (code 401): Request had invalid authentication credentials.' } }));",
+      "      } else {",
+      "        console.log(JSON.stringify({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: conv, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'rpc recovered' } } } }));",
+      "        console.log(JSON.stringify({ jsonrpc: '2.0', id: req.id, result: { stopReason: 'end_turn' } }));",
+      "      }",
+      "      return;",
+      "    }",
+      "    if (text.includes('case-midturn-401')) {",
+      "      console.log(JSON.stringify({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: conv, update: { sessionUpdate: 'tool_call', toolCallId: 'call_mid_1', name: 'read_file', rawInput: { Path: 'a.txt' }, status: 'in_progress' } } }));",
+      "      console.log(JSON.stringify({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: conv, update: { sessionUpdate: 'tool_call_update', toolCallId: 'call_mid_1', name: 'read_file', rawInput: { Path: 'a.txt' }, status: 'completed', rawOutput: 'file body' } } }));",
+      "      console.log(JSON.stringify({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: conv, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '⚠ UNAUTHENTICATED (code 401): Request had invalid authentication credentials.' } } } }));",
+      "      console.log(JSON.stringify({ jsonrpc: '2.0', id: req.id, result: { stopReason: 'end_turn' } }));",
+      "      return;",
+      "    }",
+      "    if (text === 'Continue from where you left off.') {",
+      "      console.log(JSON.stringify({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: conv, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'midturn continued' } } } }));",
+      "      console.log(JSON.stringify({ jsonrpc: '2.0', id: req.id, result: { stopReason: 'end_turn' } }));",
+      "      return;",
+      "    }",
+      "    if (text.includes('case-always-401')) {",
+      "      console.log(JSON.stringify({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: conv, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '⚠ UNAUTHENTICATED (code 401): Request had invalid authentication credentials.' } } } }));",
+      "      console.log(JSON.stringify({ jsonrpc: '2.0', id: req.id, result: { stopReason: 'end_turn' } }));",
+      "      return;",
+      "    }",
+      "    console.log(JSON.stringify({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: conv, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `ok-boot-${myBoot}` } } } }));",
+      "    console.log(JSON.stringify({ jsonrpc: '2.0', id: req.id, result: { stopReason: 'end_turn' } }));",
+      "  }",
+      "});",
+    ].join('\n'),
+    'utf8',
+  );
+
+  if (process.platform === 'win32') {
+    fs.writeFileSync(mockAgyCmd, `@echo off\r\n"${process.execPath}" "${mockAgyJs}" %*\r\n`, 'ascii');
+  } else {
+    fs.writeFileSync(mockAgyCmd, `#!/usr/bin/env sh\nexec "${process.execPath}" "${mockAgyJs}" "$@"\n`, { mode: 0o755 });
+  }
+
+  const resetMockState = () => {
+    try {
+      fs.unlinkSync(stateFile);
+    } catch {}
+  };
+  const readMockState = () => (fs.existsSync(stateFile) ? JSON.parse(fs.readFileSync(stateFile, 'utf8')) : { boots: 0, resumedIds: [], prompts: [] });
+
+  const createHarness = (extraEnv = {}) => {
+    const storeDir = fs.mkdtempSync(path.join(tempDir, 'store-'));
+    const store = new RouterStore(storeDir);
+    const sseHub = new SseHub({ upstreamUrl: () => '', authHeader: () => null });
+    const events = [];
+    const origBroadcast = sseHub.broadcast.bind(sseHub);
+    sseHub.broadcast = (ev) => {
+      events.push(ev);
+      return origBroadcast(ev);
+    };
+    const runner = new AgyRunner({
+      store,
+      sseHub,
+      env: {
+        ...process.env,
+        AGY_ROUTER_AGY_BIN: mockAgyCmd,
+        AGY_ROUTER_MAGPIE_BIN: path.join(tempDir, 'no-magpie.exe'),
+        AGY_ROUTER_HOME_DIR: tempDir,
+        AGY_ROUTER_DISABLE_AUTO_TITLE: '1',
+        AGY_ROUTER_AUTH_RETRY_DELAY_MS: '40',
+        ...extraEnv,
+      },
+    });
+    return { store, sseHub, events, runner };
+  };
+
+  const waitUntil = async (pred, timeoutMs = 4000) => {
+    const deadline = Date.now() + timeoutMs;
+    while (!pred() && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 15));
+    }
+    assert.equal(Boolean(pred()), true);
+  };
+
+  try {
+    // 1. Step-1 chunked `⚠ UNAUTHENTICATED (code 401)` auto-retries on fresh resumed worker without leaking 401
+    resetMockState();
+    {
+      const { store, sseHub, events, runner } = createHarness();
+      try {
+        await runner.startTurn({
+          sessionID: 'ses_case1',
+          modelID: 'gemini-4-hydrogen',
+          variant: 'high',
+          directory: tempDir,
+          promptPayload: { id: 'msg_u_c1', text: 'case-step1-text-401' },
+        });
+        await waitUntil(() => events.some((e) => e.type === 'session.idle' && e.data?.sessionID === 'ses_case1'));
+        const st = readMockState();
+        assert.equal(st.boots, 2);
+        assert.deepEqual(st.resumedIds, ['conv_401_test']);
+        assert.equal(st.prompts.length, 2);
+        assert.equal(st.prompts[0].text, st.prompts[1].text);
+        assert.ok(st.prompts[0].text.endsWith('case-step1-text-401'));
+        assert.equal(events.filter((e) => e.type === 'session.idle').length, 1);
+        assert.equal(events.some((e) => e.type === 'session.text.delta' && String(e.data?.delta || '').includes('UNAUTHENTICATED')), false);
+        const msgs = store.getMessages('ses_case1').filter((m) => m.type === 'assistant');
+        assert.equal(msgs.length, 1);
+        assert.equal(msgs[0].content[0].text, 'step1 recovered');
+      } finally {
+        runner.stopAll();
+        sseHub.close();
+      }
+    }
+
+    // 2. JSON-RPC `session/prompt` 401 error rejection auto-recovers
+    resetMockState();
+    {
+      const { store, sseHub, events, runner } = createHarness();
+      try {
+        await runner.startTurn({
+          sessionID: 'ses_case2',
+          modelID: 'gemini-4-hydrogen',
+          variant: 'high',
+          directory: tempDir,
+          promptPayload: { id: 'msg_u_c2', text: 'case-rpc-401' },
+        });
+        await waitUntil(() => events.some((e) => e.type === 'session.idle' && e.data?.sessionID === 'ses_case2'));
+        const st = readMockState();
+        assert.equal(st.boots, 2);
+        assert.equal(events.some((e) => e.type === 'session.execution.failed'), false);
+        const msgs = store.getMessages('ses_case2').filter((m) => m.type === 'assistant');
+        assert.equal(msgs[0].content[0].text, 'rpc recovered');
+      } finally {
+        runner.stopAll();
+        sseHub.close();
+      }
+    }
+
+    // 3. Mid-turn 401 after tool completion resumes with continuation prompt and keeps earlier tool step
+    resetMockState();
+    {
+      const { store, sseHub, events, runner } = createHarness();
+      try {
+        await runner.startTurn({
+          sessionID: 'ses_case3',
+          modelID: 'gemini-4-hydrogen',
+          variant: 'high',
+          directory: tempDir,
+          promptPayload: { id: 'msg_u_c3', text: 'case-midturn-401' },
+        });
+        await waitUntil(() => events.some((e) => e.type === 'session.idle' && e.data?.sessionID === 'ses_case3'));
+        const st = readMockState();
+        assert.equal(st.boots, 2);
+        assert.equal(st.prompts.length, 2);
+        assert.ok(st.prompts[0].text.endsWith('case-midturn-401'));
+        assert.equal(st.prompts[1].text, 'Continue from where you left off.');
+        const assistantMsgs = store.getMessages('ses_case3').filter((m) => m.type === 'assistant');
+        assert.equal(assistantMsgs.length, 2);
+        assert.equal(assistantMsgs[0].content[0].type, 'tool');
+        assert.equal(assistantMsgs[0].content[0].state.status, 'completed');
+        assert.equal(assistantMsgs[1].content[0].text, 'midturn continued');
+      } finally {
+        runner.stopAll();
+        sseHub.close();
+      }
+    }
+
+    // 4. Exhausted retry budget emits the 401 text transparently without infinite looping
+    resetMockState();
+    {
+      const { store, sseHub, events, runner } = createHarness({ AGY_ROUTER_MAX_AUTH_RETRIES: '1' });
+      try {
+        await runner.startTurn({
+          sessionID: 'ses_case4',
+          modelID: 'gemini-4-hydrogen',
+          variant: 'high',
+          directory: tempDir,
+          promptPayload: { id: 'msg_u_c4', text: 'case-always-401' },
+        });
+        await waitUntil(() => events.some((e) => e.type === 'session.idle' && e.data?.sessionID === 'ses_case4'));
+        const st = readMockState();
+        assert.equal(st.boots, 2);
+        const assistantMsgs = store.getMessages('ses_case4').filter((m) => m.type === 'assistant');
+        assert.ok(assistantMsgs[0].content.some((p) => p.text?.includes('UNAUTHENTICATED (code 401)')));
+      } finally {
+        runner.stopAll();
+        sseHub.close();
+      }
+    }
+
+    // 5. User interrupt during retry backoff cancels retry immediately without respawning
+    resetMockState();
+    {
+      const { sseHub, events, runner } = createHarness({ AGY_ROUTER_AUTH_RETRY_DELAY_MS: '500' });
+      try {
+        await runner.startTurn({
+          sessionID: 'ses_case5',
+          modelID: 'gemini-4-hydrogen',
+          variant: 'high',
+          directory: tempDir,
+          promptPayload: { id: 'msg_u_c5', text: 'case-always-401' },
+        });
+        await waitUntil(() => readMockState().prompts.length === 1);
+        await new Promise((r) => setTimeout(r, 40));
+        assert.equal(runner.isRunning('ses_case5'), true);
+        assert.equal(runner.interrupt('ses_case5'), true);
+        await waitUntil(() => events.some((e) => e.type === 'session.idle' && e.data?.sessionID === 'ses_case5'));
+        assert.equal(readMockState().boots, 1);
+        assert.equal(events.some((e) => e.type === 'session.execution.interrupted'), true);
+      } finally {
+        runner.stopAll();
+        sseHub.close();
+      }
+    }
+
+    // 6. Proactive worker max-age rotation respawns idle warm worker after threshold
+    resetMockState();
+    {
+      const { store, sseHub, events, runner } = createHarness({ AGY_ROUTER_WORKER_MAX_AGE_MS: '35' });
+      try {
+        await runner.startTurn({
+          sessionID: 'ses_case6',
+          modelID: 'gemini-4-hydrogen',
+          variant: 'high',
+          directory: tempDir,
+          promptPayload: { id: 'msg_u_c6a', text: 'first-age-turn' },
+        });
+        await waitUntil(() => events.some((e) => e.type === 'session.idle' && e.data?.sessionID === 'ses_case6'));
+        await new Promise((r) => setTimeout(r, 60));
+        await runner.startTurn({
+          sessionID: 'ses_case6',
+          modelID: 'gemini-4-hydrogen',
+          variant: 'high',
+          directory: tempDir,
+          promptPayload: { id: 'msg_u_c6b', text: 'second-age-turn' },
+        });
+        await waitUntil(() => events.filter((e) => e.type === 'session.idle' && e.data?.sessionID === 'ses_case6').length === 2);
+        const st = readMockState();
+        assert.equal(st.boots, 2);
+        const msgs = store.getMessages('ses_case6').filter((m) => m.type === 'assistant');
+        assert.equal(msgs[0].content[0].text, 'ok-boot-1');
+        assert.equal(msgs[1].content[0].text, 'ok-boot-2');
+      } finally {
+        runner.stopAll();
+        sseHub.close();
+      }
+    }
+
+    // 7. Compaction `/compact` 401 auto-recovers cleanly on replacement worker
+    resetMockState();
+    {
+      const { store, sseHub, events, runner } = createHarness();
+      try {
+        store.upsertMessage('ses_case7', { id: 'msg_seed', type: 'user', text: 'seed', time: { created: Date.now() } });
+        const res = await runner.compactSession({
+          sessionID: 'ses_case7',
+          modelID: 'gemini-4-hydrogen',
+          variant: 'high',
+          directory: tempDir,
+        });
+        assert.equal(res.ok, true);
+        await waitUntil(() => events.some((e) => e.type === 'session.compaction.ended' && e.data?.sessionID === 'ses_case7'));
+        const st = readMockState();
+        assert.equal(st.boots, 2);
+        assert.deepEqual(st.prompts.map((p) => p.text), ['/compact', '/compact']);
+        const compactMsg = store.getMessages('ses_case7').find((m) => m.type === 'compaction');
+        assert.equal(compactMsg.status, 'completed');
+        assert.equal(compactMsg.summary, 'Compact recovered ok');
+      } finally {
+        runner.stopAll();
+        sseHub.close();
+      }
+    }
+  } finally {
     try {
       fs.rmSync(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
     } catch {}

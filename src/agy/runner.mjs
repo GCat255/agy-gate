@@ -10,7 +10,11 @@ import {
   buildDefaultPermissionAllowResult,
   buildDefaultPermissionRejectResult,
 } from './acp-client.mjs';
-import { AgyTurnTranslator, normalizeUsageBuckets } from './event-translator.mjs';
+import {
+  AgyTurnTranslator,
+  isTransientAgyAuthErrorText,
+  normalizeUsageBuckets,
+} from './event-translator.mjs';
 import {
   AgySubagentWatcher,
   buildSubagentCompletionSynthetic,
@@ -30,6 +34,10 @@ import {
 } from './session-title.mjs';
 
 const DEFAULT_WORKER_IDLE_MS = 15 * 60_000;
+const DEFAULT_WORKER_MAX_AGE_MS = 45 * 60_000;
+const DEFAULT_MAX_AUTH_RETRIES = 1;
+const DEFAULT_AUTH_RETRY_DELAY_MS = 350;
+const CONTINUATION_PROMPT_AFTER_401 = 'Continue from where you left off.';
 const CANCEL_FORCE_KILL_DELAY_MS = 3_000;
 const EFFORT_SUFFIX_RE = /^(.+)-(low|medium|high|xhigh|max)$/;
 const PLAN_MODE_DIRECTIVE =
@@ -169,6 +177,16 @@ export class AgyRunner {
     this.renameSessionTitle = options.renameSessionTitle || null;
     const rawIdle = Number.parseInt(this.env.AGY_ROUTER_WORKER_IDLE_MS || '', 10);
     this.workerIdleMs = Number.isFinite(rawIdle) && rawIdle >= 0 ? rawIdle : DEFAULT_WORKER_IDLE_MS;
+    const rawMaxAge = Number.parseInt(this.env.AGY_ROUTER_WORKER_MAX_AGE_MS || '', 10);
+    this.workerMaxAgeMs = Number.isFinite(rawMaxAge) && rawMaxAge >= 0 ? rawMaxAge : DEFAULT_WORKER_MAX_AGE_MS;
+    const rawAuthRetries = Number.parseInt(this.env.AGY_ROUTER_MAX_AUTH_RETRIES || '', 10);
+    this.maxAuthRetries = Number.isFinite(rawAuthRetries) && rawAuthRetries >= 0
+      ? rawAuthRetries
+      : DEFAULT_MAX_AUTH_RETRIES;
+    const rawAuthRetryDelay = Number.parseInt(this.env.AGY_ROUTER_AUTH_RETRY_DELAY_MS || '', 10);
+    this.authRetryDelayMs = Number.isFinite(rawAuthRetryDelay) && rawAuthRetryDelay >= 0
+      ? rawAuthRetryDelay
+      : DEFAULT_AUTH_RETRY_DELAY_MS;
     this.useWarmWorker = this.env.AGY_ROUTER_WARM_WORKER !== '0';
 
     /**
@@ -176,10 +194,12 @@ export class AgyRunner {
      *   client: AgyAcpClient,
      *   acpSessionId: string,
      *   cwd: string,
+     *   createdAt?: number,
      *   appliedModelKey: string | null,
      *   busy: boolean,
      *   exited: boolean,
      *   interrupted: boolean,
+     *   steered: boolean,
      *   hadFirstTurn: boolean,
      *   idleTimer: NodeJS.Timeout | null,
      *   cancelTimer: NodeJS.Timeout | null,
@@ -187,11 +207,11 @@ export class AgyRunner {
      * }>}
      */
     this.workers = new Map();
-    /** @type {Map<string, { translator: AgyTurnTranslator, directory?: string | null, aborted: boolean, client: AgyAcpClient | null }>} */
+    /** @type {Map<string, { translator: AgyTurnTranslator | null, directory?: string | null, aborted: boolean, steerAbort?: boolean, client: AgyAcpClient | null, cancelSleep?: (() => void) | null }>} */
     this.startingSessions = new Map();
     /** @type {Map<string, { watcher: AgySubagentWatcher, parentSessionID: string }>} */
     this.childWatchers = new Map();
-    /** @type {Map<string, Array<{ messageID?: string, modelID: string, variant?: string, directory?: string | null, promptPayload: any }>>} */
+    /** @type {Map<string, Array<{ messageID?: string, itemType?: string, delivery?: 'queue'|'steer', created?: number, inboxPayload?: any, modelID: string, variant?: string, agent?: string, directory?: string | null, handoverContext?: string | null, promptPayload: any }>>} */
     this.pendingTurnQueue = new Map();
     /** @type {Set<AbortController>} */
     this.autoTitleControllers = new Set();
@@ -256,13 +276,239 @@ export class AgyRunner {
 
   /**
    * Queue a follow-up turn payload when the session is currently busy.
+   * Steer items jump ahead of queued items while preserving FIFO order among steers.
    * @param {string} sessionID
-   * @param {{ messageID?: string, modelID: string, variant?: string, directory?: string | null, promptPayload: any }} item
+   * @param {{ messageID?: string, itemType?: string, delivery?: 'queue'|'steer', created?: number, inboxPayload?: any, modelID: string, variant?: string, agent?: string, directory?: string | null, handoverContext?: string | null, promptPayload: any }} item
    */
   enqueueTurnInput(sessionID, item) {
+    const delivery = item?.delivery === 'steer' ? 'steer' : 'queue';
+    const entry = {
+      ...item,
+      delivery,
+      itemType: item?.itemType || 'user',
+      created: typeof item?.created === 'number' ? item.created : Date.now(),
+    };
     const list = this.pendingTurnQueue.get(sessionID) || [];
-    list.push(item);
+    if (delivery === 'steer') {
+      let insertIdx = 0;
+      while (insertIdx < list.length && list[insertIdx]?.delivery === 'steer') {
+        insertIdx += 1;
+      }
+      list.splice(insertIdx, 0, entry);
+    } else {
+      list.push(entry);
+    }
     this.pendingTurnQueue.set(sessionID, list);
+  }
+
+  _hasPendingSteer(sessionID) {
+    const list = this.pendingTurnQueue.get(sessionID);
+    return Array.isArray(list) && list.some((item) => item?.delivery === 'steer');
+  }
+
+  _triggerSteer(sessionID) {
+    const starting = this.startingSessions.get(sessionID);
+    if (starting) {
+      starting.aborted = true;
+      starting.steerAbort = true;
+      starting.cancelSleep?.();
+      starting.client?.close(true);
+      const w = this.workers.get(sessionID);
+      if (w) {
+        w.interrupted = true;
+        w.steered = true;
+        if (w.acpSessionId) w.client.notify('session/cancel', { sessionId: w.acpSessionId });
+        if (!w.cancelTimer) {
+          w.cancelTimer = setTimeout(() => {
+            if (w.busy) this._retireWorker(sessionID, true);
+          }, CANCEL_FORCE_KILL_DELAY_MS);
+          w.cancelTimer.unref?.();
+        }
+      }
+      return true;
+    }
+
+    const worker = this.workers.get(sessionID);
+    if (!worker || !worker.busy) return false;
+    if (worker.steered) return true;
+    worker.interrupted = true;
+    worker.steered = true;
+    if (worker.acpSessionId) {
+      worker.client.notify('session/cancel', { sessionId: worker.acpSessionId });
+    }
+    if (!worker.cancelTimer) {
+      worker.cancelTimer = setTimeout(() => {
+        if (worker.busy) this._retireWorker(sessionID, true);
+      }, CANCEL_FORCE_KILL_DELAY_MS);
+      worker.cancelTimer.unref?.();
+    }
+    return true;
+  }
+
+  /**
+   * Submit a user/synthetic/command turn input, respecting `delivery: 'steer' | 'queue'`.
+   * Emits `session.inbox.enqueued`, and either starts immediately, queues behind active work,
+   * or immediately interrupts the active ACP turn (`session/cancel`) to continue with the steered message.
+   * @param {string} sessionID
+   * @param {{ messageID?: string, itemType?: 'user'|'synthetic', delivery?: 'queue'|'steer', created?: number, inboxPayload?: any, modelID: string, variant?: string, agent?: string, directory?: string | null, handoverContext?: string | null, promptPayload: any }} item
+   */
+  async submitTurnInput(sessionID, item) {
+    const delivery = item?.delivery === 'steer' ? 'steer' : 'queue';
+    const created = typeof item?.created === 'number' ? item.created : Date.now();
+    const itemType = item?.itemType || 'user';
+    const effectiveDir = item?.directory || this.store.getSession(sessionID)?.directory || null;
+    const loc = effectiveDir ? { location: { directory: effectiveDir } } : {};
+    const inboxPayload = item?.inboxPayload || { text: String(item?.promptPayload?.text || '') };
+
+    if (item?.messageID) {
+      this.sseHub.broadcast({
+        type: 'session.inbox.enqueued',
+        created,
+        ...loc,
+        data: {
+          sessionID,
+          inboxID: item.messageID,
+          item: { type: itemType, payload: inboxPayload },
+        },
+      });
+    }
+
+    const normalized = {
+      ...item,
+      delivery,
+      created,
+      itemType,
+      directory: effectiveDir,
+      inboxPayload,
+    };
+
+    if (!this.isRunning(sessionID)) {
+      const deliveredAt = Math.max(Date.now(), created);
+      if (normalized.messageID) {
+        this.store.updateMessageTimestamp?.(sessionID, normalized.messageID, deliveredAt);
+        this.sseHub.broadcast({
+          type: 'session.inbox.delivered',
+          created: deliveredAt,
+          ...loc,
+          data: { sessionID, inboxID: normalized.messageID },
+        });
+      }
+      const started = await this.startTurn({
+        sessionID,
+        modelID: normalized.modelID,
+        variant: normalized.variant,
+        agent: normalized.agent,
+        directory: effectiveDir,
+        handoverContext: normalized.handoverContext,
+        promptPayload: normalized.promptPayload,
+        minCreated: deliveredAt + 1,
+      });
+      if (!started.ok) {
+        this.enqueueTurnInput(sessionID, normalized);
+        if (delivery === 'steer') {
+          this._triggerSteer(sessionID);
+        }
+      }
+      return;
+    }
+
+    this.enqueueTurnInput(sessionID, normalized);
+    if (delivery === 'steer') {
+      this._triggerSteer(sessionID);
+    }
+  }
+
+  /**
+   * List pending inbox entries for `sessionID` matching OpenCode `SessionInbox.Entry`.
+   * @param {string} sessionID
+   */
+  listInbox(sessionID) {
+    const list = this.pendingTurnQueue.get(sessionID);
+    if (!list || list.length === 0) return [];
+    return list
+      .filter((item) => Boolean(item?.messageID))
+      .map((item) => ({
+        id: item.messageID,
+        sessionID,
+        type: item.itemType || 'user',
+        delivery: item.delivery === 'steer' ? 'steer' : 'queue',
+        payload: item.inboxPayload || { text: String(item.promptPayload?.text || '') },
+        time: { created: item.created || Date.now() },
+      }));
+  }
+
+  /**
+   * Change the delivery mode (`'steer' | 'queue'`) of a pending inbox item.
+   * Promoting to `'steer'` immediately triggers steering of the active turn.
+   * @param {string} sessionID
+   * @param {string} inboxID
+   * @param {'steer'|'queue'} delivery
+   */
+  updateInboxDelivery(sessionID, inboxID, delivery) {
+    if (delivery !== 'steer' && delivery !== 'queue') {
+      return { ok: false, status: 400, error: 'delivery must be "steer" or "queue"' };
+    }
+    const list = this.pendingTurnQueue.get(sessionID);
+    const idx = list ? list.findIndex((item) => item?.messageID === inboxID) : -1;
+    if (idx < 0) {
+      return { ok: false, status: 409, error: `Pending input cannot change delivery: ${inboxID}` };
+    }
+    const [item] = list.splice(idx, 1);
+    item.delivery = delivery;
+    if (delivery === 'steer') {
+      let insertIdx = 0;
+      while (insertIdx < list.length && list[insertIdx]?.delivery === 'steer') {
+        insertIdx += 1;
+      }
+      list.splice(insertIdx, 0, item);
+    } else {
+      let lastSteerIdx = 0;
+      while (lastSteerIdx < list.length && list[lastSteerIdx]?.delivery === 'steer') {
+        lastSteerIdx += 1;
+      }
+      list.splice(Math.max(lastSteerIdx, idx), 0, item);
+    }
+
+    const effectiveDir = item.directory || this.store.getSession(sessionID)?.directory || null;
+    const loc = effectiveDir ? { location: { directory: effectiveDir } } : {};
+    this.sseHub.broadcast({
+      type: 'session.inbox.delivery.changed',
+      created: Date.now(),
+      ...loc,
+      data: { sessionID, inboxID, delivery },
+    });
+
+    if (delivery === 'steer') {
+      if (!this._triggerSteer(sessionID) && !this.isRunning(sessionID)) {
+        queueMicrotask(() => void this._drainPendingQueue(sessionID));
+      }
+    }
+    return { ok: true };
+  }
+
+  /**
+   * Cancel a pending inbox item before it is delivered.
+   * @param {string} sessionID
+   * @param {string} inboxID
+   */
+  cancelInboxItem(sessionID, inboxID) {
+    const list = this.pendingTurnQueue.get(sessionID);
+    if (!list || list.length === 0) return { ok: true, removed: false };
+    const idx = list.findIndex((item) => item?.messageID === inboxID);
+    if (idx < 0) return { ok: true, removed: false };
+
+    const [removedItem] = list.splice(idx, 1);
+    if (list.length === 0) this.pendingTurnQueue.delete(sessionID);
+    this.store.deleteMessage?.(sessionID, inboxID);
+    const effectiveDir = removedItem?.directory || this.store.getSession(sessionID)?.directory || null;
+    const loc = effectiveDir ? { location: { directory: effectiveDir } } : {};
+    this.sseHub.broadcast({
+      type: 'session.inbox.cancelled',
+      created: Date.now(),
+      ...loc,
+      data: { sessionID, inboxID },
+    });
+    return { ok: true, removed: true };
   }
 
   _clearPendingQueueOnInterrupt(sessionID) {
@@ -382,11 +628,13 @@ export class AgyRunner {
     const next = list.shift();
     if (list.length === 0) this.pendingTurnQueue.delete(sessionID);
     if (!next) return;
+    const deliveredAt = Date.now();
     if (next.messageID) {
+      this.store.updateMessageTimestamp?.(sessionID, next.messageID, deliveredAt);
       const effectiveDir = next.directory || this.store.getSession(sessionID)?.directory || null;
       this.sseHub.broadcast({
         type: 'session.inbox.delivered',
-        created: Date.now(),
+        created: deliveredAt,
         ...(effectiveDir ? { location: { directory: effectiveDir } } : {}),
         data: { sessionID, inboxID: next.messageID },
       });
@@ -399,6 +647,7 @@ export class AgyRunner {
       directory: next.directory,
       handoverContext: next.handoverContext,
       promptPayload: next.promptPayload,
+      minCreated: deliveredAt + 1,
     });
   }
 
@@ -593,6 +842,9 @@ export class AgyRunner {
 
     const useMagpie = this.env.AGY_ROUTER_USE_MAGPIE === '1';
     const childEnv = { ...this.env };
+    if (this.env.AGY_ROUTER_HOME_DIR?.trim() && !childEnv.GEMINI_HOME) {
+      childEnv.GEMINI_HOME = this.env.AGY_ROUTER_HOME_DIR.trim();
+    }
     if (opts.sessionID) childEnv.OPENCHAMBER_ROUTER_SESSION_ID = opts.sessionID;
     if (opts.cwd) childEnv.OPENCHAMBER_ROUTER_DIRECTORY = opts.cwd;
     if (opts.callLogPath) childEnv.OPENCHAMBER_ROUTER_CALL_LOG = opts.callLogPath;
@@ -847,7 +1099,8 @@ export class AgyRunner {
         }
         if (worker.turn) {
           if (worker.interrupted) {
-            this._settleTurn(worker, opts.sessionID, 'interrupt');
+            const outcome = worker.steered && this._hasPendingSteer(opts.sessionID) ? 'steer' : 'interrupt';
+            this._settleTurn(worker, opts.sessionID, outcome);
           } else if (code === 0) {
             this._settleTurn(worker, opts.sessionID, 'complete');
           } else {
@@ -863,6 +1116,7 @@ export class AgyRunner {
       client,
       acpSessionId: '',
       cwd: opts.cwd,
+      createdAt: Date.now(),
       skipPermissions: Boolean(cfg.skipPermissions),
       permissionMode: opts.planMode ? 'plan' : 'build',
       availableModes: new Set(),
@@ -871,6 +1125,7 @@ export class AgyRunner {
       busy: false,
       exited: false,
       interrupted: false,
+      steered: false,
       hadFirstTurn: Boolean(opts.existingConvId),
       idleTimer: null,
       cancelTimer: null,
@@ -933,30 +1188,325 @@ export class AgyRunner {
     }
   }
 
+  _isWorkerExpired(worker) {
+    if (!worker || this.workerMaxAgeMs <= 0) return false;
+    const createdAt = Number(worker.createdAt || 0);
+    if (!createdAt) return false;
+    return Date.now() - createdAt >= this.workerMaxAgeMs;
+  }
+
+  _sleepRetryDelay(entry, ms) {
+    if (!ms || ms <= 0 || entry?.aborted) return Promise.resolve();
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        if (entry) entry.cancelSleep = null;
+        resolve();
+      }, ms);
+      timer.unref?.();
+      if (entry) {
+        entry.cancelSleep = () => {
+          clearTimeout(timer);
+          entry.cancelSleep = null;
+          resolve();
+        };
+      }
+    });
+  }
+
+  /**
+   * Retire a worker after a transient 401, pause briefly for fresh OAuth credentials on disk,
+   * and spawn + resume a replacement worker while keeping `isRunning(sessionID)` continuously true.
+   */
+  async _respawnWorkerForAuthRetry(opts) {
+    const {
+      oldWorker,
+      expectedTurn,
+      sessionID,
+      directory,
+      cwd,
+      callLogPath,
+      planMode,
+      modelID,
+      variant,
+      realModelID,
+      targetModeId,
+    } = opts;
+    if (oldWorker.turn !== expectedTurn) {
+      return { status: 'stale' };
+    }
+    if (oldWorker.idleTimer) {
+      clearTimeout(oldWorker.idleTimer);
+      oldWorker.idleTimer = null;
+    }
+    if (oldWorker.cancelTimer) {
+      clearTimeout(oldWorker.cancelTimer);
+      oldWorker.cancelTimer = null;
+    }
+    oldWorker.turn = null;
+    oldWorker.busy = false;
+    oldWorker.steered = false;
+
+    const retryEntry = {
+      translator: expectedTurn.translator || null,
+      directory,
+      aborted: false,
+      steerAbort: false,
+      client: null,
+      cancelSleep: null,
+    };
+    this.startingSessions.set(sessionID, retryEntry);
+    this._retireWorker(sessionID, true);
+
+    let newWorker = null;
+    try {
+      await this._sleepRetryDelay(retryEntry, this.authRetryDelayMs);
+      if (retryEntry.aborted) {
+        const outcome = retryEntry.steerAbort && this._hasPendingSteer(sessionID) ? 'steer' : 'interrupt';
+        return { status: 'aborted', outcome };
+      }
+
+      const latestState = this.store.getSession(sessionID);
+      const resumeConvId = oldWorker.acpSessionId || latestState?.agyConversationId || null;
+      newWorker = await this._spawnAndInitWorker({
+        sessionID,
+        cwd,
+        callLogPath,
+        existingConvId: resumeConvId,
+        planMode,
+        onClientCreated: (client) => {
+          retryEntry.client = client;
+        },
+      });
+      if (!newWorker) {
+        return { status: 'failed', message: 'agy executable not found on this machine' };
+      }
+
+      if (retryEntry.aborted) {
+        newWorker.exited = true;
+        newWorker.client.close(true);
+        const outcome = retryEntry.steerAbort && this._hasPendingSteer(sessionID) ? 'steer' : 'interrupt';
+        return { status: 'aborted', outcome };
+      }
+
+      const modelKey = `${modelID}|${variant || ''}|${realModelID}`;
+      if (newWorker.appliedModelKey !== modelKey) {
+        await this._applySessionModel(newWorker.client, newWorker.acpSessionId, realModelID, variant);
+        newWorker.appliedModelKey = modelKey;
+      }
+      if (targetModeId) {
+        const shouldApplyMode =
+          newWorker.appliedModeId !== targetModeId
+          && (planMode || newWorker.appliedModeId === 'plan' || newWorker.availableModes?.has(targetModeId));
+        if (shouldApplyMode) {
+          await this._applySessionMode(newWorker.client, newWorker.acpSessionId, targetModeId);
+          newWorker.appliedModeId = targetModeId;
+        }
+      }
+
+      if (retryEntry.aborted) {
+        newWorker.exited = true;
+        newWorker.client.close(true);
+        const outcome = retryEntry.steerAbort && this._hasPendingSteer(sessionID) ? 'steer' : 'interrupt';
+        return { status: 'aborted', outcome };
+      }
+
+      newWorker.busy = true;
+      newWorker.interrupted = false;
+      newWorker.steered = false;
+      newWorker.hadFirstTurn = true;
+      if (typeof planMode === 'boolean') {
+        newWorker.permissionMode = planMode ? 'plan' : 'build';
+      }
+      newWorker.turn = expectedTurn;
+      this.workers.set(sessionID, newWorker);
+      return { status: 'ready', worker: newWorker };
+    } catch (err) {
+      if (newWorker) {
+        newWorker.exited = true;
+        newWorker.client.close(true);
+      }
+      if (retryEntry.aborted) {
+        const outcome = retryEntry.steerAbort && this._hasPendingSteer(sessionID) ? 'steer' : 'interrupt';
+        return { status: 'aborted', outcome };
+      }
+      return { status: 'failed', message: err?.message || String(err) };
+    } finally {
+      if (this.startingSessions.get(sessionID) === retryEntry) {
+        this.startingSessions.delete(sessionID);
+      }
+    }
+  }
+
+  _dispatchPromptWithAuthRetry(ctx) {
+    const { worker, sessionID, blocks, turnState, retryCount = 0 } = ctx;
+    void worker.client
+      .request('session/prompt', {
+        sessionId: worker.acpSessionId,
+        prompt: blocks,
+      })
+      .then(
+        (result) => {
+          if (worker.turn !== turnState) return;
+          if (result?.stopReason === 'cancelled' || worker.interrupted) {
+            if (result?.usage) turnState.translator.recordPromptUsage(result.usage);
+            const outcome = worker.steered && this._hasPendingSteer(sessionID) ? 'steer' : 'interrupt';
+            this._settleTurn(worker, sessionID, outcome);
+            return;
+          }
+          if (turnState.translator.authErrorDetected && retryCount < this.maxAuthRetries) {
+            void this._retryTurnAfterAuthFailure(ctx);
+            return;
+          }
+          this._settleTurn(worker, sessionID, 'complete', result);
+        },
+        (err) => {
+          if (worker.turn !== turnState) return;
+          if (worker.interrupted) {
+            const outcome = worker.steered && this._hasPendingSteer(sessionID) ? 'steer' : 'interrupt';
+            this._settleTurn(worker, sessionID, outcome);
+            return;
+          }
+          const errMsg = err?.message || String(err);
+          const isAuthErr = turnState.translator.authErrorDetected || isTransientAgyAuthErrorText(errMsg);
+          if (isAuthErr && retryCount < this.maxAuthRetries) {
+            void this._retryTurnAfterAuthFailure(ctx, errMsg);
+            return;
+          }
+          this._settleTurn(worker, sessionID, 'fail', errMsg);
+        },
+      );
+  }
+
+  async _retryTurnAfterAuthFailure(ctx, errMessage = '') {
+    const { worker, sessionID, blocks, turnState, cwd, callLogPath, isPlan, modelID, variant, realModelID, targetModeId, retryCount = 0 } = ctx;
+    if (worker.turn !== turnState) return;
+
+    this._syncMainTranscriptForSubagents(worker);
+    const shouldContinueProgress = turnState.translator.hasNonErrorProgress();
+    turnState.translator.prepareForAuthRetry();
+
+    const respawn = await this._respawnWorkerForAuthRetry({
+      oldWorker: worker,
+      expectedTurn: turnState,
+      sessionID,
+      directory: turnState.directory,
+      cwd,
+      callLogPath,
+      planMode: isPlan,
+      modelID,
+      variant,
+      realModelID,
+      targetModeId,
+    });
+
+    if (respawn.status === 'stale') return;
+    if (respawn.status === 'aborted') {
+      this._settleTurnState(null, turnState, sessionID, respawn.outcome);
+      return;
+    }
+    if (respawn.status === 'failed') {
+      this._settleTurnState(null, turnState, sessionID, 'fail', respawn.message || errMessage || 'Failed to recover from agy authentication error');
+      return;
+    }
+
+    const retryBlocks = shouldContinueProgress
+      ? [{ type: 'text', text: CONTINUATION_PROMPT_AFTER_401 }]
+      : blocks;
+    this._dispatchPromptWithAuthRetry({
+      ...ctx,
+      worker: respawn.worker,
+      blocks: retryBlocks,
+      retryCount: retryCount + 1,
+    });
+  }
+
+  async _retryCompactAfterAuthFailure(opts) {
+    const {
+      oldWorker,
+      compactTurn,
+      sessionID,
+      directory,
+      cwd,
+      callLogPath,
+      modelID,
+      variant,
+      realModelID,
+      transcriptPathRef,
+      emitCompactionFailed,
+      onReady,
+    } = opts;
+    const respawn = await this._respawnWorkerForAuthRetry({
+      oldWorker,
+      expectedTurn: compactTurn,
+      sessionID,
+      directory,
+      cwd,
+      callLogPath,
+      planMode: false,
+      modelID,
+      variant,
+      realModelID,
+      targetModeId: null,
+    });
+
+    if (respawn.status === 'stale') return;
+    if (respawn.status === 'aborted') {
+      emitCompactionFailed('Compaction cancelled', { emitIdle: respawn.outcome !== 'steer' });
+      queueMicrotask(() => {
+        void this._drainPendingQueue(sessionID);
+      });
+      return;
+    }
+    if (respawn.status === 'failed') {
+      emitCompactionFailed(respawn.message || 'Failed to recover from agy authentication error');
+      queueMicrotask(() => {
+        void this._drainPendingQueue(sessionID);
+      });
+      return;
+    }
+
+    const nextPath = respawn.worker.acpSessionId
+      ? resolveBrainTranscriptPath(respawn.worker.acpSessionId, this.env.AGY_ROUTER_HOME_DIR || undefined)
+      : null;
+    if (nextPath) transcriptPathRef?.(nextPath);
+    onReady(respawn.worker);
+  }
+
   _settleTurn(worker, sessionID, outcome, payload) {
     const activeTurn = worker.turn;
     if (!activeTurn) return;
-    if (activeTurn.subagentSyncTimer) {
-      clearInterval(activeTurn.subagentSyncTimer);
-      activeTurn.subagentSyncTimer = null;
-    }
     if (worker.cancelTimer) {
       clearTimeout(worker.cancelTimer);
       worker.cancelTimer = null;
     }
 
     this._syncMainTranscriptForSubagents(worker);
-    const aborted = outcome === 'interrupt' || outcome === 'fail';
+    worker.turn = null;
+    worker.busy = false;
+    worker.steered = false;
+    this._settleTurnState(worker, activeTurn, sessionID, outcome, payload);
+  }
+
+  _settleTurnState(worker, activeTurn, sessionID, outcome, payload) {
+    if (activeTurn.subagentSyncTimer) {
+      clearInterval(activeTurn.subagentSyncTimer);
+      activeTurn.subagentSyncTimer = null;
+    }
+
+    const isSteer = outcome === 'steer';
+    const aborted = outcome === 'interrupt' || outcome === 'fail' || isSteer;
     this._flushSubagentWatchersForParent(activeTurn.sessionID, {
-      cancelRemaining: aborted,
+      cancelRemaining: outcome === 'interrupt' || outcome === 'fail',
       settleReplyNow: !aborted,
     });
 
-    worker.turn = null;
-    worker.busy = false;
-
     let assistantMsg;
-    if (outcome === 'interrupt') {
+    if (isSteer) {
+      assistantMsg = activeTurn.translator.interrupt('superseded', {
+        emitIdle: false,
+        toolMessage: 'Interrupted by follow-up message',
+      });
+    } else if (outcome === 'interrupt') {
       assistantMsg = activeTurn.translator.interrupt('user');
     } else if (outcome === 'fail') {
       assistantMsg = activeTurn.translator.fail(payload);
@@ -1001,14 +1551,16 @@ export class AgyRunner {
       });
     }
 
-    if (!this.useWarmWorker) {
-      this._retireWorker(sessionID, false);
-    } else if (!worker.exited && this.workerIdleMs > 0) {
-      if (worker.idleTimer) clearTimeout(worker.idleTimer);
-      worker.idleTimer = setTimeout(() => {
-        if (!worker.busy) this._retireWorker(sessionID, false);
-      }, this.workerIdleMs);
-      worker.idleTimer.unref();
+    if (worker) {
+      if (!this.useWarmWorker) {
+        this._retireWorker(sessionID, false);
+      } else if (!worker.exited && this.workerIdleMs > 0) {
+        if (worker.idleTimer) clearTimeout(worker.idleTimer);
+        worker.idleTimer = setTimeout(() => {
+          if (!worker.busy) this._retireWorker(sessionID, false);
+        }, this.workerIdleMs);
+        worker.idleTimer.unref();
+      }
     }
 
     queueMicrotask(() => {
@@ -1018,7 +1570,7 @@ export class AgyRunner {
 
   /**
    * Start an `agy acp` turn asynchronously, reusing the session's warm ACP worker when compatible.
-   * @param {{ sessionID: string, modelID: string, variant?: string, realModelID?: string, agent?: string, directory?: string | null, promptPayload: any }} params
+   * @param {{ sessionID: string, modelID: string, variant?: string, realModelID?: string, agent?: string, directory?: string | null, handoverContext?: string | null, minCreated?: number, promptPayload: any }} params
    */
   async startTurn(params) {
     const { sessionID, modelID, variant, agent, directory, promptPayload } = params;
@@ -1050,6 +1602,7 @@ export class AgyRunner {
       variant,
       agent: activeAgent,
       directory,
+      minCreated: params.minCreated,
       priorSessionTokens: sessionState?.sessionTokens || null,
       emit: (ev) => this.sseHub.broadcast(ev),
       onStepSettled: (stepMsg) => {
@@ -1074,9 +1627,17 @@ export class AgyRunner {
       onSubagentKilled: (killInfo) => this.handleSubagentKill(sessionID, killInfo),
     });
 
-    const startingEntry = { translator, directory, aborted: false, client: null };
+    const startingEntry = { translator, directory, aborted: false, steerAbort: false, client: null };
     this.startingSessions.set(sessionID, startingEntry);
     translator.begin();
+
+    const settleAbortedStart = () => {
+      const isSteer = Boolean(startingEntry.steerAbort && this._hasPendingSteer(sessionID));
+      const msg = isSteer
+        ? translator.interrupt('superseded', { emitIdle: false, toolMessage: 'Interrupted by follow-up message' })
+        : translator.interrupt('user');
+      if (msg) this.store.upsertMessage(sessionID, msg);
+    };
 
     let worker = null;
     try {
@@ -1111,6 +1672,7 @@ export class AgyRunner {
         && existing
         && !existing.exited
         && !existing.busy
+        && !this._isWorkerExpired(existing)
         && existing.cwd === cwd
         && existing.skipPermissions === wantSkipPermissions;
 
@@ -1140,8 +1702,7 @@ export class AgyRunner {
 
       if (startingEntry.aborted) {
         this._retireWorker(sessionID, true);
-        const msg = translator.interrupt('user');
-        if (msg) this.store.upsertMessage(sessionID, msg);
+        settleAbortedStart();
         return { ok: true };
       }
 
@@ -1171,6 +1732,7 @@ export class AgyRunner {
 
       worker.busy = true;
       worker.interrupted = false;
+      worker.steered = false;
       worker.hadFirstTurn = true;
       worker.permissionMode = isPlan ? 'plan' : 'build';
       worker.turn = turnState;
@@ -1189,48 +1751,49 @@ export class AgyRunner {
       }
 
       if (startingEntry.aborted || worker.interrupted) {
-        this._settleTurn(worker, sessionID, 'interrupt');
+        const outcome = (startingEntry.steerAbort || worker.steered) && this._hasPendingSteer(sessionID)
+          ? 'steer'
+          : 'interrupt';
+        this._settleTurn(worker, sessionID, outcome);
         return { ok: true };
       }
 
-      void worker.client
-        .request('session/prompt', {
-          sessionId: worker.acpSessionId,
-          prompt: blocks,
-        })
-        .then(
-          (result) => {
-            if (!worker.turn) return;
-            if (result?.stopReason === 'cancelled' || worker.interrupted) {
-              if (result?.usage) worker.turn.translator.recordPromptUsage(result.usage);
-              this._settleTurn(worker, sessionID, 'interrupt');
-            } else {
-              this._settleTurn(worker, sessionID, 'complete', result);
-            }
-          },
-          (err) => {
-            if (!worker.turn) return;
-            if (worker.interrupted) {
-              this._settleTurn(worker, sessionID, 'interrupt');
-            } else {
-              this._settleTurn(worker, sessionID, 'fail', err?.message || String(err));
-            }
-          },
-        );
+      this._dispatchPromptWithAuthRetry({
+        worker,
+        sessionID,
+        blocks,
+        turnState,
+        cwd,
+        callLogPath,
+        isPlan,
+        modelID,
+        variant,
+        realModelID,
+        targetModeId,
+        retryCount: 0,
+      });
 
       return { ok: true };
     } catch (err) {
       if (worker && worker.turn) {
-        this._settleTurn(worker, sessionID, startingEntry.aborted ? 'interrupt' : 'fail', err?.message || String(err));
+        const outcome = startingEntry.aborted
+          ? ((startingEntry.steerAbort || worker.steered) && this._hasPendingSteer(sessionID) ? 'steer' : 'interrupt')
+          : 'fail';
+        this._settleTurn(worker, sessionID, outcome, err?.message || String(err));
+      } else if (startingEntry.aborted) {
+        settleAbortedStart();
       } else {
-        const msg = startingEntry.aborted
-          ? translator.interrupt('user')
-          : translator.fail(err?.message || 'Failed to start agy acp turn');
+        const msg = translator.fail(err?.message || 'Failed to start agy acp turn');
         if (msg) this.store.upsertMessage(sessionID, msg);
       }
       return { ok: true };
     } finally {
-      this.startingSessions.delete(sessionID);
+      if (this.startingSessions.get(sessionID) === startingEntry) {
+        this.startingSessions.delete(sessionID);
+      }
+      if (!this.isRunning(sessionID) && (this.pendingTurnQueue.get(sessionID)?.length ?? 0) > 0) {
+        queueMicrotask(() => void this._drainPendingQueue(sessionID));
+      }
     }
   }
 
@@ -1370,7 +1933,7 @@ export class AgyRunner {
       return { ok: true, messageID, created };
     }
 
-    const emitCompactionFailed = (message) => {
+    const emitCompactionFailed = (message, { emitIdle = true } = {}) => {
       const now = Date.now();
       const errObj = { type: 'unknown', message: String(message || 'Compaction failed') };
       this.store.upsertMessage(sessionID, {
@@ -1395,18 +1958,20 @@ export class AgyRunner {
           error: errObj,
         },
       });
-      this.sseHub.broadcast({
-        type: 'session.execution.failed',
-        created: now,
-        ...loc,
-        data: { sessionID, error: errObj },
-      });
-      this.sseHub.broadcast({
-        type: 'session.idle',
-        created: now,
-        ...loc,
-        data: { sessionID },
-      });
+      if (emitIdle) {
+        this.sseHub.broadcast({
+          type: 'session.execution.failed',
+          created: now,
+          ...loc,
+          data: { sessionID, error: errObj },
+        });
+        this.sseHub.broadcast({
+          type: 'session.idle',
+          created: now,
+          ...loc,
+          data: { sessionID },
+        });
+      }
     };
 
     try {
@@ -1420,6 +1985,7 @@ export class AgyRunner {
         && existing
         && !existing.exited
         && !existing.busy
+        && !this._isWorkerExpired(existing)
         && existing.cwd === cwd;
 
       let worker = canReuse ? existing : null;
@@ -1446,10 +2012,10 @@ export class AgyRunner {
         worker.idleTimer = null;
       }
 
-      const transcriptPath = worker.acpSessionId
+      let transcriptPath = worker.acpSessionId
         ? resolveBrainTranscriptPath(worker.acpSessionId, this.env.AGY_ROUTER_HOME_DIR || undefined)
         : null;
-      const startLineOffset = transcriptPath ? (readTranscriptLines(transcriptPath)?.length ?? 0) : 0;
+      let startLineOffset = transcriptPath ? (readTranscriptLines(transcriptPath)?.length ?? 0) : 0;
 
       // Dummy translator handles `onClose` / `interrupt` cleanly if worker drops mid-compact
       let checkpointSummary = '';
@@ -1471,8 +2037,8 @@ export class AgyRunner {
               streamedText += update.content.text;
             }
           },
-          interrupt: () => {
-            emitCompactionFailed('Compaction interrupted');
+          interrupt: (_reason, options) => {
+            emitCompactionFailed('Compaction interrupted', options);
             return null;
           },
           fail: (msg) => {
@@ -1484,6 +2050,7 @@ export class AgyRunner {
 
       worker.busy = true;
       worker.interrupted = false;
+      worker.steered = false;
       worker.hadFirstTurn = true;
       worker.turn = compactTurn;
 
@@ -1523,158 +2090,240 @@ export class AgyRunner {
       const extraCompactContext = [pendingHandover, upstreamHandover].filter(Boolean).join('\n\n');
       const compactPromptText = extraCompactContext ? `${extraCompactContext}\n\n/compact` : '/compact';
 
-      void worker.client
-        .request('session/prompt', {
-          sessionId: worker.acpSessionId,
-          prompt: [{ type: 'text', text: compactPromptText }],
-        })
-        .then(
-          (result) => {
-            if (worker.turn !== compactTurn) return;
-            if (worker.cancelTimer) {
-              clearTimeout(worker.cancelTimer);
-              worker.cancelTimer = null;
-            }
-            worker.turn = null;
-            worker.busy = false;
+      const dispatchCompactPrompt = (activeWorker, retryCount = 0) => {
+        void activeWorker.client
+          .request('session/prompt', {
+            sessionId: activeWorker.acpSessionId,
+            prompt: [{ type: 'text', text: compactPromptText }],
+          })
+          .then(
+            (result) => {
+              if (activeWorker.turn !== compactTurn) return;
+              if (activeWorker.cancelTimer) {
+                clearTimeout(activeWorker.cancelTimer);
+                activeWorker.cancelTimer = null;
+              }
+              const isCancelled = result?.stopReason === 'cancelled' || activeWorker.interrupted;
+              if (!isCancelled && !checkpointSummary && isTransientAgyAuthErrorText(streamedText)) {
+                if (retryCount < this.maxAuthRetries) {
+                  streamedText = '';
+                  checkpointSummary = '';
+                  void this._retryCompactAfterAuthFailure({
+                    oldWorker: activeWorker,
+                    compactTurn,
+                    sessionID,
+                    directory: effectiveDir,
+                    cwd,
+                    callLogPath,
+                    modelID,
+                    variant,
+                    realModelID,
+                    transcriptPathRef: (nextPath) => {
+                      transcriptPath = nextPath;
+                      startLineOffset = nextPath ? (readTranscriptLines(nextPath)?.length ?? 0) : 0;
+                      compactTurn.transcriptLineOffset = startLineOffset;
+                    },
+                    emitCompactionFailed,
+                    onReady: (freshWorker) => dispatchCompactPrompt(freshWorker, retryCount + 1),
+                  });
+                  return;
+                }
+                const authFailureText = streamedText.trim();
+                activeWorker.turn = null;
+                activeWorker.busy = false;
+                activeWorker.steered = false;
+                emitCompactionFailed(authFailureText);
+                this._retireWorker(sessionID, false);
+                queueMicrotask(() => {
+                  void this._drainPendingQueue(sessionID);
+                });
+                return;
+              }
 
-            if (result?.stopReason === 'cancelled' || worker.interrupted) {
-              emitCompactionFailed('Compaction cancelled');
-              return;
-            }
+              activeWorker.turn = null;
+              activeWorker.busy = false;
+              const isSteer = Boolean(activeWorker.steered && this._hasPendingSteer(sessionID));
+              activeWorker.steered = false;
 
-            if (transcriptPath) {
-              const lines = readTranscriptLines(transcriptPath);
-              if (lines && lines.length > startLineOffset) {
-                for (let i = startLineOffset; i < lines.length; i += 1) {
-                  try {
-                    const entry = JSON.parse(lines[i]);
-                    if (entry?.type === 'CHECKPOINT' && typeof entry.content === 'string') {
-                      const extracted = extractCheckpointSummary(entry.content);
-                      if (extracted) checkpointSummary = extracted;
-                    }
-                  } catch {}
+              if (isCancelled) {
+                emitCompactionFailed('Compaction cancelled', { emitIdle: !isSteer });
+                queueMicrotask(() => {
+                  void this._drainPendingQueue(sessionID);
+                });
+                return;
+              }
+
+              if (transcriptPath) {
+                const lines = readTranscriptLines(transcriptPath);
+                if (lines && lines.length > startLineOffset) {
+                  for (let i = startLineOffset; i < lines.length; i += 1) {
+                    try {
+                      const entry = JSON.parse(lines[i]);
+                      if (entry?.type === 'CHECKPOINT' && typeof entry.content === 'string') {
+                        const extracted = extractCheckpointSummary(entry.content);
+                        if (extracted) checkpointSummary = extracted;
+                      }
+                    } catch {}
+                  }
                 }
               }
-            }
 
-            const summary = checkpointSummary || streamedText.trim() || 'Conversation compacted.';
-            const parsedUsage = normalizeUsageBuckets(result?.usage);
-            const turnTokens = parsedUsage
-              ? {
-                  input: parsedUsage.input,
-                  output: parsedUsage.output,
-                  reasoning: parsedUsage.reasoning,
-                  cache: { ...parsedUsage.cache },
-                }
-              : undefined;
-            const prevSession = sessionState?.sessionTokens || {
-              input: 0,
-              output: 0,
-              reasoning: 0,
-              cache: { read: 0, write: 0 },
-            };
-            const nextSessionTokens = turnTokens
-              ? {
-                  input: (prevSession.input || 0) + turnTokens.input,
-                  output: (prevSession.output || 0) + turnTokens.output,
-                  reasoning: (prevSession.reasoning || 0) + turnTokens.reasoning,
-                  cache: {
-                    read: (prevSession.cache?.read || 0) + turnTokens.cache.read,
-                    write: (prevSession.cache?.write || 0) + turnTokens.cache.write,
-                  },
-                }
-              : prevSession;
+              const summary = checkpointSummary || streamedText.trim() || 'Conversation compacted.';
+              const parsedUsage = normalizeUsageBuckets(result?.usage);
+              const turnTokens = parsedUsage
+                ? {
+                    input: parsedUsage.input,
+                    output: parsedUsage.output,
+                    reasoning: parsedUsage.reasoning,
+                    cache: { ...parsedUsage.cache },
+                  }
+                : undefined;
+              const prevSession = sessionState?.sessionTokens || {
+                input: 0,
+                output: 0,
+                reasoning: 0,
+                cache: { read: 0, write: 0 },
+              };
+              const nextSessionTokens = turnTokens
+                ? {
+                    input: (prevSession.input || 0) + turnTokens.input,
+                    output: (prevSession.output || 0) + turnTokens.output,
+                    reasoning: (prevSession.reasoning || 0) + turnTokens.reasoning,
+                    cache: {
+                      read: (prevSession.cache?.read || 0) + turnTokens.cache.read,
+                      write: (prevSession.cache?.write || 0) + turnTokens.cache.write,
+                    },
+                  }
+                : prevSession;
 
-            if (turnTokens) {
-              this.store.recordTurnUsage(sessionID, { sessionTokens: nextSessionTokens });
-            }
+              if (turnTokens) {
+                this.store.recordTurnUsage(sessionID, { sessionTokens: nextSessionTokens });
+              }
 
-            const completedAt = Date.now();
-            this.store.upsertMessage(sessionID, {
-              id: messageID,
-              type: 'compaction',
-              status: 'completed',
-              reason: 'manual',
-              summary,
-              model: modelRef,
-              cost: 0,
-              ...(turnTokens ? { tokens: turnTokens } : {}),
-              time: { created, completed: completedAt },
-            });
-
-            this.sseHub.broadcast({
-              type: 'session.compaction.delta',
-              created: completedAt,
-              ...loc,
-              data: { sessionID, text: summary },
-            });
-            this.sseHub.broadcast({
-              id: eventID,
-              type: 'session.compaction.ended',
-              created: completedAt,
-              ...loc,
-              data: {
-                sessionID,
+              const completedAt = Date.now();
+              this.store.upsertMessage(sessionID, {
+                id: messageID,
+                type: 'compaction',
+                status: 'completed',
                 reason: 'manual',
+                summary,
                 model: modelRef,
-                text: summary,
                 cost: 0,
                 ...(turnTokens ? { tokens: turnTokens } : {}),
-              },
-            });
-            if (turnTokens) {
+                time: { created, completed: completedAt },
+              });
+
               this.sseHub.broadcast({
-                type: 'session.usage.updated',
+                type: 'session.compaction.delta',
                 created: completedAt,
                 ...loc,
-                data: { sessionID, cost: 0, tokens: nextSessionTokens },
+                data: { sessionID, text: summary },
               });
-            }
-            this.sseHub.broadcast({
-              type: 'session.execution.succeeded',
-              created: completedAt,
-              ...loc,
-              data: { sessionID },
-            });
-            this.sseHub.broadcast({
-              type: 'session.idle',
-              created: completedAt,
-              ...loc,
-              data: { sessionID },
-            });
+              this.sseHub.broadcast({
+                id: eventID,
+                type: 'session.compaction.ended',
+                created: completedAt,
+                ...loc,
+                data: {
+                  sessionID,
+                  reason: 'manual',
+                  model: modelRef,
+                  text: summary,
+                  cost: 0,
+                  ...(turnTokens ? { tokens: turnTokens } : {}),
+                },
+              });
+              if (turnTokens) {
+                this.sseHub.broadcast({
+                  type: 'session.usage.updated',
+                  created: completedAt,
+                  ...loc,
+                  data: { sessionID, cost: 0, tokens: nextSessionTokens },
+                });
+              }
+              this.sseHub.broadcast({
+                type: 'session.execution.succeeded',
+                created: completedAt,
+                ...loc,
+                data: { sessionID },
+              });
+              this.sseHub.broadcast({
+                type: 'session.idle',
+                created: completedAt,
+                ...loc,
+                data: { sessionID },
+              });
 
-            if (!this.useWarmWorker) {
-              this._retireWorker(sessionID, false);
-            } else if (!worker.exited && this.workerIdleMs > 0) {
-              if (worker.idleTimer) clearTimeout(worker.idleTimer);
-              worker.idleTimer = setTimeout(() => {
-                if (!worker.busy) this._retireWorker(sessionID, false);
-              }, this.workerIdleMs);
-              worker.idleTimer.unref();
-            }
-            queueMicrotask(() => {
-              void this._drainPendingQueue(sessionID);
-            });
-          },
-          (err) => {
-            if (worker.turn !== compactTurn) return;
-            if (worker.cancelTimer) {
-              clearTimeout(worker.cancelTimer);
-              worker.cancelTimer = null;
-            }
-            worker.turn = null;
-            worker.busy = false;
-            emitCompactionFailed(err?.message || String(err));
-          },
-        );
+              if (!this.useWarmWorker) {
+                this._retireWorker(sessionID, false);
+              } else if (!activeWorker.exited && this.workerIdleMs > 0) {
+                if (activeWorker.idleTimer) clearTimeout(activeWorker.idleTimer);
+                activeWorker.idleTimer = setTimeout(() => {
+                  if (!activeWorker.busy) this._retireWorker(sessionID, false);
+                }, this.workerIdleMs);
+                activeWorker.idleTimer.unref();
+              }
+              queueMicrotask(() => {
+                void this._drainPendingQueue(sessionID);
+              });
+            },
+            (err) => {
+              if (activeWorker.turn !== compactTurn) return;
+              if (activeWorker.cancelTimer) {
+                clearTimeout(activeWorker.cancelTimer);
+                activeWorker.cancelTimer = null;
+              }
+              const errMsg = err?.message || String(err);
+              const isAuthErr = isTransientAgyAuthErrorText(errMsg) || isTransientAgyAuthErrorText(streamedText);
+              if (!activeWorker.interrupted && isAuthErr && retryCount < this.maxAuthRetries) {
+                streamedText = '';
+                checkpointSummary = '';
+                void this._retryCompactAfterAuthFailure({
+                  oldWorker: activeWorker,
+                  compactTurn,
+                  sessionID,
+                  directory: effectiveDir,
+                  cwd,
+                  callLogPath,
+                  modelID,
+                  variant,
+                  realModelID,
+                  transcriptPathRef: (nextPath) => {
+                    transcriptPath = nextPath;
+                    startLineOffset = nextPath ? (readTranscriptLines(nextPath)?.length ?? 0) : 0;
+                    compactTurn.transcriptLineOffset = startLineOffset;
+                  },
+                  emitCompactionFailed,
+                  onReady: (freshWorker) => dispatchCompactPrompt(freshWorker, retryCount + 1),
+                });
+                return;
+              }
+
+              activeWorker.turn = null;
+              activeWorker.busy = false;
+              const isSteer = Boolean(activeWorker.steered && this._hasPendingSteer(sessionID));
+              activeWorker.steered = false;
+              emitCompactionFailed(errMsg, { emitIdle: !isSteer });
+              queueMicrotask(() => {
+                void this._drainPendingQueue(sessionID);
+              });
+            },
+          );
+      };
+
+      dispatchCompactPrompt(worker, 0);
 
       return { ok: true, messageID, created };
     } catch (err) {
       emitCompactionFailed(err?.message || 'Failed to compact session');
       return { ok: true, messageID, created };
     } finally {
-      this.startingSessions.delete(sessionID);
+      if (this.startingSessions.get(sessionID) === startingCompact) {
+        this.startingSessions.delete(sessionID);
+      }
+      if (!this.isRunning(sessionID) && (this.pendingTurnQueue.get(sessionID)?.length ?? 0) > 0) {
+        queueMicrotask(() => void this._drainPendingQueue(sessionID));
+      }
     }
   }
 
@@ -1798,10 +2447,13 @@ export class AgyRunner {
     const starting = this.startingSessions.get(sessionID);
     if (starting) {
       starting.aborted = true;
+      starting.steerAbort = false;
+      starting.cancelSleep?.();
       starting.client?.close(true);
       const w = this.workers.get(sessionID);
       if (w) {
         w.interrupted = true;
+        w.steered = false;
         if (w.acpSessionId) w.client.notify('session/cancel', { sessionId: w.acpSessionId });
       }
       return true;
@@ -1809,6 +2461,7 @@ export class AgyRunner {
     const worker = this.workers.get(sessionID);
     if (!worker || !worker.busy) return false;
     worker.interrupted = true;
+    worker.steered = false;
     if (worker.acpSessionId) {
       worker.client.notify('session/cancel', { sessionId: worker.acpSessionId });
     }

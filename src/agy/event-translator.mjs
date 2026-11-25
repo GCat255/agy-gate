@@ -7,6 +7,20 @@ import {
   unwrapToolParamValue,
 } from './tool-adapter.mjs';
 
+const TRANSIENT_AUTH_ERROR_RE =
+  /UNAUTHENTICATED\s*\(\s*code\s*401\s*\)|transport error\s*\(\s*Unauthenticated,\s*HTTP\s*401\s*\)|Request had invalid authentication credentials\.\s*Expected OAuth 2 access token/i;
+
+const WARNING_PREFIX_HOLD_CHARS = 180;
+
+/**
+ * Detect transient OAuth 401 errors emitted by `agy acp` across the 1-hour token refresh boundary.
+ * @param {string} text
+ */
+export function isTransientAgyAuthErrorText(text) {
+  if (typeof text !== 'string' || !text.trim()) return false;
+  return TRANSIENT_AUTH_ERROR_RE.test(text);
+}
+
 export function computeStepWindowTotal(parsed) {
   if (!parsed || typeof parsed !== 'object') return 0;
   return parsed.windowTotal || 0;
@@ -102,6 +116,7 @@ export class AgyTurnTranslator {
    *   onSubagentWake?: (info: { recipientId: string }) => void,
    *   onSubagentKilled?: (info: { all: boolean, conversationIds: string[] }) => void,
    *   priorSessionTokens?: { input: number, output: number, reasoning: number, cache: { read: number, write: number } } | null,
+   *   minCreated?: number,
    * }} options
    */
   constructor(options) {
@@ -120,7 +135,7 @@ export class AgyTurnTranslator {
     this.onSubagentKilled = options.onSubagentKilled;
     this.priorSessionTokens = options.priorSessionTokens || emptyTokenBuckets();
 
-    this.created = Date.now();
+    this.created = Math.max(Date.now(), typeof options.minCreated === 'number' ? options.minCreated : 0);
     this.started = false;
     this.finished = false;
 
@@ -134,6 +149,9 @@ export class AgyTurnTranslator {
     this.latestWindowUsed = 0;
     this.tokens = emptyTokenBuckets();
     this.sessionTokens = addTokenBuckets(this.priorSessionTokens, emptyTokenBuckets());
+    this.pendingWarningBuffer = null;
+    this.authErrorDetected = false;
+    this.authErrorMessage = '';
     /** @type {any[]} */
     this.steps = [];
     this.currentStep = this._createStep(1, this.created);
@@ -150,6 +168,60 @@ export class AgyTurnTranslator {
 
   hasAnyContent() {
     return this.steps.some((step) => step.content.length > 0) || Boolean(this.openStream);
+  }
+
+  /**
+   * Whether real progress (settled steps, tools, reasoning, or non-error text) has already occurred in this turn.
+   */
+  hasNonErrorProgress() {
+    return (
+      this.steps.length > 1
+      || this.currentStep.hasTools
+      || this.currentStep.content.length > 0
+      || Boolean(this.openStream)
+    );
+  }
+
+  /**
+   * Reset transient auth-error state before retrying the turn on a freshly spawned ACP worker.
+   * Preserves any prior completed tool/prose steps; opens a fresh step only if the current step already has content.
+   */
+  prepareForAuthRetry() {
+    this.pendingWarningBuffer = null;
+    this.authErrorDetected = false;
+    this.authErrorMessage = '';
+    this.priorSessionTokens = this.sessionTokens;
+    this.tokens = emptyTokenBuckets();
+    this.latestWindowUsed = 0;
+
+    if (this.openStream) {
+      this._closeOpenStream();
+    }
+
+    if (this.currentStep.content.length > 0 || this.currentStep.hasTools) {
+      const prevStep = this.currentStep;
+      const settledAt = Math.max(Date.now(), prevStep.created + 1);
+      prevStep.closed = true;
+      prevStep.completed = settledAt;
+      prevStep.finish = prevStep.hasTools ? 'tool-calls' : 'unknown';
+      prevStep.tokens = emptyTokenBuckets();
+      prevStep.record = this._buildStepRecord(prevStep);
+      this._send('session.step.ended', {
+        sessionID: this.sessionID,
+        assistantMessageID: prevStep.id,
+        finish: prevStep.finish,
+        cost: 0,
+        tokens: prevStep.tokens,
+      });
+      if (this.onStepSettled) {
+        this.onStepSettled(prevStep.record);
+      }
+
+      const nextStep = this._createStep(this.steps.length + 1, Math.max(Date.now(), settledAt + 1));
+      this.steps.push(nextStep);
+      this.currentStep = nextStep;
+      this._emitStepStarted(nextStep);
+    }
   }
 
   _createStep(index, created) {
@@ -285,12 +357,7 @@ export class AgyTurnTranslator {
     }
   }
 
-  /**
-   * Append streaming text or reasoning delta from ACP chunk notifications.
-   * @param {'text'|'reasoning'} kind
-   * @param {string} delta
-   */
-  _appendStreamDelta(kind, delta) {
+  _emitStreamDeltaDirect(kind, delta) {
     if (typeof delta !== 'string' || delta.length === 0) return;
 
     this._maybeAdvanceStep();
@@ -325,6 +392,62 @@ export class AgyTurnTranslator {
       ordinal: this.openStream.ordinal,
       delta,
     });
+  }
+
+  flushPendingWarning() {
+    if (this.pendingWarningBuffer === null) return;
+    const buffered = this.pendingWarningBuffer;
+    this.pendingWarningBuffer = null;
+    this._emitStreamDeltaDirect('text', buffered);
+  }
+
+  /**
+   * Append streaming text or reasoning delta from ACP chunk notifications.
+   * Holds a short `'⚠'` text prefix so transient `UNAUTHENTICATED (code 401)` chunks
+   * can be intercepted and retried before reaching SSE.
+   * @param {'text'|'reasoning'} kind
+   * @param {string} delta
+   */
+  _appendStreamDelta(kind, delta) {
+    if (typeof delta !== 'string' || delta.length === 0) return;
+
+    if (kind === 'text') {
+      if (this.authErrorDetected) {
+        this.authErrorMessage += delta;
+        return;
+      }
+      if (this.pendingWarningBuffer !== null) {
+        this.pendingWarningBuffer += delta;
+        if (isTransientAgyAuthErrorText(this.pendingWarningBuffer)) {
+          this.authErrorDetected = true;
+          this.authErrorMessage = this.pendingWarningBuffer;
+          this.pendingWarningBuffer = null;
+          return;
+        }
+        if (
+          this.pendingWarningBuffer.length >= WARNING_PREFIX_HOLD_CHARS
+          || !this.pendingWarningBuffer.trimStart().startsWith('⚠')
+        ) {
+          this.flushPendingWarning();
+        }
+        return;
+      }
+      if (!this.openStream && delta.trimStart().startsWith('⚠')) {
+        if (isTransientAgyAuthErrorText(delta)) {
+          this.authErrorDetected = true;
+          this.authErrorMessage = delta;
+          return;
+        }
+        if (delta.length < WARNING_PREFIX_HOLD_CHARS) {
+          this.pendingWarningBuffer = delta;
+          return;
+        }
+      }
+    } else {
+      this.flushPendingWarning();
+    }
+
+    this._emitStreamDeltaDirect(kind, delta);
   }
 
   /**
@@ -365,6 +488,7 @@ export class AgyTurnTranslator {
   }
 
   _handleAcpToolEvent(update) {
+    this.flushPendingWarning();
     this._closeOpenStream();
 
     const step = this.currentStep;
@@ -715,6 +839,50 @@ export class AgyTurnTranslator {
     return true;
   }
 
+  _flushOpenTools(errorMessage = 'Tool execution interrupted') {
+    const now = Date.now();
+    const errText = String(errorMessage || 'Tool execution interrupted');
+    for (const tool of this.activeTools.values()) {
+      if (tool.closed) continue;
+      tool.closed = true;
+      tool.step.openToolCount = Math.max(0, tool.step.openToolCount - 1);
+      const errObj = { type: 'unknown', message: errText };
+      const openchamberMeta = tool.isOpenChamberTool
+        ? {
+            openchamber: {
+              schemaVersion: 1,
+              ...(typeof tool.input?.action === 'string' ? { action: tool.input.action } : {}),
+              ok: false,
+            },
+          }
+        : undefined;
+      this._send('session.tool.failed', {
+        sessionID: this.sessionID,
+        assistantMessageID: tool.step.id,
+        id: tool.callID,
+        error: errObj,
+        content: [],
+        executed: true,
+        ...(openchamberMeta ? { metadata: openchamberMeta } : {}),
+      });
+      tool.step.content.push({
+        type: 'tool',
+        id: tool.callID,
+        name: tool.name,
+        executed: true,
+        time: { created: tool.startedAt, ran: tool.startedAt, completed: now },
+        state: {
+          status: 'error',
+          input: tool.input,
+          error: errObj,
+          content: [],
+          ...(openchamberMeta ? { metadata: openchamberMeta } : {}),
+        },
+      });
+      this._syncSettledStepRecord(tool.step);
+    }
+  }
+
   _flushOpenSubagents(interrupted = false) {
     const now = Date.now();
     for (const entry of this.activeSubagents) {
@@ -831,6 +999,10 @@ export class AgyTurnTranslator {
   /** Mark turn completed successfully and emit terminal OpenCode events. */
   complete() {
     if (this.finished) return;
+    this.flushPendingWarning();
+    if (this.authErrorDetected && this.authErrorMessage) {
+      this._emitStreamDeltaDirect('text', this.authErrorMessage);
+    }
     this._closeOpenStream();
     this._flushOpenSubagents(false);
     this.finished = true;
@@ -854,10 +1026,17 @@ export class AgyTurnTranslator {
     return step.record;
   }
 
-  /** @param {string} reason */
-  interrupt(reason = 'user') {
+  /**
+   * @param {string} reason
+   * @param {{ emitIdle?: boolean, toolMessage?: string }} [options]
+   */
+  interrupt(reason = 'user', options = {}) {
     if (this.finished) return;
+    const emitIdle = options.emitIdle !== false;
+    const toolMessage = options.toolMessage || (emitIdle ? 'Interrupted by user' : 'Interrupted by follow-up message');
+    this.flushPendingWarning();
     this._closeOpenStream();
+    this._flushOpenTools(toolMessage);
     this._flushOpenSubagents(true);
     this.finished = true;
     const step = this._finalizeTerminalStep('unknown');
@@ -869,8 +1048,17 @@ export class AgyTurnTranslator {
       cost: 0,
       tokens: this.tokens,
     });
-    this._send('session.execution.interrupted', { sessionID: this.sessionID, reason });
-    this._send('session.idle', { sessionID: this.sessionID });
+    if (this.tokens.input > 0 || this.tokens.output > 0) {
+      this._send('session.usage.updated', {
+        sessionID: this.sessionID,
+        cost: 0,
+        tokens: this.sessionTokens,
+      });
+    }
+    if (emitIdle) {
+      this._send('session.execution.interrupted', { sessionID: this.sessionID, reason });
+      this._send('session.idle', { sessionID: this.sessionID });
+    }
 
     return step.record;
   }
@@ -878,10 +1066,16 @@ export class AgyTurnTranslator {
   /** @param {string} message */
   fail(message) {
     if (this.finished) return;
+    this.flushPendingWarning();
+    const resolvedMessage =
+      String(message || '').trim()
+      || (this.authErrorDetected ? this.authErrorMessage.trim() : '')
+      || 'agy-cli error';
     this._closeOpenStream();
+    this._flushOpenTools(resolvedMessage);
     this._flushOpenSubagents(true);
     this.finished = true;
-    const errObj = { type: 'unknown', message: String(message || 'agy-cli error') };
+    const errObj = { type: 'unknown', message: resolvedMessage };
     const step = this._finalizeTerminalStep('error', errObj);
 
     this._send('session.step.failed', {
