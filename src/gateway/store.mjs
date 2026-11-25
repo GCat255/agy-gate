@@ -77,6 +77,26 @@ function normalizeStoredMessage(msg) {
   return msg;
 }
 
+export function encodeMessageCursor(id, order, direction) {
+  return Buffer.from(JSON.stringify({ id, order, direction }), 'utf8').toString('base64url');
+}
+
+export function decodeMessageCursor(rawCursor) {
+  if (typeof rawCursor !== 'string' || !rawCursor.trim()) return null;
+  try {
+    const normalized = rawCursor.trim().replace(/-/g, '+').replace(/_/g, '/');
+    const padLen = (4 - (normalized.length % 4)) % 4;
+    const json = JSON.parse(Buffer.from(normalized + '='.repeat(padLen), 'base64').toString('utf8'));
+    if (!json || typeof json !== 'object') return null;
+    if (typeof json.id !== 'string' || !json.id) return null;
+    if (json.order !== 'asc' && json.order !== 'desc') return null;
+    if (json.direction !== 'next' && json.direction !== 'previous') return null;
+    return { id: json.id, order: json.order, direction: json.direction };
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Persistent store for `agy-cli` session bindings, model overrides, and messages.
  * One JSON file per session under `<dataDir>/sessions/` with atomic temp-file writes.
@@ -224,6 +244,22 @@ export class RouterStore {
       s.messages.push(msg);
     }
     this._save(sessionID);
+  }
+
+  /**
+   * @param {string} sessionID
+   * @param {string} messageID
+   * @param {number} created
+   */
+  updateMessageTimestamp(sessionID, messageID, created) {
+    if (!messageID || typeof created !== 'number' || !Number.isFinite(created)) return false;
+    const s = this.getSession(sessionID);
+    if (!s || !Array.isArray(s.messages)) return false;
+    const target = s.messages.find((m) => m?.id === messageID);
+    if (!target) return false;
+    target.time = { ...(target.time || {}), created };
+    this._save(sessionID);
+    return true;
   }
 
   /**
@@ -674,7 +710,9 @@ export class RouterStore {
 
     const byId = new Map();
     for (const msg of upstreamMessages || []) {
-      if (msg?.id) byId.set(msg.id, msg);
+      if (!msg?.id) continue;
+      if (query.type && msg.type !== query.type) continue;
+      byId.set(msg.id, msg);
     }
     for (const msg of [...local, ...extras]) {
       if (!msg?.id) continue;
@@ -682,17 +720,85 @@ export class RouterStore {
       byId.set(msg.id, msg);
     }
 
+    const desc = query.order === 'desc';
     const merged = [...byId.values()];
     merged.sort((a, b) => {
       const ta = a?.time?.created ?? 0;
       const tb = b?.time?.created ?? 0;
-      if (ta !== tb) return query.order === 'desc' ? tb - ta : ta - tb;
-      return String(a.id).localeCompare(String(b.id));
+      if (ta !== tb) return desc ? tb - ta : ta - tb;
+      const cmp = String(a.id).localeCompare(String(b.id));
+      return desc ? -cmp : cmp;
     });
 
-    if (typeof query.limit === 'number' && query.limit > 0 && merged.length > query.limit) {
+    if (typeof query.limit === 'number' && Number.isFinite(query.limit) && query.limit > 0 && merged.length > query.limit) {
       return merged.slice(0, query.limit);
     }
     return merged;
+  }
+
+  /**
+   * Merge and cursor-paginate upstream + local messages using OpenCode 2.x semantics
+   * (`order` defaults to `'desc'` when neither `order` nor `cursor` is specified).
+   * @param {any[]} upstreamMessages
+   * @param {string} sessionID
+   * @param {{ order?: string, cursor?: string, type?: string, limit?: number, extraMessages?: any[] }} [query]
+   * @returns {{ data: any[], cursor: { previous?: string | null, next?: string | null }, invalidCursor?: boolean }}
+   */
+  paginateMessages(upstreamMessages, sessionID, query = {}) {
+    let decodedCursor = null;
+    if (query.cursor !== undefined && query.cursor !== null && query.cursor !== '') {
+      decodedCursor = decodeMessageCursor(query.cursor);
+      if (!decodedCursor) {
+        return { data: [], cursor: { previous: null, next: null }, invalidCursor: true };
+      }
+    }
+
+    const effectiveOrder = decodedCursor
+      ? decodedCursor.order
+      : query.order === 'asc'
+        ? 'asc'
+        : 'desc';
+
+    const merged = this.mergeMessages(upstreamMessages, sessionID, {
+      order: effectiveOrder,
+      type: query.type,
+      extraMessages: query.extraMessages,
+    });
+
+    const limit = typeof query.limit === 'number' && Number.isFinite(query.limit) && query.limit > 0
+      ? Math.floor(query.limit)
+      : null;
+
+    let start = 0;
+    let end = merged.length;
+    if (decodedCursor) {
+      const idx = merged.findIndex((m) => m?.id === decodedCursor.id);
+      if (idx < 0) {
+        return { data: [], cursor: { previous: null, next: null } };
+      }
+      if (decodedCursor.direction === 'next') {
+        start = idx + 1;
+        end = limit ? Math.min(merged.length, start + limit) : merged.length;
+      } else {
+        end = idx;
+        start = limit ? Math.max(0, end - limit) : 0;
+      }
+    } else if (limit) {
+      end = Math.min(merged.length, limit);
+    }
+
+    const slice = merged.slice(start, end);
+    if (slice.length === 0) {
+      return { data: [], cursor: { previous: null, next: null } };
+    }
+
+    const cursor = {};
+    if (start > 0 && slice[0]?.id) {
+      cursor.previous = encodeMessageCursor(slice[0].id, effectiveOrder, 'previous');
+    }
+    if (end < merged.length && slice[slice.length - 1]?.id) {
+      cursor.next = encodeMessageCursor(slice[slice.length - 1].id, effectiveOrder, 'next');
+    }
+    return { data: slice, cursor };
   }
 }

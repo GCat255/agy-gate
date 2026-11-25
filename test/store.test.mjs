@@ -54,3 +54,56 @@ test('RouterStore persists session overrides and merges messages chronologically
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('RouterStore.paginateMessages defaults to newest-first (desc) and traverses cursor.next / cursor.previous cleanly', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-router-page-'));
+  try {
+    const store = new RouterStore(dir);
+    for (let i = 2; i <= 6; i += 1) {
+      store.upsertMessage('ses_page', {
+        id: `msg_${i}`,
+        type: i % 2 === 0 ? 'user' : 'assistant',
+        time: { created: i * 100 },
+        text: `m${i}`,
+      });
+    }
+    const upstream = [
+      { id: 'msg_1', type: 'user', time: { created: 100 }, text: 'm1' },
+      { id: 'msg_7', type: 'assistant', time: { created: 700 }, content: [] },
+    ];
+
+    // Default order is desc (newest first) -> returns msg_7, msg_6, msg_5
+    const page1 = store.paginateMessages(upstream, 'ses_page', { limit: 3 });
+    assert.deepEqual(page1.data.map((m) => m.id), ['msg_7', 'msg_6', 'msg_5']);
+    assert.equal(page1.cursor.previous, undefined);
+    assert.ok(page1.cursor.next);
+
+    // Next page in desc -> older messages msg_4, msg_3, msg_2
+    const page2 = store.paginateMessages(upstream, 'ses_page', { limit: 3, cursor: page1.cursor.next });
+    assert.deepEqual(page2.data.map((m) => m.id), ['msg_4', 'msg_3', 'msg_2']);
+    assert.ok(page2.cursor.previous);
+    assert.ok(page2.cursor.next);
+
+    // Previous from page2 walks back to newer messages msg_7, msg_6, msg_5
+    const backToPage1 = store.paginateMessages(upstream, 'ses_page', { limit: 3, cursor: page2.cursor.previous });
+    assert.deepEqual(backToPage1.data.map((m) => m.id), ['msg_7', 'msg_6', 'msg_5']);
+
+    // Last page in desc -> oldest msg_1, no further next cursor
+    const page3 = store.paginateMessages(upstream, 'ses_page', { limit: 3, cursor: page2.cursor.next });
+    assert.deepEqual(page3.data.map((m) => m.id), ['msg_1']);
+    assert.ok(page3.cursor.previous);
+    assert.equal(page3.cursor.next, undefined);
+
+    // Explicit asc order
+    const ascPage = store.paginateMessages(upstream, 'ses_page', { limit: 2, order: 'asc' });
+    assert.deepEqual(ascPage.data.map((m) => m.id), ['msg_1', 'msg_2']);
+    assert.equal(ascPage.cursor.previous, undefined);
+    assert.ok(ascPage.cursor.next);
+
+    // Invalid cursor flagged cleanly
+    const bad = store.paginateMessages(upstream, 'ses_page', { cursor: 'not-valid-cursor' });
+    assert.equal(bad.invalidCursor, true);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
