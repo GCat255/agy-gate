@@ -84,11 +84,14 @@ test('runSetup wires engine, extension, and mcp_config cleanly in isolated temp 
     const ocDir = path.join(tmp, 'openchamber');
     const dataDir = path.join(tmp, 'router-data');
     const mcpPath = path.join(tmp, 'gemini', 'mcp_config.json');
+    const geminiHome = path.join(tmp, 'gemini-home');
     const env = {
       ...process.env,
       OPENCHAMBER_DATA_DIR: ocDir,
       AGY_ROUTER_DATA_DIR: dataDir,
       AGY_MCP_CONFIG_PATH: mcpPath,
+      GEMINI_HOME: geminiHome,
+      AGY_ROUTER_HOME_DIR: '',
     };
 
     const repoRoot = path.resolve(import.meta.dirname, '..');
@@ -102,6 +105,7 @@ test('runSetup wires engine, extension, and mcp_config cleanly in isolated temp 
     assert.equal(result.steps.engine.action, 'updated');
     assert.equal(result.steps.quotaExtension.action, 'updated');
     assert.equal(result.steps.mcp.ok, true);
+    assert.equal(result.steps.agyFast.action, 'not-installed');
     assert.equal(fs.existsSync(path.join(ocDir, 'settings.json')), true);
     assert.equal(fs.existsSync(path.join(ocDir, 'extensions.json')), true);
     assert.equal(fs.existsSync(mcpPath), true);

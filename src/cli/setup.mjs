@@ -11,6 +11,7 @@ import {
   resolveRealOpenCode,
 } from '../core/config.mjs';
 import { resolveNpmInvocation } from '../core/process.mjs';
+import { ensureAgyFastPlugin } from '../agy/fast-plugin.mjs';
 import { ensureOpenChamberMcpConfig } from '../bridge/mcp.mjs';
 import { resolveOpenChamberDataDir, resolveOpenChamberWebRoot } from '../bridge/openchamber.mjs';
 import { createOAuthManager } from '../../extensions/agy-quota/service/oauth.js';
@@ -279,6 +280,17 @@ export async function runSetup(options = {}) {
     steps.mcp = { ok: true, action: 'dry-run' };
   }
 
+  if (!uninstall && !options.skipAgyFast) {
+    steps.agyFast = ensureAgyFastPlugin({
+      env,
+      installIfMissing: Boolean(options.installDeps),
+      dryRun,
+    });
+    if (!steps.agyFast.ok && steps.agyFast.error) {
+      warnings.push(steps.agyFast.error);
+    }
+  }
+
   const nodeVersion = process.versions.node;
   const nodeOk = parseNodeMajor(nodeVersion) >= 24;
   if (!nodeOk) {
@@ -292,6 +304,9 @@ export async function runSetup(options = {}) {
   if (!realOpenCode) warnings.push('未检测到原生 opencode 可执行文件（可运行 npm i -g @opencode/cli 或执行官网安装脚本）');
   if (!openChamberWebRoot) warnings.push('未检测到 @openchamber/web（可运行 npm i -g @openchamber/web）');
   if (!agyBin) warnings.push('未检测到 agy（agy-cli），请先安装 Antigravity CLI 并完成登录');
+  if (!uninstall && agyBin && steps.agyFast && !steps.agyFast.status?.healthy) {
+    warnings.push('未启用 agy-fast 加速插件（可运行 agy-gate setup --install-deps 自动安装推荐配置）');
+  }
 
   let quotaAuth = { connected: false, email: null };
   try {
@@ -310,6 +325,7 @@ export async function runSetup(options = {}) {
     openChamberWebRoot,
     realOpenCode,
     agyBin,
+    agyFast: steps.agyFast?.status || null,
     quotaAuth,
   };
 
@@ -348,6 +364,15 @@ export function formatSetupReport(result) {
   }
   if (result.steps.mcp) {
     lines.push(`  OpenChamber MCP:  ${result.steps.mcp.action || (result.steps.mcp.ok ? 'ready' : 'error')}`);
+  }
+  if (result.steps.agyFast) {
+    const af = result.steps.agyFast.status;
+    const afSummary = af?.healthy
+      ? `已启用 v${af.version || '?'} (${af.toolLoading}, edits=${af.editsFormat})`
+      : result.steps.agyFast.action === 'not-installed'
+        ? '未安装（可运行 agy-gate setup --install-deps 自动安装）'
+        : result.steps.agyFast.action;
+    lines.push(`  Agy Fast 加速:    ${afSummary}`);
   }
   lines.push(
     `  Agy 用量授权:     ${result.checks.quotaAuth.connected ? `已授权 (${result.checks.quotaAuth.email || 'Google'})` : '未授权（可运行 occ → Agy 用量授权 或 agy-gate quota-login）'}`,

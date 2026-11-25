@@ -112,6 +112,26 @@ describe('tool-adapter OpenChamber normalization & extensibility', () => {
     });
     assert.equal(resCall.name, 'read_resource');
     assert.equal(resCall.input.description, 'unity-mcp · mcpforunity://editor/state');
+
+    const fastOutline = normalizeAcpToolInvocation({
+      name: 'call_mcp_tool',
+      rawInput: {
+        ServerName: 'agy-fast_fast',
+        ToolName: 'quick_outline',
+        Arguments: { cwd: 'E:/proj', paths: ['package.json'], toolSummary: 'Outline package.json' },
+      },
+    });
+    assert.equal(fastOutline.name, 'agy-fast/quick_outline');
+    assert.equal(fastOutline.input.description, 'Outline package.json');
+    assert.equal(fastOutline.targetPath, 'package.json');
+
+    const fastEdits = normalizeAcpToolInvocation({
+      name: 'mcp__agy-fast_fast__apply_edits',
+      rawInput: { edits: [{ path: 'src/a.mjs', hunks: [] }], verify: 'npm test' },
+    });
+    assert.equal(fastEdits.name, 'agy-fast/apply_edits');
+    assert.equal(fastEdits.input.description, 'src/a.mjs + verify');
+    assert.equal(fastEdits.targetPath, 'src/a.mjs');
   });
 
   it('attaches inline image data URI & summary when read_file inspects a PNG with empty ACP output', async () => {

@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { unwrapOpenChamberToolCall } from '../bridge/mcp.mjs';
 import { getCachedOpenChamberToolContract } from '../bridge/openchamber.mjs';
+import { summarizeAgyFastTool, unwrapAgyFastToolInvocation } from './fast-plugin.mjs';
 
 const MAX_INLINE_IMAGE_BYTES = 1024 * 1024; // 1 MiB safety cap to keep SSE & session JSON bounded
 const IMAGE_MIME_BY_EXT = {
@@ -553,6 +554,26 @@ export function normalizeAcpToolInvocation(snapshot, options = {}) {
       isOpenChamberTool: true,
       isImageRead: false,
       targetPath: undefined,
+    };
+  }
+
+  // 1b. `agy-fast` MCP tools (`call_mcp_tool` or eager `mcp__agy-fast_fast__*`)
+  const agyFast = unwrapAgyFastToolInvocation(rawName, rawInput);
+  if (agyFast.isAgyFast) {
+    const { description, targetPath } = summarizeAgyFastTool(agyFast.toolName, agyFast.args);
+    return {
+      rawName,
+      name: `agy-fast/${agyFast.toolName}`,
+      input: {
+        ...agyFast.args,
+        server: 'agy-fast_fast',
+        tool: agyFast.toolName,
+        ...(description ? { description } : {}),
+        ...(targetPath && !agyFast.args.path ? { path: targetPath } : {}),
+      },
+      isOpenChamberTool: false,
+      isImageRead: false,
+      targetPath,
     };
   }
 

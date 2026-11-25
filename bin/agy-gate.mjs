@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { parseCliArgs } from '../src/cli/args.mjs';
 import { resolveAgyBinary, resolveDataDir, resolveMagpieBinary, resolveRealOpenCode } from '../src/core/config.mjs';
 import { loadMagpieAgyEnv, redactMagpieSummary } from '../src/agy/magpie-env.mjs';
+import { inspectAgyFastPlugin } from '../src/agy/fast-plugin.mjs';
 import { getAgyCatalog } from '../src/agy/models.mjs';
 import { buildUpstreamAuthHeader, readRealOpenCodeVersion, startInternalOpenCode } from '../src/gateway/upstream.mjs';
 import { RouterStore } from '../src/gateway/store.mjs';
@@ -80,6 +81,7 @@ async function cmdDoctor() {
   const ocVer = realOpenCode ? readRealOpenCodeVersion(realOpenCode).stdout?.trim() : null;
   const openchamberWebRoot = resolveOpenChamberWebRoot();
   const openchamberCompat = await probeOpenChamberCompat({ env: process.env, forceRefresh: true });
+  const agyFast = inspectAgyFastPlugin({ env: process.env });
 
   process.stdout.write(
     JSON.stringify(
@@ -88,6 +90,7 @@ async function cmdDoctor() {
         realOpenCode,
         realOpenCodeVersion: ocVer,
         agyBin,
+        agyFast,
         openchamberWebRoot,
         openchamberCompat,
         useMagpie,

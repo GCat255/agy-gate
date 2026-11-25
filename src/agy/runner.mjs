@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { resolveAgyBinary } from '../core/config.mjs';
 import { buildSessionGuidancePrefix, loadOpenChamberToolContract } from '../bridge/openchamber.mjs';
+import { unwrapAgyFastToolInvocation } from './fast-plugin.mjs';
 import { loadMagpieAgyEnv } from './magpie-env.mjs';
 import { AGY_PROVIDER_ID, modelSupportsImageInput, resolveRealAgyModelId } from './models.mjs';
 import {
@@ -40,9 +41,16 @@ function isPlanAgent(agent) {
   return String(agent || '').trim().toLowerCase() === 'plan';
 }
 
-function isPlanBlockedPermissionRequest(params) {
+export function isPlanBlockedPermissionRequest(params) {
   const toolCall = params?.toolCall;
   if (!toolCall || typeof toolCall !== 'object') return false;
+  const agyFast = unwrapAgyFastToolInvocation(
+    toolCall.name || toolCall.toolName,
+    toolCall.rawInput || toolCall.args,
+  );
+  if (agyFast.isAgyFast) {
+    return Boolean(agyFast.mutating);
+  }
   const kind = String(toolCall.kind || '').trim().toLowerCase();
   if (PLAN_BLOCKED_TOOL_KINDS.has(kind)) return true;
   const label = `${toolCall.name || ''} ${toolCall.title || ''} ${toolCall.toolCallId || ''}`;
