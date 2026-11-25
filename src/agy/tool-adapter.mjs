@@ -361,6 +361,19 @@ function summarizeMcpArgs(toolName, args) {
   return toolName;
 }
 
+const STEP_STATUS_TO_TODO = {
+  pending: 'pending',
+  in_progress: 'in_progress',
+  running: 'in_progress',
+  done: 'completed',
+  completed: 'completed',
+  skipped: 'cancelled',
+  cancelled: 'cancelled',
+  canceled: 'cancelled',
+  failed: 'cancelled',
+  error: 'cancelled',
+};
+
 /**
  * Declarative adapter registry converting `agy` / ACP tools into OpenChamber/OpenCode's
  * canonical tool contract while keeping future OP & `agy` tool evolution clean and localized.
@@ -495,6 +508,32 @@ const BUILTIN_ADAPTERS = [
       return {
         name: resolveCanonicalToolName('websearch', 'websearch', contract),
         input: query ? { query } : {},
+      };
+    },
+  },
+  {
+    names: new Set(['update_steps', 'todowrite']),
+    normalize({ rawInput, contract }) {
+      const rawSteps = pickValue(rawInput, ['steps', 'Steps', 'todos', 'Todos']);
+      const todos = Array.isArray(rawSteps)
+        ? rawSteps
+            .map((item) => {
+              if (!item || typeof item !== 'object') return null;
+              const content = pickString(item, ['title', 'Title', 'content', 'Content', 'text', 'Text', 'name', 'Name']);
+              if (!content) return null;
+              const rawStatus = String(pickString(item, ['status', 'Status', 'state', 'State']) || 'pending')
+                .trim()
+                .toLowerCase();
+              return {
+                content: content.trim(),
+                status: STEP_STATUS_TO_TODO[rawStatus] || 'pending',
+              };
+            })
+            .filter(Boolean)
+        : undefined;
+      return {
+        name: resolveCanonicalToolName('todowrite', 'todowrite', contract),
+        input: todos ? { todos } : {},
       };
     },
   },

@@ -72,6 +72,36 @@ describe('tool-adapter OpenChamber normalization & extensibility', () => {
     });
     assert.equal(listDirCall.name, 'glob');
     assert.deepEqual(listDirCall.input, { pattern: '*', path: 'E:/proj/src' });
+
+    const stepsCall = normalizeAcpToolInvocation({
+      name: 'update_steps',
+      rawInput: {
+        Steps: [
+          { title: '实现控制器', status: 'done' },
+          { title: '绑定预制体', status: 'in_progress' },
+          { title: '跳过旧步骤', status: 'skipped' },
+          { title: '失败重试项', status: 'failed' },
+          { title: '待验证项', status: 'pending' },
+        ],
+      },
+    });
+    assert.equal(stepsCall.name, 'todowrite');
+    assert.deepEqual(stepsCall.input, {
+      todos: [
+        { content: '实现控制器', status: 'completed' },
+        { content: '绑定预制体', status: 'in_progress' },
+        { content: '跳过旧步骤', status: 'cancelled' },
+        { content: '失败重试项', status: 'cancelled' },
+        { content: '待验证项', status: 'pending' },
+      ],
+    });
+
+    const partialStepsCall = normalizeAcpToolInvocation({
+      name: 'update_steps',
+      rawInput: {},
+    });
+    assert.equal(partialStepsCall.name, 'todowrite');
+    assert.deepEqual(partialStepsCall.input, {});
   });
 
   it('adapts to future contract renames dynamically via semanticRoles lookup', () => {
