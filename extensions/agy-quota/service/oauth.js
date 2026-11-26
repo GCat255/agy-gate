@@ -90,22 +90,30 @@ function resolveDesktopOAuthSecret(env = process.env, explicitSecret = undefined
 const TOKEN_REFRESH_SKEW_MS = 5 * 60 * 1000;
 const AUTH_FLOW_TIMEOUT_MS = 10 * 60 * 1000;
 
-export function resolveDefaultAuthFilePath(env = process.env) {
+export function resolveAuthCandidatePaths(env = process.env) {
   if (env.AGY_QUOTA_AUTH_FILE?.trim()) {
-    return path.resolve(env.AGY_QUOTA_AUTH_FILE.trim());
+    return [path.resolve(env.AGY_QUOTA_AUTH_FILE.trim())];
   }
-  const primary = path.join(os.homedir(), '.config', 'agy-gate', 'quota-auth.json');
-  if (fsSync.existsSync(primary)) return primary;
-  const legacy = path.join(os.homedir(), '.config', 'agy-opencode-router', 'quota-auth.json');
-  if (fsSync.existsSync(legacy)) return legacy;
-  return primary;
+  const dataDirOverride = env.AGY_GATE_DATA_DIR?.trim() || env.AGY_ROUTER_DATA_DIR?.trim();
+  if (dataDirOverride) {
+    return [path.join(path.resolve(dataDirOverride), 'quota-auth.json')];
+  }
+  const candidates = [
+    path.join(os.homedir(), '.config', 'agy-gate', 'quota-auth.json'),
+    path.join(os.homedir(), '.config', 'agy-opencode-router', 'quota-auth.json'),
+  ];
+  if (env.OPENCHAMBER_SERVICE_DATA_DIR?.trim()) {
+    candidates.push(path.join(path.resolve(env.OPENCHAMBER_SERVICE_DATA_DIR.trim()), 'quota-auth.json'));
+  }
+  return [...new Set(candidates)];
 }
 
-function resolveFallbackAuthFilePath(env = process.env) {
-  if (env.AGY_QUOTA_AUTH_FILE?.trim() || !env.OPENCHAMBER_SERVICE_DATA_DIR?.trim()) {
-    return null;
+export function resolveDefaultAuthFilePath(env = process.env) {
+  const candidates = resolveAuthCandidatePaths(env);
+  for (const candidate of candidates) {
+    if (fsSync.existsSync(candidate)) return candidate;
   }
-  return path.join(path.resolve(env.OPENCHAMBER_SERVICE_DATA_DIR.trim()), 'quota-auth.json');
+  return candidates[0];
 }
 
 function escapeHtml(text) {
@@ -166,8 +174,9 @@ export function extractCodeFromManualInput(rawInput, expectedState) {
 
 export function createOAuthManager(options = {}) {
   const env = options.env ?? process.env;
-  const authFilePath = options.authFilePath ?? resolveDefaultAuthFilePath(env);
-  const fallbackAuthFilePath = options.authFilePath ? null : resolveFallbackAuthFilePath(env);
+  const explicitAuthFilePath = options.authFilePath ? path.resolve(options.authFilePath) : null;
+  const candidatePaths = () => (explicitAuthFilePath ? [explicitAuthFilePath] : resolveAuthCandidatePaths(env));
+  const authFilePath = explicitAuthFilePath ?? candidatePaths()[0];
   const fetchImpl = options.fetchImpl ?? fetch;
   const clientId = options.clientId ?? env.AGY_QUOTA_OAUTH_CLIENT_ID?.trim() ?? ANTIGRAVITY_OAUTH_CLIENT.clientId;
   const resolveSecret = () => resolveDesktopOAuthSecret(env, options.clientSecret, options.clientSecretSha256);
@@ -175,6 +184,7 @@ export function createOAuthManager(options = {}) {
   let activeFlow = null;
   let refreshPromise = null;
   let lastError = null;
+  let lastResolvedAuthPath = authFilePath;
 
   async function readJsonIfExists(filePath) {
     try {
@@ -190,11 +200,25 @@ export function createOAuthManager(options = {}) {
   }
 
   async function readAuth() {
-    const primary = await readJsonIfExists(authFilePath);
-    if (primary) return primary;
-    if (fallbackAuthFilePath && fallbackAuthFilePath !== authFilePath) {
-      return readJsonIfExists(fallbackAuthFilePath);
+    let fallbackRecord = null;
+    let fallbackPath = null;
+    for (const candidate of candidatePaths()) {
+      const parsed = await readJsonIfExists(candidate);
+      if (!parsed) continue;
+      if (typeof parsed.refreshToken === 'string' && parsed.refreshToken.trim()) {
+        lastResolvedAuthPath = candidate;
+        return parsed;
+      }
+      if (!fallbackRecord) {
+        fallbackRecord = parsed;
+        fallbackPath = candidate;
+      }
     }
+    if (fallbackRecord) {
+      lastResolvedAuthPath = fallbackPath;
+      return fallbackRecord;
+    }
+    lastResolvedAuthPath = authFilePath;
     return null;
   }
 
@@ -210,13 +234,14 @@ export function createOAuthManager(options = {}) {
     } catch {
       // Ignore chmod limitations on Windows filesystems.
     }
+    lastResolvedAuthPath = authFilePath;
     return next;
   }
 
   async function clearAuth() {
     lastError = null;
-    for (const target of [authFilePath, fallbackAuthFilePath]) {
-      if (!target) continue;
+    lastResolvedAuthPath = authFilePath;
+    for (const target of candidatePaths()) {
       try {
         await fs.unlink(target);
       } catch (error) {
@@ -518,7 +543,7 @@ export function createOAuthManager(options = {}) {
       planLabel: auth?.planLabel ?? null,
       projectId: auth?.projectId ?? null,
       expiresAt: typeof auth?.expiresAt === 'number' ? auth.expiresAt : null,
-      authFilePath,
+      authFilePath: lastResolvedAuthPath,
       pendingAuth: activeFlow
         ? {
             authUrl: activeFlow.authUrl,

@@ -239,8 +239,8 @@ export async function readAntigravityQuota(oauthManager, options = {}) {
   if (!tokenState?.accessToken) {
     return {
       ok: false,
-      configured: false,
-      error: '尚未授权 Google 账号，请运行 agy-gate quota-login（或在 occ 中登录）。',
+      configured: true,
+      error: '尚未授权 Google 账号，请运行 occ → Agy 用量授权（或 agy-gate quota-login）。',
       usage: null,
     };
   }

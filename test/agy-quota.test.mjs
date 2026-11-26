@@ -165,6 +165,38 @@ describe('agy-quota OAuth & token management', () => {
       await oauth.close();
     });
   });
+
+  it('dynamically detects quota-auth.json written after manager startup', async () => {
+    await withTempDir(async (dir) => {
+      const dataDir = path.join(dir, 'agy-gate-data');
+      const oauth = createOAuthManager({
+        env: { AGY_GATE_DATA_DIR: dataDir },
+        clientId: 'test-client-id',
+        clientSecret: 'test-client-secret',
+      });
+      const initial = await oauth.getStatus();
+      assert.equal(initial.connected, false);
+
+      await fs.mkdir(dataDir, { recursive: true });
+      await fs.writeFile(
+        path.join(dataDir, 'quota-auth.json'),
+        JSON.stringify({
+          email: 'late@example.com',
+          accessToken: 'late-access-token',
+          refreshToken: 'late-refresh-token',
+          expiresAt: Date.now() + 3_600_000,
+        }),
+        'utf8',
+      );
+
+      const after = await oauth.getStatus();
+      assert.equal(after.connected, true);
+      assert.equal(after.email, 'late@example.com');
+      const token = await oauth.getAccessToken();
+      assert.equal(token?.accessToken, 'late-access-token');
+      await oauth.close();
+    });
+  });
 });
 
 describe('agy-quota payload transformation & HTTP service', () => {
@@ -280,8 +312,9 @@ describe('agy-quota payload transformation & HTTP service', () => {
         assert.equal(unconfigured.status, 200);
         const unconfJson = await unconfigured.json();
         assert.equal(unconfJson.ok, true);
-        assert.equal(unconfJson.data.configured, false);
+        assert.equal(unconfJson.data.configured, true);
         assert.equal(unconfJson.data.ok, false);
+        assert.match(unconfJson.data.error, /occ|quota-login/);
 
         await fs.writeFile(authFile, JSON.stringify({
           email: 'demo@example.com',
