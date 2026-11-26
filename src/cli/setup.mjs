@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import {
   ROUTER_BIN_DIR,
   ROUTER_ROOT,
+  rememberRepoRoot,
   resolveAgyBinary,
   resolveDataDir,
   resolveRealOpenCode,
@@ -173,12 +174,20 @@ export function registerOpenChamberQuotaExtension(options = {}) {
     nextStorageIds[QUOTA_EXTENSION_ID] = crypto.randomUUID();
   }
 
+  const nextDisabledGuests = existing.disabledGuests && typeof existing.disabledGuests === 'object'
+    ? { ...existing.disabledGuests }
+    : null;
+  if (nextDisabledGuests) {
+    delete nextDisabledGuests[QUOTA_EXTENSION_ID];
+  }
+
   const nextDoc = {
     ...existing,
     paths: nextPaths,
     capabilityGrants: nextGrants,
     capabilityScopes: nextScopes,
     storageIds: nextStorageIds,
+    ...(nextDisabledGuests ? { disabledGuests: nextDisabledGuests } : {}),
   };
   const changed = JSON.stringify(existing) !== JSON.stringify(nextDoc);
 
@@ -289,6 +298,10 @@ export async function runSetup(options = {}) {
     if (!steps.agyFast.ok && steps.agyFast.error) {
       warnings.push(steps.agyFast.error);
     }
+  }
+
+  if (!uninstall && !dryRun) {
+    rememberRepoRoot(routerRoot, env);
   }
 
   const nodeVersion = process.versions.node;

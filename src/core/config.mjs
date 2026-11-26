@@ -206,3 +206,60 @@ export function resolveMagpieBinary(env = process.env) {
   const candidate = path.join(localAppData, 'Programs', 'magpie', 'magpie.exe');
   return existsFile(candidate) ? candidate : null;
 }
+
+/**
+ * Resolve path to `occ-state.json` under the gateway data directory.
+ * @param {NodeJS.ProcessEnv} [env]
+ */
+export function resolveOccStatePath(env = process.env) {
+  return path.join(resolveDataDir(env), 'occ-state.json');
+}
+
+/**
+ * Read persisted `occ` state (`occ-state.json`), falling back to legacy bin state if absent.
+ * @param {NodeJS.ProcessEnv} [env]
+ * @returns {Record<string, any>}
+ */
+export function readOccState(env = process.env) {
+  for (const file of [resolveOccStatePath(env), path.join(ROUTER_BIN_DIR, 'state.json')]) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+      if (parsed && typeof parsed === 'object') return parsed;
+    } catch {
+      // Ignore missing or unreadable state file
+    }
+  }
+  return {};
+}
+
+/**
+ * Persist `occ` state atomically under the gateway data directory.
+ * @param {Record<string, any>} next
+ * @param {NodeJS.ProcessEnv} [env]
+ */
+export function writeOccState(next, env = process.env) {
+  const filePath = resolveOccStatePath(env);
+  try {
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    const tmp = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(next, null, 2), 'utf8');
+    fs.renameSync(tmp, filePath);
+  } catch {
+    // Non-fatal; state persistence must never block CLI operations
+  }
+}
+
+/**
+ * Record the git repository root so copied global installs (`npm install -g .`) can still sync via `occ`.
+ * @param {string} repoRoot
+ * @param {NodeJS.ProcessEnv} [env]
+ */
+export function rememberRepoRoot(repoRoot, env = process.env) {
+  if (!repoRoot) return;
+  const resolved = path.resolve(repoRoot);
+  if (!fs.existsSync(path.join(resolved, '.git'))) return;
+  const state = readOccState(env);
+  if (state.repoRoot === resolved) return;
+  state.repoRoot = resolved;
+  writeOccState(state, env);
+}

@@ -5,9 +5,10 @@
 ## 用法
 
 ```text
-occ           打开交互式终端菜单
-occ setup     一键配置分流网关、agy-quota 扩展与 OpenChamber MCP
-occ --help    查看说明
+occ                  打开交互式终端菜单
+occ setup            一键配置分流网关、agy-quota 扩展与 OpenChamber MCP
+occ sync [--check]   检查或从 GitHub 同步最新代码并刷新环境配置
+occ --help           查看说明
 ```
 
 主菜单项：
@@ -17,9 +18,10 @@ occ --help    查看说明
 | `启动服务` | 启动本地 OpenChamber 并显示访问地址 | 灰显，显示 `运行中 · http://127.0.0.1:3000` |
 | `停止服务` | 灰显，不可选 | 停止实例并复核状态 |
 | `升级` | 选择 `opencode` / `openchamber` / `agy-cli` 升级或回滚 | 同左（先停后恢复） |
+| `同步更新` | 检查并从 GitHub `origin` 拉取最新代码、同步全局命令与环境配置 | 同左（有更新时先停后恢复） |
 | `引擎入口` | 在原生 OpenCode 与 `agy-gate` 间切换 | 同左（自动重启生效） |
-| `Agy 用量授权` | 打开浏览器完成或解除只读 Google OAuth 授权 | 同左 |
-| `一键配置` | 绑定 `opencodeBinary`、注册 `agy-quota` 扩展与 `openchamber` MCP | 同左 |
+| `Agy 用量授权` | 完成/解除只读 Google OAuth 授权并自动确保 `agy-quota` 扩展已启用 | 同左（必要时自动重启生效；OP 内在设置 → 用量 底部查看「Agy CLI 用量」） |
+| `一键配置` | 绑定 `opencodeBinary`、注册 `agy-quota` 扩展与 `openchamber` MCP | 同左（配置变更时自动重启生效） |
 | `退出` | 等同于 `q` | 等同于 `q` |
 
 按键：`↑` `↓`（或 `j` `k`）移动，`Enter` 执行，`q` / `Esc` / `Ctrl-C` 退出；子列表按 `Esc` 返回上一层。非交互管道环境下自动打印文本状态后退出。

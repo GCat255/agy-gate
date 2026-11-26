@@ -5,16 +5,18 @@ import { spawn, spawnSync } from 'node:child_process';
 import {
   ROUTER_BIN_DIR,
   isRouterSelfPath,
+  readOccState,
+  rememberRepoRoot,
   resolveAgyBinary,
   resolveDataDir,
   resolveRealOpenCode,
+  writeOccState,
 } from '../core/config.mjs';
 import { resolveOpenChamberDataDir, resolveOpenChamberWebRoot } from '../bridge/openchamber.mjs';
 
 const IS_WIN = process.platform === 'win32';
 export const PKG_OPENCODE = '@opencode/cli';
 export const PKG_OPENCHAMBER = '@openchamber/web';
-const STATE_FILE = path.join(resolveDataDir(), 'occ-state.json');
 
 export function baseUrl(port) {
   return `http://127.0.0.1:${port}`;
@@ -81,31 +83,22 @@ export function quotaAuthState() {
   return { connected: false, email: null };
 }
 
-function readState() {
-  for (const file of [STATE_FILE, path.join(ROUTER_BIN_DIR, 'state.json')]) {
-    try {
-      return JSON.parse(fs.readFileSync(file, 'utf8'));
-    } catch {}
-  }
-  return {};
-}
+export { rememberRepoRoot };
 
-function writeState(next) {
-  try {
-    fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
-    fs.writeFileSync(STATE_FILE, JSON.stringify(next, null, 2), 'utf8');
-  } catch {}
+export function readRecordedRepoRoot(env = process.env) {
+  const repoRoot = readOccState(env).repoRoot;
+  return typeof repoRoot === 'string' && repoRoot.trim() ? repoRoot.trim() : null;
 }
 
 export function rememberPrevious(component, previousVersion) {
   if (!previousVersion) return;
-  const state = readState();
+  const state = readOccState();
   state[component] = { previous: previousVersion, at: Date.now() };
-  writeState(state);
+  writeOccState(state);
 }
 
 export function previousVersionOf(component) {
-  const entry = readState()[component];
+  const entry = readOccState()[component];
   return entry && typeof entry.previous === 'string' ? entry.previous : null;
 }
 
@@ -139,7 +132,7 @@ export function tail(text, maxLines = 6) {
     .slice(-maxLines);
 }
 
-export function runCapture(file, args, timeoutMs = 20000, env) {
+export function runCapture(file, args, timeoutMs = 20000, env, cwd = process.cwd()) {
   return new Promise((resolve) => {
     let out = '';
     let err = '';
@@ -151,7 +144,7 @@ export function runCapture(file, args, timeoutMs = 20000, env) {
     };
     let child;
     try {
-      child = spawn(file, args, { windowsHide: true, cwd: process.cwd(), env: env || process.env });
+      child = spawn(file, args, { windowsHide: true, cwd, env: env || process.env });
     } catch (e) {
       finish({ ok: false, code: -1, out: '', err: String(e?.message || e) });
       return;
@@ -388,4 +381,44 @@ export async function ensureStopped(state) {
   await runCapture(process.execPath, [webCli, 'stop'], 60000);
   await probeStatus(state);
   return state.state !== 'running';
+}
+
+/**
+ * Restart a running OpenChamber service and refresh status.
+ * @param {any} state
+ * @param {(phase: 'stopping' | 'starting') => void} [onPhase]
+ */
+export async function restartRunningService(state, onPhase) {
+  onPhase?.('stopping');
+  await ensureStopped(state);
+  onPhase?.('starting');
+  const started = await ensureStarted(state.port);
+  await probeStatus(state);
+  return started;
+}
+
+/**
+ * Probe whether a running OpenChamber instance has `ext-agy-quota` mounted and healthy.
+ * @param {number} port
+ */
+export async function probeQuotaExtension(port) {
+  const extList = await fetchJson(`${baseUrl(port)}/api/quota/extensions`, 'application/json', 3000);
+  if (!extList || !Array.isArray(extList.extensions)) {
+    return { reachable: false, registered: false, ok: false, configured: false, error: null };
+  }
+  const registered = extList.extensions.some((item) => item?.id === 'ext-agy-quota');
+  if (!registered) {
+    return { reachable: true, registered: false, ok: false, configured: false, error: null };
+  }
+  const quotaRes = await fetchJson(`${baseUrl(port)}/api/quota/ext-agy-quota`, 'application/json', 5000);
+  if (!quotaRes || typeof quotaRes !== 'object') {
+    return { reachable: true, registered: true, ok: false, configured: false, error: '扩展用量接口无响应' };
+  }
+  return {
+    reachable: true,
+    registered: true,
+    ok: Boolean(quotaRes.ok),
+    configured: Boolean(quotaRes.configured),
+    error: typeof quotaRes.error === 'string' ? quotaRes.error : null,
+  };
 }

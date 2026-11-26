@@ -53,6 +53,7 @@ test('registerOpenChamberQuotaExtension idempotently registers agy-quota and pre
         paths: ['C:\\other\\ext', 'C:\\old-location\\extensions\\agy-quota'],
         capabilityGrants: { 'other-ext': ['service'] },
         capabilityScopes: { 'other-ext': { service: {} } },
+        disabledGuests: { 'agy-quota': true, 'other-ext': true },
         storageIds: { 'other-ext': 'id-1', 'agy-quota': 'keep-existing-id' },
       }),
       'utf8',
@@ -66,6 +67,8 @@ test('registerOpenChamberQuotaExtension idempotently registers agy-quota and pre
     assert.deepEqual(saved.paths, ['C:\\other\\ext', path.resolve(extDir)]);
     assert.deepEqual(saved.capabilityGrants['agy-quota'], ['service']);
     assert.deepEqual(saved.capabilityGrants['other-ext'], ['service']);
+    assert.equal(saved.disabledGuests['agy-quota'], undefined);
+    assert.equal(saved.disabledGuests['other-ext'], true);
     assert.equal(saved.storageIds['agy-quota'], 'keep-existing-id');
 
     const removed = registerOpenChamberQuotaExtension({ dataDir: ocDir, extensionDir: extDir, remove: true });
@@ -109,6 +112,8 @@ test('runSetup wires engine, extension, and mcp_config cleanly in isolated temp 
     assert.equal(fs.existsSync(path.join(ocDir, 'settings.json')), true);
     assert.equal(fs.existsSync(path.join(ocDir, 'extensions.json')), true);
     assert.equal(fs.existsSync(mcpPath), true);
+    const occState = JSON.parse(fs.readFileSync(path.join(dataDir, 'occ-state.json'), 'utf8'));
+    assert.equal(occState.repoRoot, repoRoot);
 
     const report = formatSetupReport(result);
     assert.match(report, /环境初始化结果/);

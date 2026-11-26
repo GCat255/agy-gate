@@ -31,9 +31,18 @@ cd agy-gate
    - 在 `~/.gemini/config/mcp_config.json` 幂等注册 `mcpServers.openchamber`（仅在 OpenChamber 会话内激活工具）。
 4. 运行 `agy-gate doctor` 输出环境自检摘要。
 
-安装完成后即可直接在任意终端运行 **`occ`** 启动 OpenChamber、切换引擎、升级组件或授权 Agy 用量（也可手动执行 `agy-gate quota-login` 完成只读 Google OAuth 授权）。
+安装完成后即可直接在任意终端运行 **`occ`** 启动 OpenChamber、切换引擎、升级组件、授权 Agy 用量（在 OpenChamber「设置 → 用量」列表底部选择 **`Agy CLI 用量`** 查看，而非内置的 `Antigravity`）或一键同步 GitHub 更新（也可手动执行 `agy-gate quota-login` 完成只读 Google OAuth 授权）。
 
 ### 日常更新
+
+在已安装设备上可直接通过 `occ` 一键同步（推荐）：
+
+```bash
+# 打开 occ 交互菜单选择「同步更新」，或直接在终端执行：
+occ sync
+```
+
+`occ sync` 会自动检查 GitHub 更新、执行 `git pull --ff-only`、在非软链安装模式下重新 `npm install -g .`、刷新 `setup` 配置，并在 OpenChamber 运行中时自动重启生效；也可手动执行：
 
 ```bash
 cd agy-gate

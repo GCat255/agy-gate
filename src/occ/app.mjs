@@ -3,7 +3,12 @@ import path from 'node:path';
 import process from 'node:process';
 import { ROUTER_BIN_DIR, resolveAgyBinary, resolveRealOpenCode } from '../core/config.mjs';
 import { resolveNpmInvocation } from '../core/process.mjs';
-import { formatSetupReport, resolveRouterBinary, runSetup } from '../cli/setup.mjs';
+import {
+  formatSetupReport,
+  registerOpenChamberQuotaExtension,
+  resolveRouterBinary,
+  runSetup,
+} from '../cli/setup.mjs';
 import { ALT_SCREEN, SPIN, drawScreen, style } from './render.mjs';
 import {
   PKG_OPENCODE,
@@ -17,17 +22,20 @@ import {
   logPath,
   prepareBashEnv,
   previousVersionOf,
+  probeQuotaExtension,
   probeStatus,
   quotaAuthState,
   readSettings,
   refreshVersions,
   rememberPrevious,
   resolveWebCli,
+  restartRunningService,
   routerBindingState,
   runCapture,
   tail,
   writeSettings,
 } from './services.mjs';
+import { applyRepoSync, inspectRepoSync } from './sync.mjs';
 
 const IS_WIN = process.platform === 'win32';
 const ROUTER_CLI = path.join(ROUTER_BIN_DIR, 'agy-gate.mjs');
@@ -45,6 +53,8 @@ const S = {
   quotaAuth: { connected: false, email: null },
   latest: { openchamber: null, opencode: null },
   latestState: 'pending',
+  syncInfo: null,
+  syncState: 'pending',
   selected: 0,
   busy: false,
   message: null,
@@ -98,6 +108,28 @@ function upgradeSummary() {
   return parts.length ? `有新版：${parts.join(' · ')}` : '已是最新（可回滚）';
 }
 
+function syncSummary() {
+  if (S.syncState === 'pending') return '检查中…';
+  const info = S.syncInfo;
+  if (!info) return '未检查';
+  if (info.state === 'no-repo') return '未检测到 Git 仓库';
+  if (info.state === 'no-git') return '未检测到 Git';
+  if (info.state === 'detached') return '游离 HEAD（请切换分支）';
+  if (info.state === 'offline') {
+    return info.shortSha ? `${info.branch} (${info.shortSha}) · 离线` : '离线（无法连接 GitHub）';
+  }
+  if (info.state === 'dirty') {
+    return info.behind > 0
+      ? `有 ${info.behind} 个更新 · 工作区 ${info.dirtyCount} 处改动`
+      : `${info.branch} · 工作区有 ${info.dirtyCount} 处改动`;
+  }
+  if (info.state === 'diverged') return `${info.branch} · 分叉（+${info.ahead}/-${info.behind}）`;
+  if (info.state === 'behind') return `${info.branch} · 有 ${info.behind} 个新提交`;
+  if (info.state === 'ahead') return `${info.branch} (${info.shortSha}) · 领先 ${info.ahead}`;
+  if (info.state === 'up-to-date') return `${info.branch} (${info.shortSha}) · 已是最新`;
+  return info.error || '检查异常';
+}
+
 function menuRows() {
   const running = S.state === 'running';
   const inst = S.instances[0];
@@ -123,6 +155,7 @@ function menuRows() {
       enabled: running,
     },
     { id: 'upgrade', label: '升级', right: upgradeSummary(), enabled: true },
+    { id: 'sync', label: '同步更新', right: syncSummary(), enabled: true },
     { id: 'router', label: '引擎入口', right: routerRight, enabled: routerAvailable },
     {
       id: 'quota',
@@ -452,6 +485,19 @@ async function upgradeAgyCli() {
   draw();
 }
 
+async function restartServiceWithSpinner(stopLabel, startLabel) {
+  return restartRunningService(S, (phase) => {
+    startSpin(phase === 'stopping' ? stopLabel : startLabel);
+  });
+}
+
+async function refreshSyncStatus(state, timeoutMs = 5000) {
+  const info = await inspectRepoSync({ timeoutMs });
+  state.syncInfo = info;
+  state.syncState = info.state;
+  return info;
+}
+
 async function actionToggleRouter() {
   if (!fs.existsSync(ROUTER_BIN)) {
     S.message = style.err(`未找到分流网关：${ROUTER_BIN}`);
@@ -470,26 +516,29 @@ async function actionToggleRouter() {
   }
 
   const wasRunning = S.state === 'running';
-  if (wasRunning) {
-    startSpin('停止服务以切换引擎入口…');
-    await ensureStopped(S);
-  }
-
   const next = readSettings();
   if (toRouter) next.opencodeBinary = ROUTER_BIN;
   else delete next.opencodeBinary;
-  writeSettings(next);
-  S.routerMode = routerBindingState();
+
+  let restarted = true;
+  if (wasRunning) {
+    startSpin('停止服务以切换引擎入口…');
+    await ensureStopped(S);
+    writeSettings(next);
+    S.routerMode = routerBindingState();
+    startSpin('重启服务以应用引擎入口…');
+    restarted = await ensureStarted(S.port);
+    await probeStatus(S);
+  } else {
+    writeSettings(next);
+    S.routerMode = routerBindingState();
+  }
 
   let msg = toRouter
     ? style.ok('已切换为分流网关（OpenCode + agy-cli）')
     : style.ok('已恢复为原生 OpenCode');
-
-  if (wasRunning) {
-    startSpin('重启服务以应用引擎入口…');
-    const started = await ensureStarted(S.port);
-    await probeStatus(S);
-    if (!started) msg = style.err(`配置已保存，但服务重启超时，日志：${logPath(S.port)}`);
+  if (wasRunning && !restarted) {
+    msg = style.err(`配置已保存，但服务重启超时，日志：${logPath(S.port)}`);
   }
 
   stopSpin(msg);
@@ -539,10 +588,46 @@ async function actionQuotaAuth() {
   const inv = buildRouterInvocation(['quota-login']);
   const r = await runCapture(inv.cmd, inv.args, 180000);
   S.quotaAuth = quotaAuthState();
-  if (r.ok && S.quotaAuth.connected) {
-    stopSpin(style.ok(`已授权：${S.quotaAuth.email ?? 'Google 账号'}（可在 OpenChamber 设置 → 用量刷新查看）`));
-  } else {
+  if (!r.ok || !S.quotaAuth.connected) {
     stopSpin(style.err(`授权未完成：${tail(r.err || r.out, 2).join(' ') || '请改用终端执行 agy-gate quota-login'}`));
+    draw();
+    return;
+  }
+
+  const email = S.quotaAuth.email ?? 'Google 账号';
+  const extReg = registerOpenChamberQuotaExtension({ env: process.env });
+  if (!extReg.ok) {
+    stopSpin(style.warn(`已授权 ${email}，但注册 agy-quota 扩展失败：${extReg.error || '请运行 一键配置'}`));
+    draw();
+    return;
+  }
+
+  if (S.state === 'running') {
+    let probe = await probeQuotaExtension(S.port);
+    if (extReg.action === 'updated' || (probe.reachable && !probe.registered)) {
+      const restarted = await restartServiceWithSpinner(
+        '停止服务以加载 agy-quota 扩展…',
+        '重启服务以应用用量扩展…',
+      );
+      if (!restarted) {
+        stopSpin(style.warn(`已授权 ${email}，但服务重启超时，请手动重启后再在 OP 设置 → 用量查看`));
+        draw();
+        return;
+      }
+      probe = await probeQuotaExtension(S.port);
+    }
+
+    if (probe.ok) {
+      stopSpin(style.ok(`已授权：${email} · OP 已挂载（设置 → 用量 底部「Agy CLI 用量」）`));
+    } else if (probe.registered && probe.error) {
+      stopSpin(style.warn(`已授权 ${email}，但扩展检测报错：${probe.error}`));
+    } else if (probe.reachable && !probe.registered) {
+      stopSpin(style.warn(`已授权 ${email}，请重启 OpenChamber 后在设置 → 用量 底部查看「Agy CLI 用量」`));
+    } else {
+      stopSpin(style.ok(`已授权：${email}（请在 OP 设置 → 用量 底部选择「Agy CLI 用量」并点刷新）`));
+    }
+  } else {
+    stopSpin(style.ok(`已授权：${email}（启动服务后请在 OP 设置 → 用量 底部选择「Agy CLI 用量」）`));
   }
   draw();
 }
@@ -551,12 +636,107 @@ async function actionSetup() {
   startSpin('配置分流网关、agy-quota 扩展与 OpenChamber MCP…');
   const res = await runSetup({ cliEntryPath: ROUTER_CLI, env: process.env });
   await refreshVersions(S);
+
+  const hostConfigChanged =
+    res.steps.engine?.action === 'updated'
+    || res.steps.engine?.action === 'removed'
+    || res.steps.quotaExtension?.action === 'updated'
+    || res.steps.quotaExtension?.action === 'removed';
+
+  let restartFailed = false;
+  if (res.ok && hostConfigChanged && S.state === 'running') {
+    const restarted = await restartServiceWithSpinner(
+      '停止服务以应用最新配置…',
+      '重启服务以生效配置…',
+    );
+    if (!restarted) restartFailed = true;
+  }
+
   if (!res.ok) {
     stopSpin(style.err(`配置未完全成功：${res.warnings[0] || '请运行 agy-gate setup 查看详情'}`));
+  } else if (restartFailed) {
+    stopSpin(style.warn(`配置已写入，但服务重启超时，日志：${logPath(S.port)}`));
   } else if (res.warnings.length > 0) {
     stopSpin(style.warn(`已写入配置（${res.warnings.length} 项环境提示，可用 agy-gate doctor 检查）`));
+  } else if (hostConfigChanged && S.state === 'running') {
+    stopSpin(style.ok('已完成一条龙配置并重启 OpenChamber 生效（用量请在底部「Agy CLI 用量」查看）'));
   } else {
     stopSpin(style.ok('已完成一条龙配置（引擎绑定 + agy-quota 扩展 + MCP）'));
+  }
+  draw();
+}
+
+async function actionSync() {
+  startSpin('检查 GitHub 仓库更新…');
+  const info = await refreshSyncStatus(S, 15000);
+
+  if (!info.ok) {
+    stopSpin(style.err(info.error || '无法检查 GitHub 更新'));
+    draw();
+    return;
+  }
+  if (info.state === 'dirty') {
+    stopSpin(style.warn(`工作区有 ${info.dirtyCount} 处未提交改动，已中止同步以防覆盖`));
+    draw();
+    return;
+  }
+  if (info.state === 'diverged') {
+    stopSpin(style.warn(`分支 ${info.branch} 与远端分叉（+${info.ahead}/-${info.behind}），请手动合并`));
+    draw();
+    return;
+  }
+  if (info.state === 'ahead') {
+    stopSpin(style.ok(`分支 ${info.branch} (${info.shortSha}) 领先远端 ${info.ahead} 个提交，无需拉取`));
+    draw();
+    return;
+  }
+  if (info.behind === 0) {
+    stopSpin(style.ok(`${info.branch} (${info.shortSha}) 已是最新，无需同步`));
+    draw();
+    return;
+  }
+
+  stopSpin(null);
+  const topCommit = info.commits[0] ? `（${info.commits[0]}）` : '';
+  if (!(await confirm(`发现 ${info.behind} 个新提交${topCommit}，从 GitHub 同步并刷新配置？　Enter 确认　Esc 取消`))) {
+    S.message = '已取消';
+    draw();
+    return;
+  }
+
+  const wasRunning = S.state === 'running';
+  if (wasRunning) {
+    startSpin('停止服务以安全同步代码…');
+    await ensureStopped(S);
+  }
+
+  startSpin(`正在从 GitHub 拉取 ${info.branch} 并刷新配置…`);
+  const syncRes = await applyRepoSync({
+    repoRoot: info.repoRoot,
+    branch: info.branch,
+    installMode: info.installMode,
+    env: process.env,
+  });
+
+  await Promise.all([refreshVersions(S), refreshSyncStatus(S, 8000)]);
+
+  let restartFailed = false;
+  if (wasRunning) {
+    startSpin('恢复服务…');
+    const started = await ensureStarted(S.port);
+    await probeStatus(S);
+    if (!started) restartFailed = true;
+  }
+
+  if (!syncRes.ok) {
+    stopSpin(style.err(`同步未完成：${syncRes.error || '未知错误'}`));
+  } else if (restartFailed) {
+    stopSpin(style.warn(`已同步到 ${syncRes.afterSha}，但服务恢复失败，日志：${logPath(S.port)}`));
+  } else {
+    const verSpan = syncRes.beforeSha && syncRes.afterSha && syncRes.beforeSha !== syncRes.afterSha
+      ? `${syncRes.beforeSha} → ${syncRes.afterSha}`
+      : syncRes.afterSha || '最新';
+    stopSpin(style.ok(`已同步（${verSpan}）并刷新配置；建议退出重开 occ 使用新版面板`));
   }
   draw();
 }
@@ -588,6 +768,7 @@ async function runRow(id) {
     if (id === 'start') await actionStart();
     else if (id === 'stop') await actionStop();
     else if (id === 'upgrade') await actionUpgrade();
+    else if (id === 'sync') await actionSync();
     else if (id === 'router') await actionToggleRouter();
     else if (id === 'quota') await actionQuotaAuth();
     else if (id === 'setup') await actionSetup();
@@ -617,6 +798,7 @@ function plainStatus() {
   ];
   if (running) lines.push(`  实例：${S.instances.length}　地址：${baseUrl(S.port)}`);
   lines.push(`  版本：${upgradeSummary()}`);
+  lines.push(`  同步：${syncSummary()}`);
   process.stdout.write(`${lines.join('\n')}\n`);
 }
 
@@ -625,13 +807,15 @@ function helpText() {
     'occ — OpenChamber 终端启动器',
     '',
     '用法：',
-    '  occ           打开交互菜单',
-    '  occ setup     一键配置分流网关、agy-quota 扩展与 OpenChamber MCP',
+    '  occ                   打开交互菜单',
+    '  occ setup             一键配置分流网关、agy-quota 扩展与 OpenChamber MCP',
+    '  occ sync [--check]    检查或从 GitHub 同步最新代码并刷新环境配置',
     '',
     '交互菜单：',
     '  启动服务            启动本地服务并显示地址',
     '  停止服务            停止正在运行的实例',
     '  升级                选择组件（opencode / openchamber / agy-cli）进行升级或回滚',
+    '  同步更新            从 GitHub 拉取 agy-gate 最新提交并刷新环境配置',
     '  引擎入口            在原生 OpenCode 与 agy-gate 分流网关间切换',
     '  Agy 用量授权        为 Agy CLI 用量扩展完成或解除只读 Google OAuth 授权',
     '  一键配置            绑定分流网关、注册 agy-quota 扩展与 openchamber MCP',
@@ -641,6 +825,59 @@ function helpText() {
     '非交互环境（管道）下不进菜单，直接打印状态。',
     '',
   ].join('\n');
+}
+
+async function runOccSyncCli(argv) {
+  const checkOnly = argv.includes('--check');
+  const asJson = argv.includes('--json');
+  const info = await inspectRepoSync({ timeoutMs: 15000, env: process.env });
+
+  if (checkOnly || !info.ok || info.state !== 'behind') {
+    const ok = info.ok && (info.state === 'up-to-date' || info.state === 'behind' || info.state === 'ahead');
+    if (asJson) {
+      process.stdout.write(`${JSON.stringify(info, null, 2)}\n`);
+    } else if (!info.ok) {
+      process.stderr.write(`同步检查失败：${info.error}\n`);
+    } else if (info.state === 'dirty') {
+      process.stderr.write(`工作区有 ${info.dirtyCount} 处未提交改动，已中止同步。\n`);
+    } else if (info.state === 'diverged') {
+      process.stderr.write(`分支 ${info.branch} 与远端分叉（+${info.ahead}/-${info.behind}），请手动处理。\n`);
+    } else if (info.state === 'ahead') {
+      process.stdout.write(`分支 ${info.branch} (${info.shortSha}) 领先远端 ${info.ahead} 个提交，无需拉取。\n`);
+    } else if (info.behind === 0) {
+      process.stdout.write(`分支 ${info.branch} (${info.shortSha}) 已是最新。\n`);
+    } else {
+      process.stdout.write(`发现 ${info.behind} 个待同步提交（${info.branch} @ ${info.shortSha}）：\n`);
+      for (const c of info.commits) process.stdout.write(`  - ${c}\n`);
+    }
+    return ok ? 0 : 1;
+  }
+
+  await probeStatus(S);
+  const wasRunning = S.state === 'running';
+  if (wasRunning) {
+    await ensureStopped(S);
+  }
+  const syncRes = await applyRepoSync({
+    repoRoot: info.repoRoot,
+    branch: info.branch,
+    installMode: info.installMode,
+    env: process.env,
+  });
+  let restarted = true;
+  if (wasRunning) {
+    restarted = await ensureStarted(S.port);
+  }
+  if (asJson) {
+    process.stdout.write(`${JSON.stringify({ inspect: info, sync: syncRes, restarted }, null, 2)}\n`);
+  } else if (!syncRes.ok) {
+    process.stderr.write(`同步失败：${syncRes.error}\n`);
+  } else {
+    process.stdout.write(
+      `同步完成：${syncRes.beforeSha} → ${syncRes.afterSha}（配置已刷新${wasRunning ? (restarted ? '，OpenChamber 已重启' : '，OpenChamber 重启超时') : ''}）\n`,
+    );
+  }
+  return syncRes.ok && (!wasRunning || restarted) ? 0 : 1;
 }
 
 export async function runOccCli(argv = process.argv.slice(2)) {
@@ -660,11 +897,15 @@ export async function runOccCli(argv = process.argv.slice(2)) {
     process.stdout.write(argv.includes('--json') ? `${JSON.stringify(result, null, 2)}\n` : formatSetupReport(result));
     return result.ok ? 0 : 1;
   }
+  if (argv[0] === 'sync') {
+    return runOccSyncCli(argv.slice(1));
+  }
 
   await Promise.all([probeStatus(S), fetchLatestVersions(S)]);
   await refreshVersions(S);
 
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    await refreshSyncStatus(S, 4000).catch(() => {});
     plainStatus();
     return 0;
   }
@@ -696,6 +937,9 @@ export async function runOccCli(argv = process.argv.slice(2)) {
   process.on('SIGTERM', () => quitNow());
 
   draw();
+  void refreshSyncStatus(S, 5000).then(() => {
+    if (S.altActive && !S.busy && !S.pick) draw();
+  }).catch(() => {});
   for (;;) {
     const key = await nextKey();
     if (key === 'interrupt' || key === 'quit') break;
