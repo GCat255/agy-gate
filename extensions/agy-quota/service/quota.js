@@ -160,6 +160,12 @@ function pickSummaryFallbackBucket(existing, candidate) {
   return existing;
 }
 
+function sanitizeErrorMessage(error, fallback = '读取 Antigravity 用量失败') {
+  const raw = (error instanceof Error ? error.message : String(error ?? '')).trim();
+  if (!raw) return fallback;
+  return raw.length > 400 ? `${raw.slice(0, 397)}...` : raw;
+}
+
 export function transformQuotaPayloads({ summaryPayload, modelsPayload = null, planLabel = null }) {
   const windows = {};
   const groups = Array.isArray(summaryPayload?.groups) ? summaryPayload.groups : [];
@@ -210,6 +216,16 @@ export function transformQuotaPayloads({ summaryPayload, modelsPayload = null, p
     if (claudeGpt) windows['Claude / GPT'] = claudeGpt;
   }
 
+  if (Object.keys(windows).length === 0) {
+    return {
+      ok: false,
+      configured: true,
+      planLabel: planLabel ?? null,
+      error: 'Google 未返回任何配额窗口，请检查账号订阅状态或稍后重试。',
+      usage: null,
+    };
+  }
+
   return {
     ok: true,
     configured: true,
@@ -231,7 +247,7 @@ export async function readAntigravityQuota(oauthManager, options = {}) {
     return {
       ok: false,
       configured: true,
-      error: error instanceof Error ? error.message : String(error),
+      error: sanitizeErrorMessage(error, '读取 Google 授权令牌失败'),
       usage: null,
     };
   }
@@ -314,7 +330,7 @@ export async function readAntigravityQuota(oauthManager, options = {}) {
         return {
           ok: false,
           configured: true,
-          error: retryError instanceof Error ? retryError.message : String(retryError),
+          error: sanitizeErrorMessage(retryError),
           usage: null,
         };
       }
@@ -322,7 +338,7 @@ export async function readAntigravityQuota(oauthManager, options = {}) {
     return {
       ok: false,
       configured: true,
-      error: error instanceof Error ? error.message : String(error),
+      error: sanitizeErrorMessage(error),
       usage: null,
     };
   }

@@ -19,10 +19,12 @@ import {
   ensureStopped,
   fetchLatestVersions,
   fetchRecentVersions,
+  formatQuotaWindowsSummary,
   logPath,
   prepareBashEnv,
   previousVersionOf,
   probeQuotaExtension,
+  probeQuotaHealth,
   probeStatus,
   quotaAuthState,
   readSettings,
@@ -51,6 +53,7 @@ const S = {
   agyLocal: null,
   routerMode: 'native',
   quotaAuth: { connected: false, email: null },
+  quotaHealth: null,
   latest: { openchamber: null, opencode: null },
   latestState: 'pending',
   syncInfo: null,
@@ -130,6 +133,29 @@ function syncSummary() {
   return info.error || '检查异常';
 }
 
+function quotaSummary(routerAvailable = fs.existsSync(ROUTER_BIN)) {
+  if (!routerAvailable) return '未找到 agy-gate 垫片';
+  if (!S.quotaAuth.connected) return '未授权 · Enter 登录 Google';
+  const email = S.quotaAuth.email || 'Google';
+  const h = S.quotaHealth;
+  if (!h) return `已授权（${email}） · 检测 OP 状态中…`;
+  if (h.status === 'unregistered') return '⚠ 已授权但 OP 扩展未启用 · Enter 修复';
+  if (h.status === 'op-unmounted') return '⚠ 已授权但 OP 未加载扩展（需重启）· Enter 菜单';
+  if (h.status === 'op-error') return `✗ OP 查询失败：${h.op?.error || '未知错误'} · Enter 菜单`;
+  if (h.status === 'op-ok') {
+    const win = formatQuotaWindowsSummary(h.op?.windows);
+    const hiddenHint = h.inWorkStatus ? '' : '（未在状态栏显示）';
+    return `✓ OP 生效${hiddenHint}${win ? ` · ${win}` : `（${email}）`} · Enter 菜单`;
+  }
+  if (h.status === 'direct-ok') {
+    const win = formatQuotaWindowsSummary(h.direct?.windows);
+    return `✓ 授权有效${win ? ` · ${win}` : ''}（未运行 OP）· Enter 菜单`;
+  }
+  if (h.status === 'direct-error') return `✗ 查询失败：${h.direct?.error || '未知错误'} · Enter 菜单`;
+  if (h.status === 'ready-stopped') return `已授权且扩展已启用（启动 OP 后生效）· Enter 菜单`;
+  return `已授权（${email}） · Enter 检测/管理`;
+}
+
 function menuRows() {
   const running = S.state === 'running';
   const inst = S.instances[0];
@@ -166,11 +192,7 @@ function menuRows() {
     {
       id: 'quota',
       label: 'Agy 用量授权',
-      right: !routerAvailable
-        ? '未找到 agy-gate 垫片'
-        : S.quotaAuth.connected
-          ? `已授权${S.quotaAuth.email ? `（${S.quotaAuth.email}）` : ''} · Enter 解绑`
-          : '未授权 · Enter 打开 Google 登录',
+      right: quotaSummary(routerAvailable),
       enabled: routerAvailable,
     },
     {
@@ -571,30 +593,76 @@ function buildRouterInvocation(subArgs) {
   return { cmd: ROUTER_BIN, args: subArgs };
 }
 
-async function actionQuotaAuth() {
-  if (!fs.existsSync(ROUTER_BIN)) {
-    S.message = style.err(`未找到 agy-gate：${ROUTER_BIN}`);
+async function refreshQuotaHealth(options = {}) {
+  const health = await probeQuotaHealth(S, options);
+  S.quotaHealth = health;
+  S.quotaAuth = health.auth;
+  return health;
+}
+
+function formatQuotaCheckMessage(health) {
+  const email = health.auth?.email || 'Google 账号';
+  if (health.status === 'unauth') {
+    return style.warn('尚未授权 Google 账号');
+  }
+  if (health.status === 'unregistered') {
+    return style.warn(`已授权 ${email}，但 OP 未注册或已禁用 agy-quota 扩展（可在此选「启用/修复 OP 扩展」）`);
+  }
+  if (health.status === 'op-unmounted') {
+    return style.warn(`已授权 ${email}，但运行中的 OP 尚未挂载 ext-agy-quota（需重启 OP 生效）`);
+  }
+  if (health.status === 'op-error') {
+    return style.err(`OP 用量查询失败：${health.op?.error || '未知错误'}`);
+  }
+  if (health.status === 'op-ok') {
+    const win = formatQuotaWindowsSummary(health.op?.windows);
+    const plan = health.op?.planLabel ? `${health.op.planLabel} · ` : '';
+    const workHint = health.inWorkStatus ? '' : '（提示：如需状态栏展示请在 OP 用量页勾选「在工作状态面板中显示」）';
+    return style.ok(`OP 用量查询成功（${plan}${win || email}）· 位于 OP 设置→用量底部「Agy CLI 用量」${workHint}`);
+  }
+  if (health.status === 'direct-ok') {
+    const win = formatQuotaWindowsSummary(health.direct?.windows);
+    const plan = health.direct?.planLabel ? `${health.direct.planLabel} · ` : '';
+    return style.ok(`Google 授权与用量查询正常（${plan}${win || email}）；启动 OP 后即可在「Agy CLI 用量」查看`);
+  }
+  if (health.status === 'direct-error') {
+    return style.err(`直接探测用量失败：${health.direct?.error || '未知错误'}`);
+  }
+  return style.ok(`已授权 ${email} 且 OP 扩展已启用，启动 OP 后即可查看「Agy CLI 用量」`);
+}
+
+async function ensureQuotaExtensionActive({ forceRestartIfUnmounted = true } = {}) {
+  const extReg = registerOpenChamberQuotaExtension({ env: process.env });
+  if (!extReg.ok) {
+    await refreshQuotaHealth({ runDirectProbe: false });
+    stopSpin(style.warn(`注册 agy-quota 扩展失败：${extReg.error || '请运行 一键配置'}`));
     draw();
-    return;
+    return false;
   }
 
-  S.quotaAuth = quotaAuthState();
-  if (S.quotaAuth.connected) {
-    const label = S.quotaAuth.email ? `（${S.quotaAuth.email}）` : '';
-    if (!(await confirm(`解除 Agy 用量 Google 授权${label}　Enter 确认　Esc 取消`))) {
-      S.message = '已取消';
-      draw();
-      return;
+  if (S.state === 'running') {
+    const pre = await probeQuotaExtension(S.port);
+    if (extReg.action === 'updated' || (forceRestartIfUnmounted && pre.reachable && !pre.registered)) {
+      const restarted = await restartServiceWithSpinner(
+        '停止服务以加载 agy-quota 扩展…',
+        '重启服务以应用用量扩展…',
+      );
+      if (!restarted) {
+        await refreshQuotaHealth({ runDirectProbe: false });
+        stopSpin(style.warn('已写入扩展配置，但服务重启超时，请手动重启后再检测'));
+        draw();
+        return false;
+      }
     }
-    startSpin('清除 Agy 用量授权…');
-    const inv = buildRouterInvocation(['quota-logout']);
-    const r = await runCapture(inv.cmd, inv.args, 15000);
-    S.quotaAuth = quotaAuthState();
-    stopSpin(r.ok ? style.ok('已解除 Agy 用量授权') : style.err(`解绑失败：${tail(r.err || r.out, 2).join(' ')}`));
-    draw();
-    return;
   }
 
+  const health = await refreshQuotaHealth({ runDirectProbe: true });
+  stopSpin(formatQuotaCheckMessage(health));
+  draw();
+  return health.status === 'op-ok' || health.status === 'direct-ok';
+}
+
+async function loginAndVerifyQuota() {
   if (!(await confirm('将在浏览器打开 Google 授权页（仅用于读取 Agy 用量）　Enter 继续　Esc 取消'))) {
     S.message = '已取消';
     draw();
@@ -605,47 +673,79 @@ async function actionQuotaAuth() {
   const r = await runCapture(inv.cmd, inv.args, 180000);
   S.quotaAuth = quotaAuthState();
   if (!r.ok || !S.quotaAuth.connected) {
+    await refreshQuotaHealth({ runDirectProbe: false });
     stopSpin(style.err(`授权未完成：${tail(r.err || r.out, 2).join(' ') || '请改用终端执行 agy-gate quota-login'}`));
     draw();
     return;
   }
 
-  const email = S.quotaAuth.email ?? 'Google 账号';
-  const extReg = registerOpenChamberQuotaExtension({ env: process.env });
-  if (!extReg.ok) {
-    stopSpin(style.warn(`已授权 ${email}，但注册 agy-quota 扩展失败：${extReg.error || '请运行 一键配置'}`));
+  startSpin('正在校验 OP 扩展挂载与实时用量查询…');
+  await ensureQuotaExtensionActive({ forceRestartIfUnmounted: true });
+}
+
+async function actionQuotaAuth() {
+  if (!fs.existsSync(ROUTER_BIN)) {
+    S.message = style.err(`未找到 agy-gate：${ROUTER_BIN}`);
     draw();
     return;
   }
 
-  if (S.state === 'running') {
-    let probe = await probeQuotaExtension(S.port);
-    if (extReg.action === 'updated' || (probe.reachable && !probe.registered)) {
-      const restarted = await restartServiceWithSpinner(
-        '停止服务以加载 agy-quota 扩展…',
-        '重启服务以应用用量扩展…',
-      );
-      if (!restarted) {
-        stopSpin(style.warn(`已授权 ${email}，但服务重启超时，请手动重启后再在 OP 设置 → 用量查看`));
-        draw();
-        return;
-      }
-      probe = await probeQuotaExtension(S.port);
-    }
-
-    if (probe.ok) {
-      stopSpin(style.ok(`已授权：${email} · OP 已挂载（设置 → 用量 底部「Agy CLI 用量」）`));
-    } else if (probe.registered && probe.error) {
-      stopSpin(style.warn(`已授权 ${email}，但扩展检测报错：${probe.error}`));
-    } else if (probe.reachable && !probe.registered) {
-      stopSpin(style.warn(`已授权 ${email}，请重启 OpenChamber 后在设置 → 用量 底部查看「Agy CLI 用量」`));
-    } else {
-      stopSpin(style.ok(`已授权：${email}（请在 OP 设置 → 用量 底部选择「Agy CLI 用量」并点刷新）`));
-    }
-  } else {
-    stopSpin(style.ok(`已授权：${email}（启动服务后请在 OP 设置 → 用量 底部选择「Agy CLI 用量」）`));
+  S.quotaAuth = quotaAuthState();
+  if (!S.quotaAuth.connected) {
+    await loginAndVerifyQuota();
+    return;
   }
-  draw();
+
+  const emailLabel = S.quotaAuth.email ? `（${S.quotaAuth.email}）` : '';
+  const choice = await pick(`Agy 用量授权与 OP 检测${emailLabel}`, [
+    { id: 'probe', label: '立即检测 OP 用量查询', right: '核验授权凭证、OP 扩展挂载与实时配额返回' },
+    {
+      id: 'repair',
+      label: '启用/修复 OP 扩展并生效',
+      right: S.state === 'running' ? '确保 extensions.json 启用并按需重启 OP' : '确保 extensions.json 注册并启用 agy-quota',
+    },
+    { id: 'relogin', label: '重新授权 Google 账号', right: '覆盖或切换当前 Google 授权凭证' },
+    { id: 'logout', label: '解除 Google 授权', right: '清除本地 quota-auth.json 凭证' },
+  ]);
+  if (!choice) {
+    S.message = null;
+    draw();
+    return;
+  }
+
+  if (choice === 'probe') {
+    startSpin('正在检测 OP 扩展挂载与实时用量查询…');
+    const health = await refreshQuotaHealth({ runDirectProbe: true });
+    stopSpin(formatQuotaCheckMessage(health));
+    draw();
+    return;
+  }
+
+  if (choice === 'repair') {
+    startSpin('正在检查并修复 OP 扩展配置…');
+    await ensureQuotaExtensionActive({ forceRestartIfUnmounted: true });
+    return;
+  }
+
+  if (choice === 'relogin') {
+    await loginAndVerifyQuota();
+    return;
+  }
+
+  if (choice === 'logout') {
+    const label = S.quotaAuth.email ? `（${S.quotaAuth.email}）` : '';
+    if (!(await confirm(`解除 Agy 用量 Google 授权${label}　Enter 确认　Esc 取消`))) {
+      S.message = '已取消';
+      draw();
+      return;
+    }
+    startSpin('清除 Agy 用量授权…');
+    const inv = buildRouterInvocation(['quota-logout']);
+    const r = await runCapture(inv.cmd, inv.args, 15000);
+    await refreshQuotaHealth({ runDirectProbe: false });
+    stopSpin(r.ok ? style.ok('已解除 Agy 用量授权') : style.err(`解绑失败：${tail(r.err || r.out, 2).join(' ')}`));
+    draw();
+  }
 }
 
 async function actionSetup() {
@@ -795,6 +895,7 @@ async function runRow(id) {
   } finally {
     S.busy = false;
     await probeStatus(S);
+    await refreshQuotaHealth({ runDirectProbe: false }).catch(() => {});
   }
   return null;
 }
@@ -810,7 +911,7 @@ function plainStatus() {
     'OpenChamber',
     `  opencode ${S.ocLocal ?? '?'} · agy ${S.agyLocal ?? '?'} · openchamber ${S.obLocal ?? '?'}`,
     `  引擎：${engineLabel}`,
-    `  用量：${S.quotaAuth.connected ? `已授权${S.quotaAuth.email ? `（${S.quotaAuth.email}）` : ''}` : '未授权'}`,
+    `  用量：${quotaSummary(true)}`,
     `  服务：${running ? '运行中' : S.state === 'unknown' ? '状态未知' : '已停止'}`,
   ];
   if (running) lines.push(`  实例：${S.instances.length}　地址：${baseUrl(S.port)}`);
@@ -923,7 +1024,10 @@ export async function runOccCli(argv = process.argv.slice(2)) {
   await refreshVersions(S);
 
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
-    await refreshSyncStatus(S, 4000).catch(() => {});
+    await Promise.all([
+      refreshSyncStatus(S, 4000).catch(() => {}),
+      refreshQuotaHealth({ runDirectProbe: false }).catch(() => {}),
+    ]);
     plainStatus();
     return 0;
   }
@@ -956,6 +1060,9 @@ export async function runOccCli(argv = process.argv.slice(2)) {
 
   draw();
   void refreshSyncStatus(S, 5000).then(() => {
+    if (S.altActive && !S.busy && !S.pick) draw();
+  }).catch(() => {});
+  void refreshQuotaHealth({ runDirectProbe: false }).then(() => {
     if (S.altActive && !S.busy && !S.pick) draw();
   }).catch(() => {});
   for (;;) {

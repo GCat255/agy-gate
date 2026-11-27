@@ -46,9 +46,15 @@ export function createServiceApp(options = {}) {
       }
 
       if (req.method === 'POST' && reqUrl.pathname === '/quota') {
-        await readJsonBody(req).catch(() => ({}));
-        const data = await readAntigravityQuota(oauthManager, options);
-        sendJson(res, 200, { ok: true, data });
+        try {
+          await readJsonBody(req).catch(() => ({}));
+          const data = await readAntigravityQuota(oauthManager, options);
+          sendJson(res, 200, { ok: true, data });
+        } catch (err) {
+          const raw = (err instanceof Error ? err.message : String(err ?? '')).trim() || '读取 Antigravity 用量失败';
+          const message = raw.length > 400 ? `${raw.slice(0, 397)}...` : raw;
+          sendJson(res, 200, { ok: false, error: { message } });
+        }
         return;
       }
 

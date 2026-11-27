@@ -13,6 +13,8 @@ import {
   writeOccState,
 } from '../core/config.mjs';
 import { resolveOpenChamberDataDir, resolveOpenChamberWebRoot } from '../bridge/openchamber.mjs';
+import { createOAuthManager } from '../../extensions/agy-quota/service/oauth.js';
+import { readAntigravityQuota } from '../../extensions/agy-quota/service/quota.js';
 
 const IS_WIN = process.platform === 'win32';
 export const PKG_OPENCODE = '@opencode/cli';
@@ -48,16 +50,16 @@ export function resolveWebCli() {
   return null;
 }
 
-export function readSettings() {
+export function readSettings(env = process.env) {
   try {
-    return JSON.parse(fs.readFileSync(path.join(resolveOpenChamberDataDir(process.env), 'settings.json'), 'utf8'));
+    return JSON.parse(fs.readFileSync(path.join(resolveOpenChamberDataDir(env), 'settings.json'), 'utf8'));
   } catch {
     return {};
   }
 }
 
-export function writeSettings(next) {
-  const dir = resolveOpenChamberDataDir(process.env);
+export function writeSettings(next, env = process.env) {
+  const dir = resolveOpenChamberDataDir(env);
   fs.mkdirSync(dir, { recursive: true });
   const target = path.join(dir, 'settings.json');
   const tmp = `${target}.${process.pid}.${Date.now()}.tmp`;
@@ -65,15 +67,15 @@ export function writeSettings(next) {
   fs.renameSync(tmp, target);
 }
 
-export function routerBindingState() {
-  const configured = typeof readSettings().opencodeBinary === 'string' ? readSettings().opencodeBinary.trim() : '';
+export function routerBindingState(env = process.env) {
+  const configured = typeof readSettings(env).opencodeBinary === 'string' ? readSettings(env).opencodeBinary.trim() : '';
   if (isRouterSelfPath(configured)) return 'router';
   if (configured) return 'custom';
   return 'native';
 }
 
-export function quotaAuthState() {
-  const authPath = path.join(resolveDataDir(), 'quota-auth.json');
+export function quotaAuthState(env = process.env) {
+  const authPath = path.join(resolveDataDir(env), 'quota-auth.json');
   try {
     const raw = JSON.parse(fs.readFileSync(authPath, 'utf8'));
     if (raw && typeof raw.refreshToken === 'string' && raw.refreshToken.trim()) {
@@ -404,15 +406,15 @@ export async function restartRunningService(state, onPhase) {
 export async function probeQuotaExtension(port) {
   const extList = await fetchJson(`${baseUrl(port)}/api/quota/extensions`, 'application/json', 3000);
   if (!extList || !Array.isArray(extList.extensions)) {
-    return { reachable: false, registered: false, ok: false, configured: false, error: null };
+    return { reachable: false, registered: false, ok: false, configured: false, error: null, planLabel: null, windows: null };
   }
   const registered = extList.extensions.some((item) => item?.id === 'ext-agy-quota');
   if (!registered) {
-    return { reachable: true, registered: false, ok: false, configured: false, error: null };
+    return { reachable: true, registered: false, ok: false, configured: false, error: null, planLabel: null, windows: null };
   }
-  const quotaRes = await fetchJson(`${baseUrl(port)}/api/quota/ext-agy-quota`, 'application/json', 5000);
+  const quotaRes = await fetchJson(`${baseUrl(port)}/api/quota/ext-agy-quota`, 'application/json', 8000);
   if (!quotaRes || typeof quotaRes !== 'object') {
-    return { reachable: true, registered: true, ok: false, configured: false, error: '扩展用量接口无响应' };
+    return { reachable: true, registered: true, ok: false, configured: false, error: '扩展用量接口无响应', planLabel: null, windows: null };
   }
   return {
     reachable: true,
@@ -420,5 +422,110 @@ export async function probeQuotaExtension(port) {
     ok: Boolean(quotaRes.ok),
     configured: Boolean(quotaRes.configured),
     error: typeof quotaRes.error === 'string' ? quotaRes.error : null,
+    planLabel: typeof quotaRes.planLabel === 'string' ? quotaRes.planLabel : null,
+    windows: quotaRes.usage?.windows && typeof quotaRes.usage.windows === 'object' ? quotaRes.usage.windows : null,
   };
+}
+
+/**
+ * Inspect OpenChamber `extensions.json` for `agy-quota` registration, capability grant, and disabled state.
+ * @param {NodeJS.ProcessEnv} [env]
+ */
+export function inspectQuotaExtensionRegistration(env = process.env) {
+  const dir = resolveOpenChamberDataDir(env);
+  const extensionsPath = path.join(dir, 'extensions.json');
+  let doc = null;
+  try {
+    doc = JSON.parse(fs.readFileSync(extensionsPath, 'utf8'));
+  } catch {
+    return { exists: false, hasPath: false, hasGrant: false, disabled: false, enabled: false, extensionsPath };
+  }
+  const paths = Array.isArray(doc?.paths) ? doc.paths : [];
+  const hasPath = paths.some((p) => {
+    const norm = String(p || '').replace(/[\\/]+$/, '').toLowerCase();
+    return norm.endsWith('/agy-quota') || norm.endsWith('\\agy-quota');
+  });
+  const grants = Array.isArray(doc?.capabilityGrants?.['agy-quota']) ? doc.capabilityGrants['agy-quota'] : [];
+  const hasGrant = grants.includes('service');
+  const disabled = Boolean(doc?.disabledGuests?.['agy-quota']);
+  return {
+    exists: true,
+    hasPath,
+    hasGrant,
+    disabled,
+    enabled: hasPath && hasGrant && !disabled,
+    extensionsPath,
+  };
+}
+
+export function formatQuotaWindowsSummary(windows) {
+  if (!windows || typeof windows !== 'object') return '';
+  const entries = Object.entries(windows);
+  if (entries.length === 0) return '';
+  return entries
+    .slice(0, 2)
+    .map(([name, info]) => {
+      const used = typeof info?.usedPercent === 'number' ? info.usedPercent : null;
+      const label = name.replace(/\s*\(Weekly\)/i, '周').replace(/\s*\(5h\)/i, '5h');
+      return used !== null ? `${label} 剩${Math.max(0, 100 - used)}%` : label;
+    })
+    .join(' · ');
+}
+
+/**
+ * Perform end-to-end verification of `agy-quota` credentials, OpenChamber extension config, and live query health.
+ * @param {any} state
+ * @param {{ runDirectProbe?: boolean, env?: NodeJS.ProcessEnv, probeOp?: typeof probeQuotaExtension }} [options]
+ */
+export async function probeQuotaHealth(state, options = {}) {
+  const env = options.env || process.env;
+  const auth = quotaAuthState(env);
+  const ext = inspectQuotaExtensionRegistration(env);
+  const settings = readSettings(env);
+  const dropdown = settings?.usageDropdownProviders;
+  const inWorkStatus = !Array.isArray(dropdown) || dropdown.includes('ext-agy-quota');
+
+  let op = null;
+  if (state?.state === 'running') {
+    const probeFn = options.probeOp || probeQuotaExtension;
+    op = await probeFn(state.port);
+  }
+
+  let direct = null;
+  if (options.runDirectProbe && auth.connected && (!op || !op.reachable)) {
+    try {
+      const oauth = createOAuthManager({ env });
+      const res = await readAntigravityQuota(oauth);
+      direct = {
+        ok: Boolean(res?.ok),
+        error: typeof res?.error === 'string' ? res.error : null,
+        planLabel: typeof res?.planLabel === 'string' ? res.planLabel : null,
+        windows: res?.usage?.windows && typeof res.usage.windows === 'object' ? res.usage.windows : null,
+      };
+    } catch (err) {
+      direct = {
+        ok: false,
+        error: err instanceof Error ? err.message : String(err),
+        planLabel: null,
+        windows: null,
+      };
+    }
+  }
+
+  let status = 'unauth';
+  if (!auth.connected) {
+    status = 'unauth';
+  } else if (!ext.enabled) {
+    status = 'unregistered';
+  } else if (op?.reachable) {
+    if (!op.registered) status = 'op-unmounted';
+    else if (op.ok) status = 'op-ok';
+    else status = 'op-error';
+  } else if (direct) {
+    status = direct.ok ? 'direct-ok' : 'direct-error';
+  } else {
+    status = 'ready-stopped';
+  }
+
+  return { auth, ext, inWorkStatus, op, direct, status };
 }

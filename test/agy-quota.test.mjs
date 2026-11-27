@@ -343,4 +343,38 @@ describe('agy-quota payload transformation & HTTP service', () => {
       }
     });
   });
+
+  it('returns ok=false with error when no quota windows are present and returns HTTP 200 envelope on /quota failure', async () => {
+    const emptyOut = transformQuotaPayloads({ summaryPayload: { groups: [] }, modelsPayload: { models: {} } });
+    assert.equal(emptyOut.ok, false);
+    assert.equal(emptyOut.configured, true);
+    assert.equal(emptyOut.usage, null);
+    assert.match(emptyOut.error, /配额窗口/);
+
+    const { server } = await startService({
+      port: 0,
+      serviceToken: 'err-token',
+      oauthManager: {
+        getAccessToken: async () => {
+          throw new Error('broken token store');
+        },
+        getStatus: async () => ({ connected: false, email: null }),
+        close: async () => {},
+      },
+    });
+    try {
+      const res = await fetch(`http://127.0.0.1:${server.address().port}/quota`, {
+        method: 'POST',
+        headers: { Authorization: 'Bearer err-token', 'Content-Type': 'application/json' },
+        body: '{}',
+      });
+      assert.equal(res.status, 200);
+      const json = await res.json();
+      assert.equal(json.ok, true);
+      assert.equal(json.data.ok, false);
+      assert.match(json.data.error, /broken token store/);
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+    }
+  });
 });

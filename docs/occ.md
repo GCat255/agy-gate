@@ -21,7 +21,7 @@ occ --help           查看说明
 | `升级` | 选择 `opencode` / `openchamber` / `agy-cli` 升级或回滚 | 同左（先停后恢复） |
 | `同步更新` | 检查并从 GitHub `origin` 拉取最新代码、同步全局命令与环境配置 | 同左（有更新时先停后恢复） |
 | `引擎入口` | 在原生 OpenCode 与 `agy-gate` 间切换 | 同左（自动重启生效） |
-| `Agy 用量授权` | 完成/解除只读 Google OAuth 授权并自动确保 `agy-quota` 扩展已启用 | 同左（必要时自动重启生效；OP 内在设置 → 用量 底部查看「Agy CLI 用量」） |
+| `Agy 用量授权` | 打开 Google OAuth 授权并自动注册启用 `agy-quota` 扩展 | 实时展示 OP 挂载与查询状态；Enter 可检测查询、修复扩展、重授或解绑 |
 | `一键配置` | 绑定 `opencodeBinary`、注册 `agy-quota` 扩展与 `openchamber` MCP | 同左（配置变更时自动重启生效） |
 | `退出` | 等同于 `q` | 等同于 `q` |
 
