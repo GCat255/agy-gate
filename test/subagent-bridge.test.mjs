@@ -854,3 +854,80 @@ test('AgyRunner ACP discovers subagents from parent transcript.jsonl and spawns 
     } catch {}
   }
 });
+
+test('AgyTurnTranslator preserves Model/Workspace on invoke_subagent and AgySubagentWatcher emits session.model.selected on real model change', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-sub-model-'));
+  try {
+    const trEvents = [];
+    const tr = new AgyTurnTranslator({
+      sessionID: 'ses_p_model',
+      assistantMessageID: 'msg_p_model',
+      modelID: 'gemini-4-hydrogen-high',
+      emit: (ev) => trEvents.push(ev),
+    });
+    tr.begin();
+    tr.handleAcpUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'call_sub_m1',
+      name: 'invoke_subagent',
+      rawInput: {
+        TypeName: 'research',
+        Role: 'Scout',
+        Prompt: 'Check files',
+        Model: 'flash',
+        Workspace: 'inherit',
+      },
+      status: 'in_progress',
+    });
+    const called = trEvents.find((e) => e.type === 'session.tool.called');
+    assert.equal(called?.data?.input?.model, 'flash');
+    assert.equal(called?.data?.input?.workspace, 'inherit');
+
+    const store = new RouterStore(dir);
+    const parentID = 'ses_p_model';
+    const childID = toChildSessionID('conv-model-1');
+    store.setSessionDirectory(parentID, 'E:/proj');
+    store.createChildSession({
+      sessionID: childID,
+      parentID,
+      projectID: 'proj_1',
+      directory: 'E:/proj',
+      title: 'Scout',
+      agent: 'research',
+      model: { providerID: 'agy-cli', id: 'gemini-4-hydrogen-high' },
+      agyConversationId: 'conv-model-1',
+    });
+
+    const transcriptPath = path.join(dir, 'transcript.jsonl');
+    fs.writeFileSync(
+      transcriptPath,
+      [
+        { step_index: 0, source: 'SYSTEM', type: 'SYSTEM_MESSAGE', status: 'DONE', created_at: '2026-11-27T01:00:00Z', content: '<SYSTEM_MESSAGE>\n[Message] sender=parent content=Check files\n</SYSTEM_MESSAGE>' },
+        { step_index: 1, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', created_at: '2026-11-27T01:00:01Z', model: 'gemini-3.8-flash-high', output_tokens: 20, content: 'Done.' },
+      ].map((l) => JSON.stringify(l)).join('\n') + '\n',
+      'utf8',
+    );
+
+    const watchEvents = [];
+    const watcher = new AgySubagentWatcher({
+      childSessionID: childID,
+      parentSessionID: parentID,
+      agent: 'research',
+      title: 'Scout',
+      modelID: 'gemini-4-hydrogen-high',
+      directory: 'E:/proj',
+      transcriptPath,
+      store,
+      emit: (ev) => watchEvents.push(ev),
+    });
+    watcher.start();
+
+    const modelEv = watchEvents.find((e) => e.type === 'session.model.selected');
+    assert.ok(modelEv, 'Expected session.model.selected when transcript model differs from initial model');
+    assert.equal(modelEv.data.sessionID, childID);
+    assert.equal(modelEv.data.model.id, 'gemini-3.8-flash-high');
+    assert.equal(modelEv.data.previous.id, 'gemini-4-hydrogen-high');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

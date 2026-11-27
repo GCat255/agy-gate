@@ -973,7 +973,7 @@ export class AgyRunner {
     let attempts = 0;
     turn.subagentSyncTimer = setInterval(() => {
       attempts += 1;
-      if (!worker.turn || worker.turn !== turn || attempts > 25) {
+      if (!worker.turn || worker.turn !== turn || attempts > 125) {
         clearInterval(turn.subagentSyncTimer);
         turn.subagentSyncTimer = null;
         return;

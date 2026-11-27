@@ -531,6 +531,7 @@ export class AgySubagentWatcher {
     this.replySettleMs = options.replySettleMs ?? 500;
 
     this._suppressEmit = false;
+    this._lastBroadcastModelID = options.modelID || null;
     this.translator = new AgyTranscriptTranslator({
       childSessionID: this.childSessionID,
       parentConversationId: options.parentConversationId,
@@ -580,9 +581,29 @@ export class AgySubagentWatcher {
         this.turnSettled = true;
       }
       this.lastLineCount = limit;
+      this._lastBroadcastModelID = this.translator.modelID || this._lastBroadcastModelID;
     } finally {
       this._suppressEmit = false;
     }
+  }
+
+  _syncChildModelUpdate(now = Date.now()) {
+    const nextModelID = this.translator.modelID;
+    if (!nextModelID || nextModelID === this._lastBroadcastModelID) return;
+    const prevModelID = this._lastBroadcastModelID;
+    this._lastBroadcastModelID = nextModelID;
+    if (this._suppressEmit) return;
+    const loc = this.directory ? { location: { directory: this.directory } } : {};
+    this.emit({
+      type: 'session.model.selected',
+      created: now,
+      ...loc,
+      data: {
+        sessionID: this.childSessionID,
+        model: { providerID: AGY_PROVIDER_ID, id: nextModelID },
+        ...(prevModelID ? { previous: { providerID: AGY_PROVIDER_ID, id: prevModelID } } : {}),
+      },
+    });
   }
 
   _handleTurnStarted(created) {
@@ -673,13 +694,15 @@ export class AgySubagentWatcher {
         }
       }
       this.lastLineCount = lines.length;
+      const now = Date.now();
       this.store.replaceChildMessages(this.childSessionID, this.translator.messages);
       this.store.updateChildSession(this.childSessionID, {
         tokens: this.translator.sessionBuckets,
         model: { providerID: AGY_PROVIDER_ID, id: this.translator.modelID },
         lastSyncedLineCount: this.lastLineCount,
-        time: { updated: Date.now() },
+        time: { updated: now },
       });
+      this._syncChildModelUpdate(now);
     }
 
     if (this.translator.completed && (this.turnBusy || this.translator.assistantMsg)) {

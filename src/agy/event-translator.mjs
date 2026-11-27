@@ -702,12 +702,16 @@ export class AgyTurnTranslator {
       const step = this.currentStep;
       step.hasTools = true;
       step.openToolCount += 1;
+      const modelOpt = unwrapToolParamValue(parameters.Model ?? parameters.model);
+      const workspaceOpt = unwrapToolParamValue(parameters.Workspace ?? parameters.workspace);
       const input = {
         agent: String(unwrapToolParamValue(parameters.TypeName ?? parameters.type_name) || 'subagent'),
         description: String(
           unwrapToolParamValue(parameters.Role ?? parameters.role ?? parameters.TypeName ?? parameters.type_name) || 'Subagent',
         ),
         prompt: String(unwrapToolParamValue(parameters.Prompt ?? parameters.initial_prompt) || ''),
+        ...(typeof modelOpt === 'string' && modelOpt.trim() ? { model: modelOpt.trim() } : {}),
+        ...(typeof workspaceOpt === 'string' && workspaceOpt.trim() ? { workspace: workspaceOpt.trim() } : {}),
       };
       entry = {
         callID,
