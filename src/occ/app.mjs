@@ -154,6 +154,12 @@ function menuRows() {
       right: running ? `实例 ${S.instances.length} · PID ${inst?.pid ?? '?'}` : '已停止 · 无实例',
       enabled: running,
     },
+    {
+      id: 'restart',
+      label: '重启服务',
+      right: running ? `停止并重启 ${baseUrl(S.port)}` : '已停止 · 无实例',
+      enabled: running,
+    },
     { id: 'upgrade', label: '升级', right: upgradeSummary(), enabled: true },
     { id: 'sync', label: '同步更新', right: syncSummary(), enabled: true },
     { id: 'router', label: '引擎入口', right: routerRight, enabled: routerAvailable },
@@ -315,6 +321,16 @@ async function actionStop() {
   startSpin('停止服务…');
   const ok = await ensureStopped(S);
   stopSpin(ok ? style.ok('服务已停止') : style.err('停止未生效'));
+  draw();
+}
+
+async function actionRestart() {
+  if (S.state !== 'running') {
+    await actionStart();
+    return;
+  }
+  const ok = await restartServiceWithSpinner('停止服务…', '重启服务…');
+  stopSpin(ok ? style.ok(`已重启 ${baseUrl(S.port)}`) : style.err(`重启超时（30s）。日志：${logPath(S.port)}`));
   draw();
 }
 
@@ -767,6 +783,7 @@ async function runRow(id) {
   try {
     if (id === 'start') await actionStart();
     else if (id === 'stop') await actionStop();
+    else if (id === 'restart') await actionRestart();
     else if (id === 'upgrade') await actionUpgrade();
     else if (id === 'sync') await actionSync();
     else if (id === 'router') await actionToggleRouter();
@@ -814,6 +831,7 @@ function helpText() {
     '交互菜单：',
     '  启动服务            启动本地服务并显示地址',
     '  停止服务            停止正在运行的实例',
+    '  重启服务            停止并重新启动当前运行中的服务实例',
     '  升级                选择组件（opencode / openchamber / agy-cli）进行升级或回滚',
     '  同步更新            从 GitHub 拉取 agy-gate 最新提交并刷新环境配置',
     '  引擎入口            在原生 OpenCode 与 agy-gate 分流网关间切换',
